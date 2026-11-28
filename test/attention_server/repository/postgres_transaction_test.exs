@@ -376,7 +376,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
     @tag :tmp_dir
     test "ordinary PostgreSQL revision preserves historical body, file refs, head and ETag", %{tmp_dir: dir} do
       alias AttentionServer.{JSON, LargeData, Relay}
-      alias AttentionServer.ClientAPI.{Context, Reads, Resources, Router}
+      alias AttentionServer.ClientAPI.{Resources, Router}
       alias AttentionServer.Repository.RecipientItems
       alias AttentionServer.Repository.Postgres.LargeText
 
@@ -461,36 +461,41 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, _} =
                Transaction.query("INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)", [person, head])
 
-      read = fn conn, n ->
-        Reads.get_postgres_revision(conn, %Context{
-          principal: nil, relay: nil, request_id: nil, params: %{item_id: "i1", n: n}
-        })
-      end
+      postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, nil, nil})
+      read = &Router.call(&1, postgres)
 
-      assert %{status: 503} = read.(request, "1")
+      assert %{status: 503} = read.(request)
       address = Attributes.key({person, "i1", 1})
       assert {:ok, _} =
                Transaction.query("INSERT INTO harklight.compatibility_facts VALUES ('ordinary_revision_files', $1, $2)", [
                  address, Attributes.encode(files)
                ])
 
-      assert %{status: 200, resp_body: actual} = response = read.(request, "1")
+      assert %{status: 200, resp_body: actual} = response = read.(request)
       assert :crypto.hash(:sha256, actual) == :crypto.hash(:sha256, expected)
       assert [^etag] = Plug.Conn.get_resp_header(response, "etag")
       assert ["private, no-cache"] = Plug.Conn.get_resp_header(response, "cache-control")
       conditional = Plug.Conn.put_req_header(request, "if-none-match", "W/" <> etag)
-      assert %{status: 304, resp_body: ""} = read.(conditional, "1")
-      for n <- ["x", "0", "3", "9223372036854775808"], do: assert(%{status: 404} = read.(request, n))
+      assert %{status: 304, resp_body: ""} = read.(conditional)
+      for n <- ["x", "0", "3", "9223372036854775808"] do
+        assert %{status: 404} = read.(browser_request(:get, "/v2/items/i1/revisions/#{n}", cookie))
+      end
       assert {:error, :not_found} = RecipientItems.revision(:postgres, "other-person", "i1", 1)
-      assert %{status: 503} = read.(request, "2")
+      assert %{status: 503} = read.(browser_request(:get, "/v2/items/i1/revisions/2", cookie))
+      assert %{status: 404} = read.(browser_request(:get, "/v2/items/i1", cookie))
+      assert %{status: 404} = read.(browser_request(:get, "/v2/items/shared_fixture/revisions/1", cookie))
+      assert %{status: 400, assigns: %{client_api_error: "invalid_field"}} =
+               read.(Plug.Conn.put_req_header(request, "harklight-features", "invalid"))
+      assert %{status: 400, assigns: %{client_api_error: "unsupported"}} =
+               read.(Plug.Conn.put_req_header(request, "harklight-features", "shared_messages"))
 
       assert {:ok, _} =
                Transaction.query("UPDATE harklight.message_recipients SET attributes = $2 WHERE person_id = $1", [
                  person, Attributes.encode(%{visible: false})
                ])
-      assert %{status: 404} = read.(conditional, "1")
+      assert %{status: 404} = read.(conditional)
       assert {:ok, _} = Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [owner])
-      assert %{status: 401} = read.(conditional, "1")
+      assert %{status: 401} = read.(conditional)
     end
 
     @tag :tmp_dir

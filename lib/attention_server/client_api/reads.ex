@@ -144,17 +144,21 @@ defmodule AttentionServer.ClientAPI.Reads do
       Transaction.snapshot(fn ->
         with {:ok, %{kind: :browser, person: person}} <- Auth.web(conn, Identities, :postgres),
              :ok <- Settings.check_active(person),
+             {:ok, %{shared?: false}} <- SharedCapability.parse(conn),
              {:ok, revision} <- revision_number(raw_revision) do
           RecipientItems.revision(:postgres, person, item, revision)
         else
+          {:ok, %{shared?: true}} -> {:error, :unsupported}
           {:ok, _native} -> {:error, :not_found}
           {:error, :unavailable} -> {:error, :retry_later}
+          {:error, token, field} -> {:error, {token, field}}
           {:error, _} = error -> error
         end
       end)
 
     case result do
       {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
+      {:error, {token, field}} when is_binary(token) -> respond(conn, {:error, token, field})
       error -> respond(conn, error)
     end
   end

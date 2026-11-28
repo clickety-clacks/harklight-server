@@ -180,6 +180,17 @@ defmodule AttentionServer.ClientAPI.Router do
   end
 
   defp authenticated(
+         %{method: "GET"} = conn,
+         %{repository: :postgres, auth: {:browser, _, _}} = opts,
+         ["items", "i" <> _, "revisions", _],
+         {:ok, Reads, :get_revision, params, _},
+         request_id
+       ) do
+    ctx = %Context{principal: nil, relay: nil, request_id: request_id, params: params}
+    run(conn, Reads, :get_postgres_revision, ctx, opts)
+  end
+
+  defp authenticated(
          %{method: "PUT"} = conn,
          %{repository: :postgres, auth: {:browser, _, _}} = opts,
          ["settings", _setting] = segments,
