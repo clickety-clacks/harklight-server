@@ -52,6 +52,12 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           agent = Base.encode16(:crypto.hash(:sha256, "synthetic revoked agent"), case: :lower)
           assert :ok = Relay.setup_device(relay, person, device)
           assert :ok = Relay.setup_sender(relay, device, "app:device-scope")
+          assert {:ok, subscription_reply} = Relay.request_line(relay, device, JSON.encode!(%{
+            "v" => 1, "type" => "subscribe_remote",
+            "op_id" => "95000000-0000-4000-8000-000000000001", "revision" => 7,
+            "sender_ids" => ["app:device-scope", "app:retained-subscription"]
+          }) <> "\n")
+          assert {:ok, %{"revision" => 7}} = JSON.decode_line(subscription_reply)
           assert :ok = Relay.owner_revoke_device(relay, person, owner, device)
 
           assert :ok =
