@@ -93,6 +93,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         expected_organizations = seed_organizations(source_path, epoch)
         expected_recipients = source_recipient_expectations(source_path)
         expected_subscriptions = source_subscription_expectations(source_path)
+        expected_chats = source_chat_expectations(source_path)
         {:ok, sqlite} = Exqlite.Sqlite3.open(source_path)
 
         {:ok, rows} =
@@ -533,6 +534,14 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             {:ok, count + 1}
           _, count -> {:ok, count}
         end)
+        assert :ok = AttentionServer.Migration.ImportChatSummary.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportChatSummary.run(db, identity, bundle)
+        for {id, expected} <- expected_chats do
+          assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+            "SELECT attributes FROM harklight.conversations WHERE id=$1", [id])
+          assert {:ok, attributes} = Attributes.decode(body)
+          assert Map.take(attributes, [:chat_started, :latest_origin_reply_seq, :unread_replies]) == expected
+        end
         assert entry_count > 0
         assert {:ok, %{rows: [[^entry_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.conversation_entries", [])
 
@@ -980,6 +989,21 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert actual == File.read!(path)
       assert byte_size(actual) == size
       assert {:error, :not_found} = Uploads.read_chunk(person, id, count)
+    end
+
+    defp source_chat_expectations(path) do
+      {:ok, store} = AttentionServer.Store.open_relay(path)
+      expected = Enum.map(store.engine.messages, fn {key, record} ->
+        chat = AttentionServer.ClientAPI.Resources.item(store.engine, key, %{"key" => "synthetic-rank"})["chat"]
+        last = case chat["last_origin_reply"] do
+          nil -> nil
+          "e" <> position -> String.to_integer(position)
+        end
+        {ImportMessages.id(key, record), %{chat_started: chat["started"],
+          latest_origin_reply_seq: last, unread_replies: chat["unread_replies"]}}
+      end)
+      :ok = AttentionServer.Store.close(store)
+      expected
     end
 
     defp source_subscription_expectations(path) do
