@@ -222,3 +222,23 @@ business is the organization's `hosted_ref`, and the full tuple remains in the
 group attributes. Hosted groups retain a null manager. Existing Hosted group
 version records and deletion tombstones remain in the lossless facts staging.
 Every organization/group phase has a checkpoint and remains unpublished.
+
+`ImportTables.run/3` stages durable SQL side rows as typed compatibility facts.
+Each family is the source table name. Its address is the single primary-key
+value, or a tuple of values in the declared primary-key column order for a
+composite key. Its body is the list of exact source values in the column order
+recorded by `SourceSchema`. The shared typed codec encodes both key and body.
+For example, `harklight_auth_schema` uses key `1` and body
+`[1, minimum_generation, device_certificates_disabled]`, matching the runtime
+certificate reader. Binary
+hashes, integers and nulls are not converted to strings. The explicit table
+catalog rejects unknown tables and separates durable rows from rebuildable
+SQL indexes and source format/generation witnesses. Audit ordinals and the
+SQLite sequence are retained. Each table has an independent atomic checkpoint.
+
+This preserves pending authentication, receipt, baseline and cursor material
+without making it actionable. Normalized runtime projections, device-progress
+overlay application and referential/field validation remain required before
+activation. Derived index tables are verified in the export but are not copied
+as durable target facts. The original typed Engine facts remain separately
+addressed, and the source bundle stays immutable.

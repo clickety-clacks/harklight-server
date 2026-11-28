@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.ImportSessionTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables}
     alias AttentionServer.Repository.Postgres.Attributes
 
     for epoch <- [1, 17] do
@@ -26,8 +26,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             )
         ]
 
-        {:ok, db} = Postgrex.start_link(config)
-        on_exit(fn -> if Process.alive?(db), do: GenServer.stop(db) end)
+        db = start_supervised!({Postgrex, config})
 
         root =
           Path.join(System.tmp_dir!(), "import-history-#{System.unique_integer([:positive])}")
@@ -93,6 +92,17 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             sqlite,
             "SELECT key,payload,checksum FROM relay_records"
           )
+
+        {session_person, session_owner} = Enum.find_value(rows, fn [key, payload, hash] ->
+          case AttentionServer.Store.RecordCodec.decode_row({key, payload, hash}) do
+            {:ok, {:row, :owners, person}, owner} -> {person, owner}
+            _ -> nil
+          end
+        end)
+        {:ok, _} = AttentionServer.Store.AuthSchema.initialize(sqlite)
+        :ok = AttentionServer.BrowserAuth.add_session(sqlite,
+          :crypto.hash(:sha256, "synthetic migration browser session"),
+          session_person, session_owner.key, session_owner.revision, "fixture")
 
         {address, _} =
           Enum.find_value(rows, fn [key, payload, hash] ->
@@ -313,6 +323,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportOrganizations.run(db, identity, bundle)
         assert :ok = ImportOrganizations.run(db, identity, bundle)
         verify_organizations(db, expected_organizations)
+        assert :ok = ImportTables.run(db, identity, bundle)
+        assert :ok = ImportTables.run(db, identity, bundle)
+        verify_tables(db, bundle, manifest)
 
         assert {:ok, :ok} =
                  Frames.fold(
@@ -360,12 +373,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
       assert uri.host in ["localhost", "127.0.0.1"]
       [user, password] = String.split(uri.userinfo, ":", parts: 2)
-      {:ok, db} = Postgrex.start_link(
+      db = start_supervised!({Postgrex, [
         hostname: uri.host, port: uri.port,
         username: URI.decode(user), password: URI.decode(password),
         database: "migration_implicit_roster"
-      )
-      on_exit(fn -> if Process.alive?(db), do: GenServer.stop(db) end)
+      ]})
       root = Path.join(System.tmp_dir!(), "import-legacy-#{System.unique_integer([:positive])}")
       File.mkdir!(root)
       File.chmod!(root, 0o700)
@@ -405,6 +417,34 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "SELECT attributes::text FROM harklight.organizations WHERE id=$1", [expected.instance])
       assert_typed(text, nil)
       Agent.stop(fixture.clock)
+    end
+
+    defp verify_tables(db, bundle, manifest) do
+      for {table, source} <- manifest.data.tables do
+        family = table
+        assert {:ok, %{rows: [[count]]}} = ImportSession.query(db,
+          "SELECT count(*) FROM harklight.compatibility_facts WHERE family=$1", [family])
+        case SourceTables.disposition(table) do
+          {:durable, _} ->
+            assert count == source.summary.count
+            assert {:ok, :ok} = Frames.fold(Path.join(bundle, source.file), source.summary, :ok,
+              fn values, :ok ->
+                {:ok, address, _row} = SourceTables.fact(table, values)
+                assert {:ok, %{rows: [[text]]}} = ImportSession.query(db,
+                  "SELECT body::text FROM harklight.compatibility_facts WHERE family=$1 AND address=$2",
+                  [family, Attributes.key(address)])
+                assert_typed(text, values)
+                {:ok, :ok}
+              end)
+          excluded when excluded in [:derived, :source_only] -> assert count == 0
+        end
+      end
+      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.compatibility_facts WHERE family='harklight_browser_sessions'", [])
+      assert {:ok, %{rows: [[text]]}} = ImportSession.query(db,
+        "SELECT body::text FROM harklight.compatibility_facts WHERE family='harklight_auth_schema' AND address=$1", [Attributes.key(1)])
+      {:ok, envelope} = JSON.decode_line(text <> "\n")
+      assert {:ok, [1, 1, 0]} = Attributes.decode(envelope)
     end
 
     defp seed_organizations(path, epoch) do
