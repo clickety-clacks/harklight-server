@@ -712,3 +712,19 @@ permissions, ownership and checksum checks as other material.
 identity or runtime state. Exclude that file from the migration bundle and leave
 it untouched. It remains covered by the installation's single documented backup
 and restore procedure.
+
+
+### Destination coverage inventory
+
+`Migration.VerifyCatalog.run/3` is the read-only coverage boundary for the
+forthcoming consolidated validation report. It requires the exact known schema
+relation set and contiguous migration versions, rejects uncovered compatibility
+fact families, counts every destination table, and requires the staged runtime
+queues and baseline tables to remain empty. It binds the import identity and
+rechecks the sealed source at the end.
+
+This inventory does not replace any field, attachment, text or authority
+comparison. Dynamic LargeText path families additionally require
+`VerifyLargeText`'s source-reference and content closure. Successful inventory
+alone never transitions lifecycle state, validates material, reconciles pending
+runtime work or enables migration readiness.
