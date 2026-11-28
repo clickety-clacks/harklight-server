@@ -665,3 +665,9 @@ continuity, checks exact directory/file inventory, private modes and file
 checksums, and rechecks the bundle seal. Missing, partial, altered or extra
 material refuses; validation neither copies files nor changes permissions.
 Successful material validation alone does not authorize database activation.
+
+Bundle verification checks the copied source database together with its WAL and
+rollback journal before and after reading bundle contents. Sidecars must be
+absent or empty; a nonempty sidecar refuses even if the main database hash is
+unchanged. All verifiers share this check. It never opens, checkpoints, clears
+or otherwise modifies the copied source to make validation pass.
