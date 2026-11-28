@@ -693,7 +693,9 @@ Run `harklight-postgres status` afterwards.
 not yet implement import, validate and activate, so `migrate` detects that
 before doing anything and refuses. When the importer ships, `migrate` will, on
 every run including a resume, first prove the Server unit is inactive or failed
-with no main process (it refuses if it cannot observe that), then: write an
+with no main process (it refuses if it cannot observe that), and that the
+source store is unchanged since the backup and export (main, WAL and SHM
+fingerprints match) and held open by no process, then: write an
 immutable backup of the private install root (outside `ROOT/postgres`), export
 the store with its identity material and any files `server.env` points at
 (refusing if one cannot be captured), verify the export, import into the empty

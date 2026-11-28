@@ -100,6 +100,20 @@ wd="$(workdirs | head -n 1)"; wd="${wd%/}"
 tar -tf "$wd/backup/private-root.tar" | grep -q 'relay.sqlite3' || bad "backup lacks the store"
 ok "failed validation leaves the destination loading, server.env unchanged, backup intact"
 
+# A changed source, or one held open by a writer, is refused on resume before any importer call.
+cp "$state/relay.sqlite3" "$scratch/sqlite.keep"; echo more >> "$state/relay.sqlite3"
+: > "$FAKE_DIR/calls.log"
+expect_fail "resume refuses a source whose main file changed" "source store changed" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+cp "$scratch/sqlite.keep" "$state/relay.sqlite3"
+printf 'shm' > "$state/relay.sqlite3-shm"
+expect_fail "resume refuses a source that gained a SHM file" "source store changed" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+rm "$state/relay.sqlite3-shm"
+( exec 7<"$state/relay.sqlite3"; sleep 20 ) & holder=$!
+sleep 1
+expect_fail "resume refuses a source held open by a running process" "has the source store open" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+[[ "$(calls)" == "capabilities capabilities capabilities " || "$(calls)" == "capabilities capabilities " ]] || [[ "$(calls)" != *import* ]] || bad "importer ran against a changed source"
+
 # Resume validates, applies grants, installs material, and does NOT activate.
 sums="$(sha256sum "$wd/backup/private-root.tar")"
 rm "$scratch/ext/server.key"   # the verified staged copy must put it back

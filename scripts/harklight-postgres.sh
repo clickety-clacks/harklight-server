@@ -824,6 +824,55 @@ PY
   fi
 }
 
+# Fingerprint of the stopped source: main file digest and size, WAL and SHM
+# presence, size and digest. Also refuses while any process has one of them open.
+source_fingerprint() {
+  python3 -I - "$state/relay.sqlite3" <<'PY'
+import hashlib, os, sys
+main = sys.argv[1]
+names = [main, main + "-wal", main + "-shm", main + "-journal"]
+real = {os.path.realpath(n) for n in names}
+me = os.getpid()
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    if int(pid) == me:
+        continue
+    try:
+        fds = os.listdir("/proc/%s/fd" % pid)
+    except OSError:
+        continue
+    for fd in fds:
+        try:
+            if os.path.realpath(os.readlink("/proc/%s/fd/%s" % (pid, fd))) in real:
+                sys.stderr.write("a running process (pid %s) has the source store open; refusing\n" % pid); sys.exit(3)
+        except OSError:
+            continue
+def digest(path):
+    if not os.path.exists(path):
+        return "absent"
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return "%s:%d" % (h.hexdigest(), os.path.getsize(path))
+for label, n in zip(("main", "wal", "shm", "journal"), names):
+    print("%s=%s" % (label, digest(n)))
+PY
+}
+
+# On every run, including a resume, the source must still be the stopped,
+# unopened store that was backed up and exported.
+confirm_source() {
+  local now
+  now="$(source_fingerprint)" || fail "the source store could not be confirmed unchanged and unopened"
+  if [[ -f "$work_dir/source.manifest" ]]; then
+    [[ "$now" == "$(< "$work_dir/source.manifest")" ]] ||
+      fail "the source store changed since this migration was backed up and exported (main, WAL or SHM differ); it must be unchanged. Restore the original or start a new migration from a fresh backup"
+  elif [[ -f "$work_dir/done.backup" ]]; then
+    fail "$work_dir has a backup but no source fingerprint; start a new migration"
+  fi
+  printf '%s' "$now"
+}
+
 migrate_setup() {
   find_pg_bin
   load_config
@@ -863,12 +912,16 @@ do_migrate() {
   note "migration work directory: $work_dir"
   local bundle="$work_dir/bundle" receipt="$work_dir/receipt.json" out validation_sha externals
 
+  local fp
+  fp="$(confirm_source)"
   if [[ ! -f "$work_dir/done.backup" ]]; then
     mkdir -m 700 -p -- "$work_dir/backup"
     tar --exclude=./releases --exclude=./backups --exclude=./postgres --exclude=./migration \
       --exclude=./.release-install.lock -cf "$work_dir/backup/private-root.tar" -C "$root" . || migrate_failed backup "$work_dir"
     chmod 600 "$work_dir/backup/private-root.tar"
     sha "$work_dir/backup/private-root.tar" > "$work_dir/backup/SHA256"
+    [[ "$(source_fingerprint)" == "$fp" ]] || migrate_failed "backup (the source changed while it was being copied)" "$work_dir"
+    printf '%s' "$fp" > "$work_dir/source.manifest"; chmod 600 "$work_dir/source.manifest"
     : > "$work_dir/done.backup"
     note "immutable backup written: $work_dir/backup/private-root.tar"
   fi
