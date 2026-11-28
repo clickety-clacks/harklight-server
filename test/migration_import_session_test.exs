@@ -428,6 +428,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportAuth.run(db, identity, bundle)
         assert :ok = ImportAuth.run(db, identity, bundle)
         verify_auth(db, bundle, manifest)
+        verify_auth_drift(db, identity, bundle)
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert {:ok, _} = AttentionServer.Migration.VerifyStreamPositions.run(db, identity, bundle)
@@ -1546,6 +1547,43 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     defp assert_stream_change(db, person, origin, kind, id, rev, session, at) do
       assert {:ok, %{rows: [[^kind, ^id, ^session, ^at]]}} = ImportSession.query(db,
         "SELECT resource_kind,resource_id,session_handle,created_at_ms FROM harklight.stream_changes WHERE person_id=$1 AND origin_key=$2 AND revision=$3", [person, origin, rev])
+    end
+
+    defp verify_auth_drift(db, identity, bundle) do
+      verifier = AttentionServer.Migration.VerifyAuthSessions
+      assert {:ok, %{auth_sessions: 5} = counts} = verifier.run(db, identity, bundle)
+      for sql <- [
+        "UPDATE harklight.auth_sessions SET principal_revision=principal_revision+1",
+        "UPDATE harklight.auth_sessions SET expires_at_ms=1",
+        "UPDATE harklight.auth_sessions SET attributes='{}'::jsonb",
+        "UPDATE harklight.auth_sessions SET kind=CASE kind WHEN 'browser' THEN 'native' ELSE 'browser' END",
+        "DELETE FROM harklight.auth_sessions WHERE kind='native'"
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: n}} = ImportSession.query(tx, sql, [])
+          assert n > 0
+          assert {:error, {:auth_session_mismatch, _}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
+      for {hash, expected} <- [
+        {:crypto.hash(:sha256, "synthetic retired owner session"), :orphan},
+        {:crypto.hash(:sha256, "synthetic extra session"), :extra}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx,
+            "INSERT INTO harklight.auth_sessions(token_hash,person_id,principal_key,kind,principal_revision,expires_at_ms,attributes) SELECT $1,person_id,principal_key,kind,principal_revision,expires_at_ms,attributes FROM harklight.auth_sessions LIMIT 1", [hash])
+          result = verifier.run(tx, identity, bundle)
+          if expected == :orphan do
+            assert {:error, {:auth_session_mismatch, _}} = result
+          else
+            assert {:error, :auth_session_count_mismatch} = result
+          end
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
     end
 
     defp verify_auth(db, bundle, manifest) do
