@@ -30,6 +30,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   import Plug.Conn
 
+  alias AttentionServer.Repository.RecipientItems
   alias AttentionServer.{BrowserRecipient, ChangeLog, ConversationFiles, Engine, JSON, Relay}
 
   alias AttentionServer.ClientAPI.{
@@ -1104,9 +1105,9 @@ defmodule AttentionServer.ClientAPI.Writes do
   ## Operations, as today's engine frames
 
   defp frame(engine, principal, key, {:seen, item_id}) do
-    with {:ok, {_person, sender, message_id} = message_key} <-
-           Resources.person_item_key(engine, principal.person, item_id) do
-      %{revision: revision} = Map.fetch!(engine.messages, message_key)
+    with {:ok, {_person, sender, message_id}, record} <-
+           RecipientItems.fetch(engine, principal.person, item_id) do
+      %{revision: revision} = record
 
       {:ok,
        %{
@@ -1126,10 +1127,8 @@ defmodule AttentionServer.ClientAPI.Writes do
 
     with {:ok, {_person, sender, message_id} = message_key} <-
            Resources.person_item_key(engine, person, item_id),
-         {:ok, seq} <- item_entry_seq(engine, person, message_key, entry_id) do
-      current = Map.get(engine.chat_read_positions, message_key, 0)
-
-      case newest_origin_reply(engine, person, message_key, seq, current) do
+         {:ok, reply_seq} <- RecipientItems.read_through(engine, message_key, entry_id) do
+      case reply_seq do
         nil ->
           {:ok, :unchanged}
 
@@ -1152,9 +1151,8 @@ defmodule AttentionServer.ClientAPI.Writes do
   # is 400 unsupported (contract rulings round 13); not_found is only for an
   # item the person cannot see.
   defp frame(engine, principal, key, {:reply, item_id, text, _file_ids}) do
-    with {:ok, {_person, sender, message_id} = message_key} <-
-           Resources.person_item_key(engine, principal.person, item_id),
-         record = Map.fetch!(engine.messages, message_key),
+    with {:ok, {_person, sender, message_id}, record} <-
+           RecipientItems.fetch(engine, principal.person, item_id),
          :ok <- has_conversation(record) do
       {:ok,
        %{
@@ -1187,10 +1185,8 @@ defmodule AttentionServer.ClientAPI.Writes do
   end
 
   defp frame(engine, principal, key, {:answer, item_id, revision, value}) do
-    with {:ok, {_person, sender, message_id} = message_key} <-
-           Resources.person_item_key(engine, principal.person, item_id) do
-      record = Map.fetch!(engine.messages, message_key)
-
+    with {:ok, {_person, sender, message_id}, record} <-
+           RecipientItems.fetch(engine, principal.person, item_id) do
       cond do
         not answerable?(record) ->
           {:ok, answer_frame(key, sender, message_id, revision, nil)}
@@ -1366,43 +1362,6 @@ defmodule AttentionServer.ClientAPI.Writes do
       {:ok, dir} -> {:ok, dir}
       {:error, :disabled} -> {:error, :not_found}
       _ -> {:error, :storage_unavailable}
-    end
-  end
-
-  defp item_entry_seq(engine, person, message_key, entry_id) do
-    with {:ok, seq} <- Resources.entry_seq(entry_id),
-         %{key: ^message_key} <- Map.get(engine.conversation_events, {person, seq}) do
-      {:ok, seq}
-    else
-      _ -> {:error, :invalid_field, "entry_id"}
-    end
-  end
-
-  # Walks only this item's conversation, newest first, from the entry down to
-  # the current position (the Route B index keeps each item's seqs in order).
-  defp newest_origin_reply(engine, person, key, seq, current) do
-    case Map.get(engine.route_b_index.conversations_by_item, key) do
-      nil ->
-        nil
-
-      tree ->
-        first_origin_reply(:gb_trees.iterator_from({-seq, seq}, tree), engine, person, current)
-    end
-  end
-
-  defp first_origin_reply(iterator, engine, person, current) do
-    case :gb_trees.next(iterator) do
-      {{_, seq}, _, _next} when seq <= current ->
-        nil
-
-      {{_, seq}, _, next} ->
-        case Map.get(engine.conversation_events, {person, seq}) do
-          %{payload: %{"kind" => "reply", "author" => "origin"}} -> seq
-          _ -> first_origin_reply(next, engine, person, current)
-        end
-
-      :none ->
-        nil
     end
   end
 
