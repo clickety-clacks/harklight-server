@@ -6,9 +6,10 @@ defmodule AttentionServer.Repository.Postgres.Schema do
     "002_message_history.sql",
     "003_large_text.sql",
     "004_conversation_read_positions.sql",
-    "005_shared_message_history.sql"
+    "005_shared_message_history.sql",
+    "006_conversation_entry_uploads.sql"
   ]
-  @version 5
+  @version 6
 
   def version, do: @version
   def migration_files, do: @migration_files

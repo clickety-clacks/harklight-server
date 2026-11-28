@@ -113,6 +113,9 @@ defmodule AttentionServer.Repository.Postgres.Uploads do
                  AND NOT EXISTS (
                    SELECT 1 FROM harklight.message_uploads WHERE upload_id = upload.id
                  )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM harklight.conversation_entry_uploads WHERE upload_id = upload.id
+                 )
                ORDER BY (upload.attributes->>'reservation_expires_at_ms')::bigint, upload.id
                FOR UPDATE OF upload SKIP LOCKED LIMIT $3
                """,
@@ -134,6 +137,9 @@ defmodule AttentionServer.Repository.Postgres.Uploads do
              DELETE FROM harklight.uploads AS upload WHERE upload.id = ANY($1::text[])
                AND NOT EXISTS (
                  SELECT 1 FROM harklight.message_uploads WHERE upload_id = upload.id
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM harklight.conversation_entry_uploads WHERE upload_id = upload.id
                )
              """,
              [ids]
