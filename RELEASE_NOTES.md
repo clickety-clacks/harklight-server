@@ -1,3 +1,23 @@
+# Harklight Server v0.2.36
+
+Alarm is an ordering marker for ordinary messages. Current Alarm messages
+sort before ordinary rows in the attention list. Clients that do not
+recognize the marker still receive the Server's ordering. Shared-message
+writes reject the marker. Authenticated device requests to `GET /v2/me`
+advertise support as `features.alarm: true`. Alarm does not change
+notifications or delivery.
+
+The Hosted Agent guide directs readers to Web when there is no usable
+iPhone install link. It explains that a compatible iPhone app is not yet
+available to customers. The Hosted invitation page clarifies when to open a
+native invitation and gives separate directions for Web sign-in and Agent
+CLI setup.
+
+**Compatibility.** Protocol 0.2, FORMAT32 and auth generation 1. Bundled Web
+remains 0.2.7. Using Alarm controls requires a supporting App build or
+Harklight Agent 0.2.12. App support is currently limited to internal
+TestFlight build 369, and Agent 0.2.12 is pending.
+
 # Harklight Server v0.2.35
 
 The Hosted Agent guide now walks through connecting Harklight Agent 0.2.10,
