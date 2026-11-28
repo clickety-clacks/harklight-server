@@ -96,8 +96,16 @@ defmodule AttentionServer.Migration.MaterialIdentityTest do
     foreign = Map.put(configured, "ATTENTION_SERVER_DASHBOARD_KEYFILE", {"dashboard.key", File.read!(Path.join(certs, "b1.key"))})
     {root, manifest} = bundle(certs, [], %{}, foreign)
     assert {:error, :material_dashboard_identity_mismatch} = MaterialIdentity.validate(root, manifest)
-    {root, manifest} = bundle(certs, [], %{}, Map.delete(configured, "ATTENTION_SERVER_DASHBOARD_KEYFILE"))
-    assert {:error, :material_dashboard_identity_mismatch} = MaterialIdentity.validate(root, manifest)
+    for {variable, wrong_file} <- [{"ATTENTION_SERVER_DASHBOARD_CERTFILE", "b1.pem"},
+                                  {"ATTENTION_SERVER_DASHBOARD_KEYFILE", "b1.key"}] do
+      # Match runtime's independent fallback to the captured Server component.
+      {root, manifest} = bundle(certs, [], %{}, Map.take(configured, [variable]))
+      assert :ok = MaterialIdentity.validate(root, manifest)
+      {filename, _} = configured[variable]
+      wrong = %{variable => {filename, File.read!(Path.join(certs, wrong_file))}}
+      {root, manifest} = bundle(certs, [], %{}, wrong)
+      assert {:error, :material_dashboard_identity_mismatch} = MaterialIdentity.validate(root, manifest)
+    end
     for variable <- ["UNCONFIGURED_FILE", "ATTENTION_SERVER_JEV_SCORE_RECORD_PATH"] do
       {root, manifest} = bundle(certs, [], %{}, %{variable => {"not-imported", "synthetic output"}})
       assert {:error, :unsupported_or_missing_identity_material} = MaterialIdentity.validate(root, manifest)
