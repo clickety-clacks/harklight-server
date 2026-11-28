@@ -54,11 +54,11 @@ defmodule AttentionServer.Migration.ImportAccounts do
            is_binary(instance) and byte_size(instance) > 0 and is_binary(key) and
              byte_size(key) > 0,
          {:ok, epoch_table} <- Map.fetch(manifest.data.tables, "client_change_log_epoch"),
-         {:ok, [[1, epoch]]} <-
+         {:ok, epoch_rows} <-
            Frames.fold(Path.join(root, epoch_table.file), epoch_table.summary, [], fn row, acc ->
              {:ok, [row | acc]}
            end),
-         true <- is_integer(epoch) and epoch > 0,
+         {:ok, epoch} <- source_epoch(epoch_rows),
          {:ok, checkpoint} <- ImportSession.checkpoint(db, identity, "accounts/identity/v1") do
       entry = {instance, key, epoch}
 
@@ -96,6 +96,12 @@ defmodule AttentionServer.Migration.ImportAccounts do
       _ -> {:error, :source_identity_missing}
     end
   end
+
+  # ChangeLog.epoch/1 treats an absent row as epoch 1. Preserve that existing
+  # effective value; do not generate a new epoch or change retained cursors.
+  defp source_epoch([]), do: {:ok, 1}
+  defp source_epoch([[1, epoch]]) when is_integer(epoch) and epoch > 0, do: {:ok, epoch}
+  defp source_epoch(_), do: {:error, :invalid_source_epoch}
 
   defp write(db, entries) do
     Enum.reduce_while(entries, :ok, fn entry, :ok ->

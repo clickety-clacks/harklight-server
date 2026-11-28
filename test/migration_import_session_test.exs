@@ -63,6 +63,21 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           [{:blob, payload}, {:blob, hash}, {:blob, key}]
         )
 
+      for number <- 1..300 do
+        {key, payload, hash} =
+          AttentionServer.Store.RecordCodec.encode_row(
+            {:row, :persons, "synthetic-extra-#{number}"},
+            10_000 + number
+          )
+
+        :ok =
+          AttentionServer.Store.RecordTable.run(
+            sqlite,
+            "INSERT INTO relay_records(key,payload,checksum,account) VALUES (?,?,?,1)",
+            [{:blob, key}, {:blob, payload}, {:blob, hash}]
+          )
+      end
+
       :ok = Exqlite.Sqlite3.close(sqlite)
       bundle = Path.join(root, "export")
 
@@ -138,6 +153,65 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
                  flunk("stale checkpoint must not write")
                end)
 
+      # Fail the second batch after the first checkpoint has committed. This
+      # trigger exists only in this dedicated throwaway database.
+      {:ok, _} =
+        ImportSession.query(
+          db,
+          """
+          CREATE FUNCTION harklight.synthetic_interrupt() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN
+            IF (SELECT count(*) FROM harklight.compatibility_facts) >= 256 THEN
+              RAISE EXCEPTION 'synthetic interruption after committed batch';
+            END IF;
+            RETURN NEW;
+          END $$
+          """,
+          []
+        )
+
+      {:ok, _} =
+        ImportSession.query(
+          db,
+          """
+          CREATE TRIGGER synthetic_interrupt BEFORE INSERT ON harklight.compatibility_facts
+          FOR EACH ROW EXECUTE FUNCTION harklight.synthetic_interrupt()
+          """,
+          []
+        )
+
+      assert {:error, _} = ImportFacts.run(db, identity, bundle)
+      assert {:ok, %{ordinal: 256} = boundary} = ImportSession.checkpoint(db, identity, "records")
+
+      assert {:ok, %{rows: [[256]]}} =
+               ImportSession.query(db, "SELECT count(*) FROM harklight.compatibility_facts", [])
+
+      {:ok, _} =
+        ImportSession.query(
+          db,
+          "DROP TRIGGER synthetic_interrupt ON harklight.compatibility_facts",
+          []
+        )
+
+      {:ok, _} =
+        ImportSession.query(
+          db,
+          "UPDATE harklight.import_checkpoints SET cumulative_sha256=$1 WHERE family='records'",
+          [:binary.copy(<<0>>, 32)]
+        )
+
+      assert {:error, :checkpoint_source_mismatch} = ImportFacts.run(db, identity, bundle)
+
+      assert {:ok, %{rows: [[256]]}} =
+               ImportSession.query(db, "SELECT count(*) FROM harklight.compatibility_facts", [])
+
+      {:ok, _} =
+        ImportSession.query(
+          db,
+          "UPDATE harklight.import_checkpoints SET cumulative_sha256=$1 WHERE family='records'",
+          [boundary.digest]
+        )
+
       assert {:ok, complete} = ImportFacts.run(db, identity, bundle)
       assert complete.ordinal == manifest.data.records.count
       assert {:ok, ^complete} = ImportFacts.run(db, identity, bundle)
@@ -191,6 +265,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
 
       assert {:ok, %{rows: [["loading"]]}} =
                ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+
+      assert {:ok, %{rows: [[1]]}} =
+               ImportSession.query(db, "SELECT cursor_epoch FROM harklight.server_identity", [])
 
       Agent.stop(fixture.clock)
     end
