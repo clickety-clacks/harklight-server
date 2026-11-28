@@ -213,16 +213,27 @@ detect_roles() {
 
 # Run a client program as the runtime or the migration role. Passwords go in
 # the child's environment, never on a command line.
-rt_run() {
-  local program=$1; shift
-  PGPASSWORD="$(< "$pg_pwfile")" PGSSLROOTCERT="${pg_ca:-}" PGCONNECT_TIMEOUT=10 PGOPTIONS="-c client_min_messages=warning" \
-    "$pg_bin/$program" "$@"
+# The Server verifies TLS for any non-loopback host, and for a loopback host
+# when a CA file is configured, unless the URL says sslmode=disable. Connect
+# the same way so a setup or backup never silently uses an unencrypted link.
+ssl_default() {
+  local url=$1 host
+  [[ "$url" == *sslmode=* ]] && return 0
+  host="${url#*@}"; host="${host%%[:/?]*}"
+  case "$host" in
+    127.0.0.1|localhost|::1|\[::1\]) [[ -z "${pg_ca:-}" ]] || printf 'verify-full' ;;
+    *) printf 'verify-full' ;;
+  esac
 }
-mg_run() {
+db_run() {
+  local url=$1 pwfile=$2 mode; shift 2
   local program=$1; shift
-  PGPASSWORD="$(< "$mg_pwfile")" PGSSLROOTCERT="${pg_ca:-}" PGCONNECT_TIMEOUT=10 PGOPTIONS="-c client_min_messages=warning" \
-    "$pg_bin/$program" "$@"
+  mode="$(ssl_default "$url")"
+  PGPASSWORD="$(< "$pwfile")" PGSSLROOTCERT="${pg_ca:-}" PGCONNECT_TIMEOUT=10 PGOPTIONS="-c client_min_messages=warning" \
+    env ${mode:+PGSSLMODE=$mode} "$pg_bin/$program" "$@"
 }
+rt_run() { db_run "$pg_url" "$pg_pwfile" "$@"; }
+mg_run() { db_run "$mg_url" "$mg_pwfile" "$@"; }
 psql_flags=(--no-psqlrc --quiet --tuples-only --no-align --set ON_ERROR_STOP=1)
 psql_rt() { rt_run psql "${psql_flags[@]}" "$pg_url" "$@"; }
 psql_mg() { mg_run psql "${psql_flags[@]}" "$mg_url" "$@"; }
@@ -533,10 +544,10 @@ EOF
   note "After the schema is migrated, run: harklight-postgres apply-grants && harklight-postgres verify-roles"
 }
 
-# The Server accepts only these runtime URL forms: a user, no password, a
+# The Server accepts only these runtime URL forms; the migration URL is held to the same rule: a user, no password, a
 # database, and either no query, sslmode=verify-full, or sslmode=disable on a
 # loopback host. Anything else would be rejected at Server start.
-validate_runtime_url() {
+validate_role_url() {
   python3 -I - "$1" <<'PY' || exit 1
 import sys
 from urllib.parse import urlsplit, parse_qsl, unquote
@@ -544,10 +555,10 @@ u = urlsplit(sys.argv[1])
 def bad(msg):
     sys.stderr.write("harklight-postgres: " + msg + "\n"); sys.exit(1)
 if not u.hostname or not u.username or u.password is not None or u.fragment:
-    bad("the runtime URL needs a host and a user, and no password")
+    bad("each database URL needs a host and a user, and no password")
 db = unquote(u.path.lstrip("/"))
 if not db or "/" in db or ":" in unquote(u.username):
-    bad("the runtime URL needs a plain database name and user")
+    bad("each database URL needs a plain database name and user")
 q = parse_qsl(u.query, keep_blank_values=True)
 loop = u.hostname in ("127.0.0.1", "localhost", "::1")
 if q == [] or q == [("sslmode", "verify-full")]:
@@ -556,7 +567,7 @@ elif q == [("sslmode", "disable")]:
     if not loop:
         bad("sslmode=disable is only accepted for a loopback host; use sslmode=verify-full")
 else:
-    bad("the runtime URL may carry only sslmode=verify-full (or sslmode=disable on loopback); the Server rejects other query parameters")
+    bad("a database URL may carry only sslmode=verify-full (or sslmode=disable on loopback); other query parameters, including any that carry credentials, are refused")
 PY
 }
 
@@ -576,7 +587,8 @@ do_setup_remote() {
   done
   [[ -z "$ca_file" || "$ca_file" = /* ]] || fail "--ca-file must be an absolute path"
   [[ -z "$ca_file" || -f "$ca_file" ]] || fail "--ca-file does not exist"
-  validate_runtime_url "$remote_url"
+  validate_role_url "$remote_url"
+  validate_role_url "$migrator_url"
   [[ "$remote_url" != "$migrator_url" ]] || fail "the runtime and migration roles must be different roles"
   pg_url=$remote_url pg_pwfile=$password_file pg_ca=$ca_file
   mg_url=$migrator_url mg_pwfile=$migrator_password_file
@@ -653,6 +665,47 @@ guard_server_stopped() {
 
 sha() { sha256sum -- "$1" | cut -d' ' -f1; }
 
+# Files and directories server.env points at outside the state directory.
+# Regular files are captured into the archive; anything else is refused so a
+# backup never silently lacks bytes the Server needs. Prints NAME<TAB>path.
+external_refs() {
+  [[ -f "$state/server.env" ]] || return 0
+  python3 -I - "$state" "$root" "$state/server.env" <<'PY'
+import os, subprocess, sys
+state, root, envfile = sys.argv[1:4]
+def dump(cmd):
+    out = subprocess.run(["env", "-i", "HOME=" + os.environ["HOME"], "PATH=" + os.environ["PATH"],
+                          "bash", "-c", cmd, "x", envfile], capture_output=True).stdout
+    return dict(kv.split(b"=", 1) for kv in out.split(b"\0") if b"=" in kv)
+base = dump("env -0")
+new = dump('set -a; source "$1" >/dev/null 2>&1; env -0')
+inside = [os.path.realpath(p) for p in
+          (state, root + "/releases", root + "/current", root + "/bin", root + "/postgres", root + "/backups")]
+refused, found = [], []
+for name, value in sorted(new.items()):
+    if base.get(name) == value or name in (b"PWD", b"SHLVL", b"_", b"OLDPWD"):
+        continue
+    name, value = name.decode(), value.decode(errors="replace")
+    if not value.startswith("/") or name.endswith(("POSTGRES_PASSWORD_FILE", "POSTGRES_CA_FILE")):
+        continue
+    if "\t" in value or "\n" in value or "/../" in value + "/":
+        refused.append(name + "=" + value + " (unsupported characters)"); continue
+    real = os.path.realpath(value)
+    if any(real == d or real.startswith(d + "/") for d in inside) or not os.path.exists(real):
+        continue
+    if os.path.isfile(real) and os.access(real, os.R_OK):
+        found.append((name, value))
+    else:
+        refused.append(name + "=" + value + " (not a readable regular file)")
+if refused:
+    sys.stderr.write("harklight-postgres: server.env refers to paths outside the state directory that a backup cannot capture:\n  "
+                     + "\n  ".join(refused) + "\nMove them into the state directory or make them regular files; refusing to write an incomplete backup.\n")
+    sys.exit(3)
+for name, value in found:
+    print(name + "\t" + value)
+PY
+}
+
 do_backup() {
   local out=${positional[0]:-}
   [[ -n "$out" ]] || fail "usage: harklight-postgres backup ARCHIVE"
@@ -675,16 +728,29 @@ do_backup() {
   work="$(mktemp -d "$(dirname -- "$out")/.harklight-backup.XXXXXX")"
   trap 'rm -rf -- "$work"' EXIT
   mg_run pg_dump --format=custom --no-owner --no-privileges --file "$work/database.dump" "$mg_url"
-  tar -C "$state" --exclude=./postgres.env --exclude='./*.password' -cf "$work/state.tar" .
+  tar -C "$state" --exclude=./postgres.env -cf "$work/state.tar" .
+  local refs ext_n=0 name path
+  refs="$(external_refs)" || exit 1
+  mkdir -m 700 "$work/external"
+  : > "$work/external/MAP"
+  while IFS=$'\t' read -r name path; do
+    [[ -n "$name" ]] || continue
+    cp -p -- "$path" "$work/external/f$ext_n"
+    printf 'f%s\t%s\t%s\t%s\n' "$ext_n" "$path" "$(sha "$work/external/f$ext_n")" "$(stat -c %a -- "$path")" >> "$work/external/MAP"
+    ext_n=$((ext_n + 1))
+  done <<< "$refs"
+  tar -C "$work/external" -cf "$work/external.tar" .
   {
     printf 'format=%s\n' "$BACKUP_FORMAT"
     printf 'created=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'postgres_server=%s\n' "$(psql_mg -c 'show server_version')"
     printf 'database_sha256=%s\n' "$(sha "$work/database.dump")"
     printf 'state_sha256=%s\n' "$(sha "$work/state.tar")"
+    printf 'external_sha256=%s\n' "$(sha "$work/external.tar")"
+    printf 'external_files=%s\n' "$ext_n"
     printf 'tables=%s\n' "$(user_table_count)"
   } > "$work/MANIFEST"
-  tar -C "$work" -cf "$work/archive.tar" MANIFEST database.dump state.tar
+  tar -C "$work" -cf "$work/archive.tar" MANIFEST database.dump state.tar external.tar
   chmod 600 "$work/archive.tar"
   mv -- "$work/archive.tar" "$out"
   note "backup written: $out ($(du -h -- "$out" | cut -f1)); it contains private keys: keep it protected"
@@ -702,12 +768,25 @@ do_restore() {
   trap 'rm -rf -- "$work"' EXIT
   local listing
   listing="$(tar -tf "$archive")" || fail "the archive cannot be read"
-  [[ "$(printf '%s\n' "$listing" | sort | tr '\n' ' ')" == "MANIFEST database.dump state.tar " ]] ||
+  [[ "$(printf '%s\n' "$listing" | sort | tr '\n' ' ')" == "MANIFEST database.dump external.tar state.tar " ]] ||
     fail "the archive does not have the expected contents"
-  tar -C "$work" -xf "$archive" MANIFEST database.dump state.tar
+  tar -C "$work" -xf "$archive" MANIFEST database.dump state.tar external.tar
   grep -Fqx "format=$BACKUP_FORMAT" "$work/MANIFEST" || fail "unsupported backup format"
   grep -Fqx "database_sha256=$(sha "$work/database.dump")" "$work/MANIFEST" || fail "database dump checksum differs; the archive is damaged"
   grep -Fqx "state_sha256=$(sha "$work/state.tar")" "$work/MANIFEST" || fail "state checksum differs; the archive is damaged"
+  grep -Fqx "external_sha256=$(sha "$work/external.tar")" "$work/MANIFEST" || fail "external files checksum differs; the archive is damaged"
+  mkdir -m 700 "$work/external"
+  tar --no-same-owner -C "$work/external" -xf "$work/external.tar"
+  local ext_conflicts="" eid edest esha emode
+  while IFS=$'\t' read -r eid edest esha emode; do
+    [[ -n "$eid" ]] || continue
+    [[ "$eid" =~ ^f[0-9]+$ && "$edest" = /* && "/$edest/" != *"/../"* ]] || fail "the archive's external file map is unsafe"
+    [[ "$(sha "$work/external/$eid")" == "$esha" ]] || fail "an external file in the archive is damaged"
+    if [[ -e "$edest" && "$(sha "$edest" 2>/dev/null || true)" != "$esha" ]]; then ext_conflicts+=" $edest"; fi
+  done < "$work/external/MAP"
+  if [[ -n "$ext_conflicts" ]] && ((!replace)); then
+    fail "these files outside the state directory already exist with different content (pass --replace to keep them aside as .pre-restore and restore the archived ones):$ext_conflicts"
+  fi
   if tar -tf "$work/state.tar" | grep -Eq '(^|/)\.\.(/|$)|^/'; then fail "the state archive has unsafe paths"; fi
 
   psql_mg -c 'select 1' >/dev/null || fail "cannot connect to the database"
@@ -755,6 +834,15 @@ EOF
   fi
   mv -- "$staged" "$state"
   chmod 700 "$state"
+  while IFS=$'\t' read -r eid edest esha emode; do
+    [[ -n "$eid" ]] || continue
+    if [[ -e "$edest" ]]; then
+      [[ "$(sha "$edest")" != "$esha" ]] || continue
+      mv -- "$edest" "$edest.pre-restore-$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
+    mkdir -p -m 700 -- "$(dirname -- "$edest")"
+    install -m "$emode" -- "$work/external/$eid" "$edest"
+  done < "$work/external/MAP"
   note "restored $got tables and the state directory to $state"
   [[ -z "$previous" ]] || note "the previous state directory was kept at $previous"
 }

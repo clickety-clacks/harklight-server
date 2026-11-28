@@ -42,7 +42,10 @@ port="$(free_port)"
 
 mkdir -p "$state/tls" "$state/uploads"
 chmod 700 "$root" "$state"
-printf 'export ATTENTION_SERVER_ENABLE=1\n' > "$state/server.env"
+mkdir -m 700 "$scratch/ext"
+printf 'synthetic external key\n' > "$scratch/ext/server.key"; chmod 640 "$scratch/ext/server.key"
+printf 'export ATTENTION_SERVER_ENABLE=1\nexport ATTENTION_SERVER_STORE_PATH=%q\nexport ATTENTION_SERVER_KEYFILE=%q\n' "$state/relay.sqlite3" "$scratch/ext/server.key" > "$state/server.env"
+printf 'synthetic provider secret\n' > "$state/provider.password"
 printf 'synthetic ca\n' > "$state/tls/ca.pem"
 head -c 1048576 /dev/urandom > "$state/uploads/blob.bin"
 statehash() { (cd "$state" && find . -type f ! -name postgres.env -print0 | sort -z | xargs -0 sha256sum); }
@@ -156,15 +159,26 @@ printf '#!/bin/sh\nexit 0\n' > "$scratch/fakebin/systemctl"; chmod +x "$scratch/
 expect_fail "backup refuses while Harklight Server is running" "is running" \
   env PATH="$scratch/fakebin:$PATH" "$tool" backup "${args[@]}" "$scratch/never.tar"
 
+cp "$state/server.env" "$scratch/server.env.keep"
+printf 'export HK_TEST_DIR=%q\n' "$scratch/ext" >> "$state/server.env"
+expect_fail "backup refuses a directory outside the state directory that it cannot capture" "cannot capture" "$tool" backup "${args[@]}" "$scratch/never.tar"
+cp "$scratch/server.env.keep" "$state/server.env"
+[[ ! -e "$scratch/never.tar" ]] || bad "a refused backup left an archive"
+
 start=$(date +%s.%N)
 "$tool" backup "${args[@]}" "$scratch/backup.tar" >/dev/null
+[[ "$(tar -xOf "$scratch/backup.tar" MANIFEST | sed -n 's/^external_files=//p')" == 1 ]] || bad "external key was not captured"
+tar -xOf "$scratch/backup.tar" state.tar | tar -t | grep -q 'provider.password' || bad "non-database password file was dropped from the state backup"
+! tar -xOf "$scratch/backup.tar" state.tar | tar -t | grep -q 'postgres.env' || bad "postgres.env must not be in the state backup"
 printf 'backup seconds: %s\n' "$(echo "$(date +%s.%N) - $start" | bc)"
 [[ "$(stat -c %a "$scratch/backup.tar")" == 600 ]] || bad "backup mode"
 expect_fail "backup never overwrites" "already exists" "$tool" backup "${args[@]}" "$scratch/backup.tar"
 ok "backup written"
 
 m -c "truncate harklight.synth_receipts; delete from harklight.synth_messages where id % 2 = 0; create table harklight.stray(x int)" >/dev/null
-echo damaged > "$state/uploads/blob.bin"; rm "$state/tls/ca.pem"
+echo damaged > "$state/uploads/blob.bin"; rm "$state/tls/ca.pem"; rm -f "$state/provider.password"
+echo changed > "$scratch/ext/server.key"
+expect_fail "restore refuses to overwrite a different external file without --replace" "already exist with different content" "$tool" restore "${args[@]}" "$scratch/backup.tar"
 expect_fail "restore refuses a populated database without --replace" "pass --replace" "$tool" restore "${args[@]}" "$scratch/backup.tar"
 start=$(date +%s.%N)
 "$tool" restore "${args[@]}" --replace "$scratch/backup.tar" >/dev/null
@@ -175,6 +189,9 @@ printf 'restore seconds: %s\n' "$(echo "$(date +%s.%N) - $start" | bc)"
 [[ "$(m -c "select count(*) from pg_tables where tablename = 'stray'")" == 0 ]] || bad "stray table survived"
 [[ "$(statehash)" == "$(cat "$scratch/state.sha")" ]] || bad "state files differ after restore"
 [[ -f "$state/postgres.env" ]] || bad "postgres.env was lost"
+[[ "$(cat "$scratch/ext/server.key")" == "synthetic external key" && "$(stat -c %a "$scratch/ext/server.key")" == 640 ]] || bad "external key was not restored with its mode"
+[[ "$(ls "$scratch/ext" | grep -c pre-restore)" == 1 ]] || bad "the different external file was not kept aside"
+[[ "$(cat "$state/provider.password")" == "synthetic provider secret" ]] || bad "provider.password was not restored"
 ok "restore round trip: database rows, receipts and state bytes identical"
 q -c "insert into harklight.synth_messages values (-1,'after restore')" >/dev/null
 denied "truncate harklight.synth_messages"
@@ -183,7 +200,7 @@ ok "restore re-applies the runtime role's grants and keeps the boundary"
 
 cp "$scratch/backup.tar" "$scratch/bad.tar"
 mkdir "$scratch/x" && tar -C "$scratch/x" -xf "$scratch/bad.tar" && echo x >> "$scratch/x/database.dump" &&
-  tar -C "$scratch/x" -cf "$scratch/bad.tar" MANIFEST database.dump state.tar
+  tar -C "$scratch/x" -cf "$scratch/bad.tar" MANIFEST database.dump state.tar external.tar
 expect_fail "restore refuses a damaged archive" "checksum differs" "$tool" restore "${args[@]}" --replace "$scratch/bad.tar"
 
 # Operator-supplied remote PostgreSQL (a second database on the same private cluster).
@@ -213,6 +230,8 @@ expect_fail "remote setup refuses query parameters the Server rejects" "may carr
   "$tool" setup "${r[@]}" --remote-url "postgres://rrun@$base?connect_timeout=5" --password-file "$scratch/rrun.pw" --migrator-url "postgres://rmig@$base" --migrator-password-file "$scratch/rmig.pw"
 expect_fail "remote setup refuses sslmode=disable for a non-loopback host" "only accepted for a loopback host" \
   "$tool" setup "${r[@]}" --remote-url "postgres://rrun@db.invalid:5432/harklight?sslmode=disable" --password-file "$scratch/rrun.pw" --migrator-url "postgres://rmig@db.invalid/harklight" --migrator-password-file "$scratch/rmig.pw"
+expect_fail "remote setup refuses credential-bearing parameters on the migrator URL" "other query parameters" \
+  "$tool" setup "${r[@]}" --remote-url "postgres://rrun@$base" --password-file "$scratch/rrun.pw" --migrator-url "postgres://rmig@$base?password=x" --migrator-password-file "$scratch/rmig.pw"
 expect_fail "remote setup requires absolute password files" "absolute paths" \
   "$tool" setup "${r[@]}" --remote-url "postgres://rrun@$base" --password-file rrun.pw --migrator-url "postgres://rmig@$base" --migrator-password-file "$scratch/rmig.pw"
 expect_fail "remote setup requires a separate owner role" "separate owner role" \
@@ -236,6 +255,39 @@ q2 -c "delete from harklight.t; create table harklight.extra(x int)" >/dev/null
 PGPASSWORD="$pw2" "$pg_bin/psql" -qtA "postgres://rrun@$base" -c "select count(*) from harklight.t" >/dev/null || bad "runtime role lost access after restore"
 if PGPASSWORD="$pw2" "$pg_bin/psql" -qtA "postgres://rrun@$base" -c "truncate harklight.t" >/dev/null 2>&1; then bad "remote runtime role can truncate"; fi
 ok "operator-supplied database: boundary checked, backs up and restores identically"
+
+# Verified TLS: a host the Server treats as non-loopback with no sslmode must be
+# reached over verified TLS, so setup, backup and restore never fall back to plaintext.
+cd "$scratch"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=synthetic ca" -keyout ca.key -out ca.pem 2>/dev/null
+openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.2" -keyout server.key -out server.csr 2>/dev/null
+printf 'subjectAltName=IP:127.0.0.2\n' > san.ext
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile san.ext -out server.pem 2>/dev/null
+cp server.pem "$root/postgres/data/server.crt"; cp server.key "$root/postgres/data/server.key"; chmod 600 "$root/postgres/data/server.key"
+printf "listen_addresses = '127.0.0.1,127.0.0.2'\n" >> "$root/postgres/data/postgresql.conf"
+printf 'host remotedb rmig,rrun 127.0.0.2/32 scram-sha-256\n' >> "$root/postgres/data/pg_hba.conf"
+"$pg_bin/pg_ctl" -D "$root/postgres/data" -m fast -w restart >/dev/null   # TLS off: ssl is not yet enabled
+tbase="127.0.0.2:$port/remotedb"
+state3="$scratch/state3"; mkdir -m 700 "$state3"; echo cfg > "$state3/server.env"; mkdir -m 700 "$scratch/root3"
+t=(--root "$scratch/root3" --state "$state3" --pg-bin "$pg_bin")
+expect_fail "remote setup does not fall back to plaintext when the server has no TLS" "cannot connect" \
+  "$tool" setup "${t[@]}" --remote-url "postgres://rrun@$tbase" --password-file "$scratch/rrun.pw" --migrator-url "postgres://rmig@$tbase" --migrator-password-file "$scratch/rmig.pw" --ca-file "$scratch/ca.pem"
+printf "ssl = on\n" >> "$root/postgres/data/postgresql.conf"
+"$pg_bin/pg_ctl" -D "$root/postgres/data" -m fast -w restart >/dev/null
+expect_fail "remote setup rejects a server certificate it cannot verify" "cannot connect" \
+  "$tool" setup "${t[@]}" --remote-url "postgres://rrun@$tbase" --password-file "$scratch/rrun.pw" --migrator-url "postgres://rmig@$tbase" --migrator-password-file "$scratch/rmig.pw"
+q2 -c "drop schema harklight cascade" >/dev/null
+"$tool" setup "${t[@]}" --remote-url "postgres://rrun@$tbase" --password-file "$scratch/rrun.pw" --migrator-url "postgres://rmig@$tbase" --migrator-password-file "$scratch/rmig.pw" --ca-file "$scratch/ca.pem" >/dev/null
+q3() { PGPASSWORD="$pw1" PGSSLMODE=verify-full PGSSLROOTCERT="$scratch/ca.pem" "$pg_bin/psql" --no-psqlrc -qtA -v ON_ERROR_STOP=1 "postgres://rmig@$tbase" "$@"; }
+[[ "$(q3 -c 'select ssl from pg_stat_ssl where pid = pg_backend_pid()')" == t ]] || bad "test connection was not TLS"
+q3 -c "create schema harklight; create table harklight.t(id int primary key, v text); insert into harklight.t select g, md5(g::text) from generate_series(1,500) g" >/dev/null
+"$tool" apply-grants "${t[@]}" >/dev/null
+sum3="$(q3 -c "select md5(string_agg(v, ',' order by id)) from harklight.t")"
+"$tool" backup "${t[@]}" "$scratch/tls.tar" >/dev/null
+q3 -c "delete from harklight.t" >/dev/null
+"$tool" restore "${t[@]}" --replace "$scratch/tls.tar" >/dev/null
+[[ "$(q3 -c "select md5(string_agg(v, ',' order by id)) from harklight.t")" == "$sum3" ]] || bad "TLS remote restore differs"
+ok "remote database over verified TLS (no sslmode in the URL): setup, backup and restore round trip"
 
 "$tool" status "${args[@]}" >/dev/null
 ok "status reports working connections and a clean role boundary"

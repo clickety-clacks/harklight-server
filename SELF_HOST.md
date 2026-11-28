@@ -641,9 +641,13 @@ or can create schemas or objects.
 Create an empty database, a separate owner role and a non-owner runtime role
 first. Setup connects as both, requires PostgreSQL 16 or newer, refuses a
 database that already holds any objects (it is never repurposed), refuses a
-runtime role that is the same as the owner or privileged, runs the same
-privilege-boundary test as the local setup, and warns when a non-loopback host
-is not used with `sslmode=verify-full`. A password never appears in a URL.
+runtime role that is the same as the owner or privileged, and runs the same
+privilege-boundary test as the local setup. Both URLs may carry no password and
+no query except `sslmode=verify-full` (or `sslmode=disable` on a loopback host);
+any other parameter is refused. Like the Server, the commands verify TLS for
+any non-loopback host, with or without `sslmode` in the URL, and never fall back
+to an unencrypted connection; give `--ca-file` when the certificate is not in
+the system trust store. Password and CA paths must be absolute.
 Availability, replication and the network path of that database are yours to
 operate.
 
@@ -655,15 +659,23 @@ operate.
 Stop Harklight Server first; both commands refuse to run while
 `harklight-server.service` is active. `backup` writes one mode-0600 archive
 holding a PostgreSQL dump of the Harklight database, the whole state directory
-(configuration, TLS and owner keys, and any files Harklight keeps there) and
-SHA-256 checksums of both. It checks free space first and never overwrites an
-existing file. The archive contains private keys: store it like the state
-directory itself. `postgres.env` and the database passwords are not in it,
-because they belong to the cluster, not the data.
+(configuration, TLS and owner keys, every other file Harklight keeps there,
+including any `*.password` file), copies of any regular files `server.env`
+points at outside the state directory (for example a certificate or key kept
+elsewhere), and SHA-256 checksums of all of it. If `server.env` points at
+something outside the state directory that cannot be captured (a directory, an
+unreadable file), `backup` refuses and names it rather than writing an
+incomplete backup. It checks free space first and never overwrites an existing
+file. The archive contains private keys: store it like the state directory
+itself. Only `postgres.env` and the cluster's own database passwords are left
+out, because they belong to the cluster, not the data; an operator-supplied
+database's password file is yours to keep.
 
 `restore` verifies the checksums and the archive's contents before changing
 anything. A database that already holds data is refused unless you pass
-`--replace`; with it, the local database is dropped and recreated so nothing
+`--replace`; files outside the state directory that already exist with different
+content are refused the same way, and with `--replace` they are kept beside as
+`NAME.pre-restore-TIMESTAMP`; with it, the local database is dropped and recreated so nothing
 from before survives. It then re-applies the runtime role's grants and checks
 the role boundary. The state directory is replaced only after the database
 restored cleanly, and the previous one is kept beside it as
