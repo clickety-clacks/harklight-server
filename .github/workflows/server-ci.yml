@@ -87,7 +87,9 @@ jobs:
             test/attention_server/repository/postgres_message_history.sql \
             priv/postgres/003_large_text.sql \
             priv/postgres/004_conversation_read_positions.sql \
-            test/attention_server/repository/postgres_conversation_read_positions.sql |
+            test/attention_server/repository/postgres_conversation_read_positions.sql \
+            priv/postgres/005_shared_message_history.sql \
+            test/attention_server/repository/postgres_shared_message_history.sql |
             docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d fixture -f -
       - uses: erlef/setup-beam@v1
         with:
@@ -128,7 +130,8 @@ jobs:
         run: |
           apply_schema() {
             cat priv/postgres/001_initial.sql priv/postgres/002_message_history.sql \
-              priv/postgres/003_large_text.sql priv/postgres/004_conversation_read_positions.sql |
+              priv/postgres/003_large_text.sql priv/postgres/004_conversation_read_positions.sql \
+              priv/postgres/005_shared_message_history.sql |
               docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d "$1" -f -
           }
           apply_schema migration_fixture
