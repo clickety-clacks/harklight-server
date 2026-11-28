@@ -354,3 +354,10 @@ ordinary cleanup policy again removes expired, unlinked reservations, including
 those whose bytes have been fully transferred. Linked attachments remain retained.
 `ImportBytes` is an internal chunk primitive; the `ImportUploads` entry point
 binds the verified bundle to the import's source digest before calling it.
+Schema 002 lets ordinary history retain unknown intermediate revision acceptance
+times as SQL NULL. Known first and latest acceptance times remain exact. Hosted
+notices retain their reserved origin and sender without manufacturing a principal.
+The import still stays in `loading`; these record projections do not validate or
+activate a destination. Fresh imports pin the digest of migrations 001 and 002 in
+order. Resuming an already claimed import requires its original identity and
+schema digest, even after the destination applies migration 002.
