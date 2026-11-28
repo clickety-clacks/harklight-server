@@ -649,22 +649,28 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     defp seed_advisory(path) do
       alias AttentionServer.{BounceDecision, BouncePolicy, Engine, Store}
       {:ok, store} = Store.open_relay(path)
-      {key = {person, sender, external_id}, record} = Enum.find(store.engine.messages, fn {key, record} ->
-        is_nil(record.terminal) and is_binary(Map.get(record, :session_handle)) and
-          not BounceDecision.opened?(store.engine, key, 1) and
-          not Enum.any?(store.engine.conversation_events, fn {_, event} ->
-            event.key == key and event.payload["kind"] == "discussion"
-          end)
+      {{person, sender, _}, sample} = Enum.find(store.engine.messages, fn {_, record} ->
+        is_binary(Map.get(record, :session_handle))
       end)
-      scope = {person, record.origin, record.session_handle}
-      session = Map.fetch!(store.engine.origin_sessions, scope)
-      support = %{"route" => "other", "cli_version" => "synthetic", "unsupported_reason" => nil,
-        "advisory_v1" => true, "origin" => record.origin, "reported_at" => record.accepted_at}
-      engine = Engine.put_row(store.engine, :origin_sessions, scope, Map.put(session, :support, support))
       {:ok, levels} = BouncePolicy.normalize_levels([
         %{"name" => "Follow up", "lower_bound" => 0, "bounce_after_days" => 1}
       ])
-      {:ok, engine, _} = BounceDecision.configure_levels(engine, person, levels, record.accepted_at)
+      {:ok, engine, _} = BounceDecision.configure_levels(store.engine, person, levels, sample.accepted_at)
+      external_id = "synthetic-migration-advisory"
+      frame = %{
+        "type" => "forward", "op_id" => "30000000-0000-4000-8000-000000000007",
+        "session_handle" => sample.session_handle,
+        "route" => "other", "cli_version" => "synthetic", "unsupported_reason" => nil,
+        "advisory_v1" => true,
+        "message" => %{"sender_id" => sender, "message_id" => external_id,
+          "created_at" => 1, "title" => "Synthetic advisory", "message_type" => "fyi",
+          "answer_ui" => %{"schema" => "attention-client.actions/1", "actions" => [
+            %{"id" => "seen", "label" => "Seen", "kind" => "value", "value" => %{"acknowledgment" => "seen"}}
+          ]}}
+      }
+      {engine, {:ok, _}} = Engine.request_command(engine, sample.origin, frame, sample.accepted_at + 1)
+      record = Map.fetch!(engine.messages, {person, sender, external_id})
+      scope = {person, record.origin, record.session_handle}
       engine = BounceDecision.record_scores(engine, person,
         [%{"sender_id" => sender, "message_id" => external_id, "score" => 0.9}], record.accepted_at)
       engine = BounceDecision.evaluate_due(engine, record.accepted_at + 86_400_001)
