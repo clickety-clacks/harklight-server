@@ -84,10 +84,16 @@ defmodule AttentionServer.Migration.CLI do
 
       {:error, reason} ->
         # Do not print source values, paths, configuration or identity material.
-        IO.puts(:stderr, "Migration refused: " <> error_code(reason))
-        System.halt(2)
+        {status, message} = failure(reason)
+        IO.puts(:stderr, message)
+        System.halt(status)
     end
   end
+
+  # Stable process contract for orchestration; never includes database details.
+  def failure(:validation_retry_required),
+    do: {75, "Migration retryable: validation_retry_required; retry the same command with the same bundle and receipt."}
+  def failure(reason), do: {2, "Migration refused: " <> error_code(reason)}
 
   defp required(opts, key) do
     case Keyword.get(opts, key) do
