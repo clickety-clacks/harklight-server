@@ -56,6 +56,15 @@ defmodule AttentionServer.Repository.Postgres.Transaction do
     end
   end
 
+  @doc "Reads related facts in one primary snapshot when they need separate indexed queries."
+  def snapshot(read) when is_function(read, 0) do
+    run([], fn _ ->
+      with {:ok, _} <- query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY", []) do
+        read.()
+      end
+    end)
+  end
+
   # Retry only errors where PostgreSQL guarantees rollback. A dropped
   # connection during COMMIT is ambiguous and must reach the caller so it
   # can replay the original operation identity through the receipt lookup.
