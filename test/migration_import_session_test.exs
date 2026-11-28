@@ -355,6 +355,48 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       end
     end
 
+    @tag timeout: 120_000
+    test "legacy source without local roster retains initialization membership" do
+      uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
+      assert uri.host in ["localhost", "127.0.0.1"]
+      [user, password] = String.split(uri.userinfo, ":", parts: 2)
+      {:ok, db} = Postgrex.start_link(
+        hostname: uri.host, port: uri.port,
+        username: URI.decode(user), password: URI.decode(password),
+        database: "migration_implicit_roster"
+      )
+      on_exit(fn -> if Process.alive?(db), do: GenServer.stop(db) end)
+      root = Path.join(System.tmp_dir!(), "import-legacy-#{System.unique_integer([:positive])}")
+      File.mkdir!(root)
+      File.chmod!(root, 0o700)
+      on_exit(fn -> File.rm_rf!(root) end)
+      fixture = CompatibilityScenarios.fixture(Path.join(root, "history"))
+      {:ok, relay} = CompatibilityScenarios.start(fixture, shared_messages: false, groups: false)
+      expected = try do
+        %{person: person, other: other} = CompatibilityScenarios.provision(relay, fixture)
+        {:ok, hosted} = Relay.hosted_account_create(relay, "synthetic-legacy-hosted")
+        engine = :sys.get_state(relay).store.engine
+        refute Map.has_key?(engine.local_organizations, :default)
+        %{instance: engine.relay_instance_id, members: [person, other], hosted: hosted}
+      after
+        GenServer.stop(relay)
+      end
+      bundle = Path.join(root, "export")
+      assert {:ok, summary} = Bundle.export(Path.join(fixture.root, "relay.sqlite3"), bundle,
+        supervisor: {:operator, "synthetic fixture", "seed Relay stopped"}, material: %{})
+      identity = %{id: "synthetic-legacy", source: Base.decode16!(summary.sha256, case: :lower),
+        schema: :crypto.hash(:sha256, File.read!("priv/postgres/001_initial.sql"))}
+      assert :ok = ImportOrganizations.run(db, identity, bundle)
+      assert :ok = ImportOrganizations.run(db, identity, bundle)
+      assert_members(db, expected.instance, expected.members)
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.organization_members WHERE person_id=$1", [expected.hosted])
+      assert {:ok, %{rows: [[text]]}} = ImportSession.query(db,
+        "SELECT attributes::text FROM harklight.organizations WHERE id=$1", [expected.instance])
+      assert_typed(text, nil)
+      Agent.stop(fixture.clock)
+    end
+
     defp seed_organizations(path, epoch) do
       alias AttentionServer.{Engine, Groups, Store}
       {:ok, store} = Store.open_relay(path)
@@ -378,7 +420,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         {:ok, engine, _, ^invitation} = Groups.invite(engine, local_group, manager, invitee, invitation)
         {:ok, engine, _} = Groups.mute(engine, local_group, manager, true)
         engine = if epoch == 1 do
-          Engine.delete_row(engine, :local_organizations, :default)
+          {:ok, explicit} = Engine.set_local_organization_member(engine, extra, true)
+          explicit
         else
           {:ok, explicit} = Engine.set_local_organization_member(engine, extra, false)
           explicit
