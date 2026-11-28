@@ -671,3 +671,11 @@ rollback journal before and after reading bundle contents. Sidecars must be
 absent or empty; a nonempty sidecar refuses even if the main database hash is
 unchanged. All verifiers share this check. It never opens, checkpoints, clears
 or otherwise modifies the copied source to make validation pass.
+
+`VerifyDeliveryAcks.run/3` checks retained ACK journal pointers after exact raw
+facts and normalized feed comparisons. Each pointer must resolve to the same
+person's ordinary conversation, origin session, original turn and ACK stage;
+the normalized entry must retain the original journal position, revision and
+full typed payload. Missing or mismatched pointers refuse, without inventing a
+receipt or advancing delivery state. This does not prove runtime reconciliation
+of pending external work, which remains a separate activation requirement.
