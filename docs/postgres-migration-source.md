@@ -783,3 +783,9 @@ Errors remain exit 2 with a stable code; success is one contract-version-1 JSON
 object. No command starts Server, edits backend configuration, contacts providers
 or activates PostgreSQL. Capabilities lists import and validate, but
 `migration_ready` remains false until the full rehearsal gates pass.
+
+A loader batch also versions its locked import-state row. If validation began
+before that batch committed, PostgreSQL refuses the older validation snapshot
+with a serialization failure. Retry `validate` with the same bundle and receipt;
+it recomputes every comparison from a fresh snapshot. No report from the failed
+attempt is published or reused.
