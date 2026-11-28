@@ -476,3 +476,13 @@ terminal and supplemental attributes, without altering recorded timestamps or
 raw source facts. Its writes and checkpoint roll back together. Scoped ordinary
 item-reader parity is checked after interruption and resume; shared history and
 full authorized HTTP parity remain separate required gates.
+
+`ImportRecipients.run/3` projects the current recipient visibility, substantive
+revision and explicit origin result into typed recipient metadata. `seen_revision`
+is set only for exact membership of that current substantive revision in the
+source opened set; an older opened revision never implies a newer one is seen.
+The raw-to-substantive mapping and complete historical opened set stay intact in
+source facts. Current metadata uses the same source fallback semantics and a
+separate atomic checkpoint; future runtime writers must recompute it when the
+substantive revision changes. Any externalized origin-result field uses the
+verified LargeText path projection rather than a raw marker.

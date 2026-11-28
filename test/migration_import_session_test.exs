@@ -91,6 +91,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         seed_advisory(source_path)
         seed_historical_messages(source_path)
         expected_organizations = seed_organizations(source_path, epoch)
+        expected_recipients = source_recipient_expectations(source_path)
         {:ok, sqlite} = Exqlite.Sqlite3.open(source_path)
 
         {:ok, rows} =
@@ -434,6 +435,13 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportMessages.run(db, identity, bundle)
         start_supervised!({Repo, config})
         assert {:error, :postgres_not_active} = Transaction.verify_ready()
+        assert :ok = AttentionServer.Migration.ImportRecipients.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportRecipients.run(db, identity, bundle)
+        for {id, person, seen, metadata} <- expected_recipients do
+          assert {:ok, %{rows: [[^seen, actual]]}} = ImportSession.query(db,
+            "SELECT seen_revision,attributes FROM harklight.message_recipients WHERE message_id=$1 AND person_id=$2", [id, person])
+          assert {:ok, ^metadata} = Attributes.decode(actual)
+        end
         verify_messages(db, bundle, manifest)
         verify_receipt_replay(session_person, {agent_person, agent_key}, receipt_digest)
         wrong_source = %{identity | source: :crypto.hash(:sha256, "different export")}
@@ -910,6 +918,22 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert actual == File.read!(path)
       assert byte_size(actual) == size
       assert {:error, :not_found} = Uploads.read_chunk(person, id, count)
+    end
+
+    defp source_recipient_expectations(path) do
+      {:ok, store} = AttentionServer.Store.open_relay(path)
+      expected = Enum.map(store.engine.messages, fn {{person, _, _} = key, record} ->
+        raw = Map.get(record, :revision, 1)
+        state = Map.get(store.engine.bounce_revisions, key, %{})
+        substantive = Map.get(Map.get(state, :raw_to_substantive, %{}), raw,
+          Map.get(state, :current_substantive_revision, raw))
+        seen = AttentionServer.ClientAPI.Resources.seen?(store.engine, key, record)
+        {ImportMessages.id(key, record), person, if(seen, do: substantive),
+          %{visible: AttentionServer.BounceDecision.person_visible?(record),
+            substantive_revision: substantive, origin_result: Map.get(record, :origin_result)}}
+      end)
+      :ok = AttentionServer.Store.close(store)
+      expected
     end
 
     defp seed_historical_messages(path) do
