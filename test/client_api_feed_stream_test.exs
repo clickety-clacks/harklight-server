@@ -14,6 +14,33 @@ defmodule AttentionServer.ClientAPIFeedStreamTest.SubscriptionProbe do
   end
 end
 
+defmodule AttentionServer.ClientAPIFeedStreamTest.ClosedAdapter do
+  def send_chunked(payload, _status, _headers), do: {:ok, nil, payload}
+  def chunk(_payload, _data), do: {:error, :closed}
+end
+
+defmodule AttentionServer.ClientAPIFeedStreamTest.ClosedStartAdapter do
+  def send_chunked(_payload, _status, _headers),
+    do: raise(ArgumentError, "client closed before response headers")
+end
+
+defmodule AttentionServer.ClientAPIFeedStreamTest.ClosedSource do
+  def scope(_ctx), do: "A"
+
+  def read(_ctx, _cursor, _limit),
+    do: {:ok, [%{"rev" => 1, "kind" => "counts", "data" => %{}}], false, 1}
+
+  def opened(_ctx), do: :ok
+  def closed(_ctx), do: :ok
+  def focus(_ctx), do: :skip
+end
+
+defmodule AttentionServer.ClientAPIFeedStreamTest.InvalidFeedRenderer do
+  def render_many(_context, _principal, rows) do
+    Enum.map(rows, fn row -> {row, {:ok, %{"invalid" => self()}}} end)
+  end
+end
+
 defmodule AttentionServer.ClientAPIFeedStreamTest do
   # GET /v2/changes as Server-Sent Events (docs/client-api-v2.md §6), over
   # HTTP/2 with mutual TLS.
@@ -1073,6 +1100,152 @@ defmodule AttentionServer.ClientAPIFeedStreamTest do
 
     assert log =~
              "event=harklight_client_feed request_id=#{request_id} phase=close reason=client_closed"
+  end
+
+  @tag :client_closed_stream
+  test "a client closing a blocked feed is not a projection failure or HTTP 500", ctx do
+    Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 60_000)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
+
+    assert {:ok, conn} = Mint.HTTP2.put_settings(connect(ctx), initial_window_size: 0)
+    {conn, feed} = open_feed(conn)
+    {conn, feed} = await_open(conn, feed)
+    assert feed.status == 200
+
+    [pid] = feed_pids(ctx)
+    forward(ctx.relay, "client-closes-feed", 1)
+
+    assert eventually(fn ->
+             case Process.info(pid, :current_stacktrace) do
+               {:current_stacktrace, stack} ->
+                 Enum.any?(stack, &match?({Plug.Conn, :chunk, _, _}, &1))
+
+               nil ->
+                 false
+             end
+           end)
+
+    feed_ref = Process.monitor(pid)
+
+    log =
+      capture_log(fn ->
+        Mint.HTTP.close(conn)
+        assert_receive {:DOWN, ^feed_ref, :process, ^pid, _}, 5_000
+        Process.sleep(100)
+      end)
+
+    assert log =~ "event=harklight_client_feed"
+    assert log =~ "phase=close reason=client_closed"
+    refute log =~ "event=harklight_projection_failure"
+    refute log =~ "event=harklight_client_api "
+    refute log =~ "status=500"
+  end
+
+  @tag :closed_chunk_regression
+  test "a peer close during stream startup is not reported as an API failure", ctx do
+    context = %ClientAPI.Context{
+      principal: principal(ctx),
+      relay: ctx.relay,
+      request_id: "closed-feed-start"
+    }
+
+    conn = %Plug.Conn{
+      adapter: {AttentionServer.ClientAPIFeedStreamTest.ClosedStartAdapter, :test},
+      owner: nil,
+      state: :unset,
+      assigns: %{client_api_request_id: "closed-feed-start"}
+    }
+
+    log =
+      capture_log(fn ->
+        result =
+          ClientAPI.FeedStream.serve(
+            conn,
+            context,
+            0,
+            AttentionServer.ClientAPIFeedStreamTest.ClosedSource
+          )
+
+        send(self(), {:closed_feed_start_result, result})
+        assert eventually(fn -> watchers() == [] end, 200)
+        Process.sleep(50)
+      end)
+
+    assert_received {:closed_feed_start_result, %Plug.Conn{state: :sent, status: 200}}
+    assert log =~ "phase=close reason=client_closed"
+    refute log =~ "event=harklight_projection_failure"
+    refute log =~ "event=harklight_client_api "
+    refute log =~ "status=500"
+  end
+
+  @tag :closed_chunk_regression
+  test "a returned closed chunk ends the stream as client_closed", ctx do
+    Application.put_env(:attention_server, :client_api_feed_heartbeat_ms, 10)
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_heartbeat_ms) end)
+
+    context = %ClientAPI.Context{
+      principal: principal(ctx),
+      relay: ctx.relay,
+      request_id: "closed-feed"
+    }
+
+    conn = %Plug.Conn{
+      adapter: {AttentionServer.ClientAPIFeedStreamTest.ClosedAdapter, :test},
+      owner: nil,
+      state: :unset,
+      assigns: %{client_api_request_id: "closed-feed"}
+    }
+
+    log =
+      capture_log(fn ->
+        result =
+          ClientAPI.FeedStream.serve(
+            conn,
+            context,
+            0,
+            AttentionServer.ClientAPIFeedStreamTest.ClosedSource
+          )
+
+        send(self(), {:closed_feed_result, result})
+        assert eventually(fn -> watchers() == [] end, 200)
+        Process.sleep(50)
+      end)
+
+    assert_received {:closed_feed_result, %Plug.Conn{state: :chunked}}
+    assert log =~ "phase=close reason=client_closed"
+    refute log =~ "event=harklight_projection_failure"
+    refute log =~ "status=500"
+  end
+
+  @tag :feed_projection_failure
+  test "a genuine feed encoding failure remains a projection failure", ctx do
+    forward(ctx.relay, "invalid-feed-projection", 1)
+
+    Application.put_env(
+      :attention_server,
+      :client_api_feed_renderer,
+      AttentionServer.ClientAPIFeedStreamTest.InvalidFeedRenderer
+    )
+
+    on_exit(fn -> Application.delete_env(:attention_server, :client_api_feed_renderer) end)
+
+    log =
+      capture_log(fn ->
+        conn = connect(ctx)
+        {conn, feed} = open_feed(conn)
+        {conn, feed} = await_open(conn, feed)
+        assert feed.status == 200
+
+        {conn, feed, closing} = until_closing(conn, feed)
+        assert closing == %{event: "closing", data: %{"reason" => "internal_error"}}
+        {conn, _feed} = drain(conn, feed)
+        Mint.HTTP.close(conn)
+        Process.sleep(100)
+      end)
+
+    assert log =~ "event=harklight_projection_failure"
+    assert log =~ "resource=change cause=argument_error"
+    refute log =~ "status=500"
   end
 
   ## A slow client

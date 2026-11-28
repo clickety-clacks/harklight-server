@@ -76,33 +76,44 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     case source.read(ctx, cursor, @page) do
       {:ok, changes, more, position} ->
         subscribe_shows(ctx.principal, source)
-        conn = conn |> echo_agent_capability(ctx, source) |> start_stream()
+        conn = echo_agent_capability(conn, ctx, source)
 
-        send(watcher, {:feed_opened, self()})
+        case start_stream(conn, ctx) do
+          {:ok, conn} ->
+            send(watcher, {:feed_opened, self()})
 
-        state =
-          schedule_heartbeat(%{
-            ctx: ctx,
-            source: source,
-            cursor: cursor,
-            caught_up?: false,
-            watcher: watcher,
-            relay: monitor(ctx.relay),
-            last_show_id: nil,
-            timer: nil,
-            timer_ref: nil
-          })
+            state =
+              schedule_heartbeat(%{
+                ctx: ctx,
+                source: source,
+                cursor: cursor,
+                caught_up?: false,
+                watcher: watcher,
+                relay: monitor(ctx.relay),
+                last_show_id: nil,
+                timer: nil,
+                timer_ref: nil
+              })
 
-        send_page(conn, state, changes, more, position)
+            send_page(conn, state, changes, more, position)
+
+          {:client_closed, conn} ->
+            conn
+        end
 
       {:error, %Projection{} = fault} ->
-        conn
-        |> Projection.log(fault)
-        |> start_stream()
-        |> send_closing("internal_error")
+        conn = Projection.log(conn, fault)
+
+        case start_stream(conn, ctx) do
+          {:ok, conn} -> send_closing(conn, "internal_error")
+          {:client_closed, conn} -> conn
+        end
 
       {:error, :delivery_unavailable} ->
-        conn |> start_stream() |> send_closing("storage_unavailable")
+        case start_stream(conn, ctx) do
+          {:ok, conn} -> send_closing(conn, "storage_unavailable")
+          {:client_closed, conn} -> conn
+        end
 
       {:error, reason} ->
         Feed.send_read_error(conn, reason)
@@ -114,12 +125,33 @@ defmodule AttentionServer.ClientAPI.FeedStream do
 
   defp echo_agent_capability(conn, _ctx, _source), do: conn
 
-  defp start_stream(conn) do
-    conn
-    |> put_resp_header("content-type", "text/event-stream; charset=utf-8")
-    |> put_resp_header("cache-control", "no-cache")
-    |> put_resp_header("x-accel-buffering", "no")
-    |> send_chunked(200)
+  # send_chunked/2 writes the initial response headers. Unlike chunk/2 below,
+  # Plug does not normalize a transport close at this boundary, so an ArgumentError
+  # here would escape to Router.run/5 and become a projection failure plus a 500.
+  defp start_stream(conn, ctx) do
+    conn =
+      conn
+      |> put_resp_header("content-type", "text/event-stream; charset=utf-8")
+      |> put_resp_header("cache-control", "no-cache")
+      |> put_resp_header("x-accel-buffering", "no")
+      |> send_chunked(200)
+
+    {:ok, conn}
+  rescue
+    _error in ArgumentError ->
+      client_closed_stream(conn, ctx)
+
+    error in Bandit.TransportError ->
+      if error.error in [:closed, :econnreset, :econnaborted, :enotconn] do
+        client_closed_stream(conn, ctx)
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
+  defp client_closed_stream(conn, ctx) do
+    log(ctx, "close", "client_closed")
+    {:client_closed, %{conn | status: 200, state: :sent}}
   end
 
   # Reads and sends pages until the feed has caught up with the log.
@@ -157,7 +189,7 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   defp read_page(state), do: state.source.read(state.ctx, state.cursor, @page)
 
   defp send_page(conn, state, changes, more, position) do
-    case Projection.capture(fn -> send_changes(conn, changes) end) do
+    case send_changes(conn, changes) do
       {:ok, conn} ->
         continue(conn, %{state | cursor: position}, more)
 
@@ -341,18 +373,27 @@ defmodule AttentionServer.ClientAPI.FeedStream do
   end
 
   defp send_changes(conn, []), do: {:ok, conn}
-  defp send_changes(conn, changes), do: chunk_safely(conn, Enum.map(changes, &event/1))
+
+  defp send_changes(conn, changes) do
+    case Projection.capture(fn -> Enum.map(changes, &event/1) end) do
+      events when is_list(events) -> chunk_safely(conn, events)
+      {:error, %Projection{} = fault} -> {:error, fault}
+    end
+  end
 
   defp write_ephemeral(conn, event, data, key) do
-    Projection.capture(fn ->
-      json =
-        Projection.run(key, fn ->
-          Projection.probe({:feed_event, event})
-          JSON.encode!(data)
-        end)
+    case Projection.capture(fn ->
+           Projection.run(key, fn ->
+             Projection.probe({:feed_event, event})
+             JSON.encode!(data)
+           end)
+         end) do
+      json when is_binary(json) ->
+        chunk_safely(conn, ["event: ", event, "\ndata: ", json, "\n\n"])
 
-      chunk_safely(conn, ["event: ", event, "\ndata: ", json, "\n\n"])
-    end)
+      {:error, %Projection{} = fault} ->
+        {:error, fault}
+    end
   end
 
   @doc false
@@ -376,8 +417,8 @@ defmodule AttentionServer.ClientAPI.FeedStream do
     |> closing(state, "internal_error")
   end
 
-  # The HTTP server raises, rather than returning an error, when a send cannot
-  # complete, for example when the peer has gone or its window stays closed.
+  # A closed peer can make Plug.Conn.chunk/2 return {:error, reason}; some
+  # adapters also raise while attempting a transport write.
   defp chunk_safely(conn, data) do
     chunk(conn, data)
   rescue
