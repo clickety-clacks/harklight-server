@@ -646,6 +646,51 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
                run.(recent, other, expires + 1, no_write, project)
     end
 
+    @tag timeout: 120_000
+    test "unknown delivery acknowledgement stage refuses the receipt checkpoint" do
+      alias AttentionServer.Store.{RecordCodec, RecordTable}
+      uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
+      assert uri.host in ["localhost", "127.0.0.1"]
+      [user, password] = String.split(uri.userinfo, ":", parts: 2)
+      db = start_supervised!({Postgrex, [hostname: uri.host, port: uri.port,
+        username: URI.decode(user), password: URI.decode(password), database: "migration_invalid_ack"]})
+      root = Path.join(System.tmp_dir!(), "invalid-ack-#{System.unique_integer([:positive])}")
+      File.mkdir!(root)
+      File.chmod!(root, 0o700)
+      on_exit(fn -> File.rm_rf!(root) end)
+      fixture = CompatibilityScenarios.fixture(Path.join(root, "history"))
+      {:ok, relay} = CompatibilityScenarios.start(fixture)
+      try do
+        CompatibilityScenarios.run(relay, fixture)
+      after
+        GenServer.stop(relay)
+      end
+      path = Path.join(fixture.root, "relay.sqlite3")
+      {:ok, sqlite} = Exqlite.Sqlite3.open(path)
+      {:ok, rows} = RecordTable.select(sqlite, "SELECT key,payload,checksum FROM relay_records")
+      {address, stages} = Enum.find_value(rows, fn [key, payload, hash] ->
+        case RecordCodec.decode_row({key, payload, hash}) do
+          {:ok, {:origin_feed, _, {:delivery_ack, _}} = address, stages} -> {address, stages}
+          _ -> nil
+        end
+      end)
+      {key, payload, hash} = RecordCodec.encode_row(address, Map.put(stages, :unsupported_stage, 1))
+      :ok = RecordTable.run(sqlite, "UPDATE relay_records SET payload=?,checksum=? WHERE key=?",
+        [{:blob, payload}, {:blob, hash}, {:blob, key}])
+      :ok = Exqlite.Sqlite3.close(sqlite)
+      bundle = Path.join(root, "export")
+      assert {:ok, summary} = Bundle.export(path, bundle,
+        supervisor: {:operator, "synthetic fixture", "stopped invalid-stage fixture"}, material: %{})
+      identity = %{id: "synthetic-invalid-ack", source: Base.decode16!(summary.sha256, case: :lower),
+        schema: AttentionServer.Repository.Postgres.Schema.digest()}
+      assert {:error, :unsupported_delivery_ack} = ImportFeeds.run(db, identity, bundle)
+      assert {:error, :unsupported_delivery_ack} = ImportFeeds.run(db, identity, bundle)
+      assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "feeds/receipts/v1")
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.origin_delivery_acks", [])
+      assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+      Agent.stop(fixture.clock)
+    end
+
     defp seed_advisory(path) do
       alias AttentionServer.{BounceDecision, BouncePolicy, Engine, Store}
       {:ok, store} = Store.open_relay(path)

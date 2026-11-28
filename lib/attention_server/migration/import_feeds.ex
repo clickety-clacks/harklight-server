@@ -54,7 +54,8 @@ defmodule AttentionServer.Migration.ImportFeeds do
   end
 
   defp row(db, {{:origin_feed, {person, origin}, {:delivery_ack, position}}, body}) do
-    with {:ok, %{rows: [[1]]}} <- ImportSession.query(db,
+    with :ok <- supported_ack(body),
+         {:ok, %{rows: [[1]]}} <- ImportSession.query(db,
            "SELECT 1 FROM harklight.origin_feed_entries WHERE person_id=$1 AND origin_key=$2 AND position=$3", [person, origin, position]) do
       execute(db,
         "INSERT INTO harklight.origin_delivery_acks(person_id,origin_key,position,body) VALUES($1,$2,$3,$4::text::jsonb)",
@@ -92,6 +93,15 @@ defmodule AttentionServer.Migration.ImportFeeds do
   end
 
   defp row(_, _), do: {:error, :unsupported_feed_fact}
+
+  defp supported_ack(%{ack1: first} = stages) when is_integer(first) and first > 0 do
+    if Enum.all?(stages, fn
+      {:ack1, ^first} -> true
+      {:ack2, second} -> is_integer(second) and second > first
+      _ -> false
+    end), do: :ok, else: {:error, :unsupported_delivery_ack}
+  end
+  defp supported_ack(_), do: {:error, :unsupported_delivery_ack}
 
   defp high(db, person, origin, handle, kind, high),
     do: execute(db,
