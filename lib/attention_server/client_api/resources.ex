@@ -1369,7 +1369,8 @@ defmodule AttentionServer.ClientAPI.Resources do
   def settings_payload(levels, alerts, push),
     do: %{"priority_levels" => levels, "alerts" => alerts, @viewer => %{"push" => push}}
 
-  defp push_status(binding) do
+  @doc false
+  def push_status(binding) do
     %{"state" => binding.state, "revision" => binding.revision}
     |> put_present("binding_id", if(binding.active, do: Map.get(binding, :binding_id)))
     |> put_present("environment", if(binding.active, do: environment(binding.profile_id)))

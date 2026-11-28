@@ -739,8 +739,8 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
 
     @tag :tmp_dir
     test "FORMAT32 native bearers retain pending state and device authority in PostgreSQL", %{tmp_dir: dir} do
-      alias AttentionServer.{BrowserAuth, DeviceProof, NativeSignIn, Relay, Store.AuthSchema}
-      alias AttentionServer.ClientAPI.{Auth, Router}
+      alias AttentionServer.{BrowserAuth, DeviceProof, JSON, NativeSignIn, Relay, Store.AuthSchema}
+      alias AttentionServer.ClientAPI.{Auth, Router, Writes}
       alias AttentionServer.Repository.Postgres.Attributes
       alias Exqlite.Sqlite3
 
@@ -748,7 +748,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       active = "synthetic-active-device"
       pending = "synthetic-pending-device"
       path = Path.join(dir, "native.sqlite3")
-      opts = [store_path: path]
+      opts = [store_path: path, push_enabled: true]
       relay = start_supervised!({Relay, opts})
       assert :ok = Relay.setup_person(relay, person)
       assert :ok = Relay.setup_device(relay, person, active)
@@ -785,6 +785,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       :ok = Sqlite3.close(db)
       relay = start_supervised!({Relay, opts})
       router = Router.init(relay: relay, auth: {:browser, nil, nil})
+      postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, nil, nil})
 
       for {device, {header, hash, pending?}} <- requests do
         conn = Plug.Test.conn(:get, "/v2/me") |> Plug.Conn.put_req_header("authorization", header)
@@ -792,6 +793,11 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                  Auth.web(conn, nil, relay)
         assert {:ok, ^principal} = Auth.web(conn, nil, :postgres)
         assert %{status: 200} = Router.call(conn, router)
+
+        settings = Plug.Test.conn(:get, "/v2/settings") |> Plug.Conn.put_req_header("authorization", header)
+        assert %{status: 200, resp_body: body} = response = Router.call(settings, router)
+        assert %{status: 200, resp_body: ^body} = pg_response = Router.call(settings, postgres)
+        assert Plug.Conn.get_resp_header(response, "etag") == Plug.Conn.get_resp_header(pg_response, "etag")
 
         both = Plug.Test.put_req_cookie(conn, "__Host-harklight", "fixture-cookie")
         assert {:error, :unauthorized} = Auth.web(both, nil, relay)
@@ -806,11 +812,43 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
 
       {active_header, old_hash, _} = Map.fetch!(requests, active)
       old = Plug.Test.conn(:get, "/v2/me") |> Plug.Conn.put_req_header("authorization", active_header)
+      assert {:ok, principal} = Auth.web(old, nil, relay)
+      assert {:ok, 200, _, false} =
+               Writes.push(relay, principal, String.duplicate("a", 64), "production", 1)
+
+      settings = Plug.Test.conn(:get, "/v2/settings") |> Plug.Conn.put_req_header("authorization", active_header)
+      assert %{status: 200, resp_body: body} = response = Router.call(settings, router)
+      assert {:ok, %{"rev" => head, "settings" => %{"rev" => rev, "push" => %{"revision" => 1}}}} =
+               JSON.decode_line(body <> "\n")
+      binding = Map.fetch!(:sys.get_state(relay).store.engine.push_bindings, {person, active})
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.compatibility_facts (family, address, body) VALUES ('push_bindings', $1, $2)",
+                 [Attributes.key({:row, :push_bindings, {person, active}}), Attributes.encode(binding)]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)",
+                 [person, head]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.stream_resource_revisions
+                   (person_id, origin_key, resource_kind, resource_id, revision)
+                 VALUES ($1, '', 'settings', 'settings', $2)
+                 """,
+                 [person, rev]
+               )
+      assert %{status: 200, resp_body: ^body} = pg_response = Router.call(settings, postgres)
+      assert Plug.Conn.get_resp_header(response, "etag") == Plug.Conn.get_resp_header(pg_response, "etag")
+
       assert :ok = Relay.revoke_device(relay, active)
       assert {:ok, _} =
                Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [active])
       assert {:error, :unauthorized} = Auth.web(old, nil, relay)
       assert {:error, :unauthorized} = Auth.web(old, nil, :postgres)
+      assert %{status: 401} = Router.call(settings, postgres)
 
       assert {:ok, _} =
                Transaction.query(
