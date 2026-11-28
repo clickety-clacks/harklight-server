@@ -31,6 +31,13 @@ The authoritative columns and constraints live in
   as the content and operation receipt. Acquire multiple stream head locks
   in ascending key order using C collation. Baselines use an expiring ordered
   snapshot of versioned resources.
+- Person changes retain the FORMAT32 kind and encoded resource ID. In the
+  revision index, item removals share the `item` identity. Shared items and
+  entries have kind `item` and `entry`, and all three counts IDs share the
+  `counts` kind. Keep `availability-writer:` markers under `availability_writer`
+  in the revision index only. Agent changes retain the full resource ID and
+  use the Agent decoder kind as text. Both advisory prefixes have kind
+  `advisory`. Rows with a null source timestamp are revision-only.
 - Import upload sizes and SHA-256 bytes unchanged, with zero-based chunks
   of up to 1 MiB. A non-null completion timestamp means the total size and
   digest have been validated. An empty file has zero chunks. Writers may
@@ -130,8 +137,11 @@ fact. No record contains a whole Engine or unbounded feed.
   The SQL-only `client_change_log_state` and `agent_change_log_state`
   generation witnesses are FORMAT32 preflight checks, not target counters.
 - Map `client_idempotency` and `harklight_app_receipts` to separate
-  `operation_receipts` namespaces and preserve the retained original-response
-  flag. Keep `harklight_app_reply_intents` as its own typed family.
+  `operation_receipts` namespaces named for those source tables. Person
+  receipts use an empty origin key and raw SHA-256 digest bytes. Recent rows
+  expire 30 days after their original timestamp and have
+  `original_response = false`. Retained rows have no expiry and preserve the
+  source flag. Keep `harklight_app_reply_intents` as its own typed family.
 - Preserve `harklight_auth_schema`, including device certificate disablement,
   and typed rows from `harklight_browser_sessions`, `harklight_browser_grants`,
   `harklight_migration_roster`, `harklight_migration_grants`, `harklight_passkeys`,

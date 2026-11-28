@@ -170,7 +170,135 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert %{status: 401} = Router.call(conn, postgres)
       assert %{status: 401} = Router.call(Plug.Test.conn(:get, "/v2/settings"), postgres)
       assert %{status: 404} = Router.call(browser_request(:get, "/v2/inbox", cookie), postgres)
-      assert %{status: 404} = Router.call(browser_request(:put, "/v2/settings/alerts", cookie), postgres)
+      assert %{status: 404} = Router.call(browser_request(:put, "/v2/settings/priority-levels", cookie), postgres)
+    end
+
+    @tag :tmp_dir
+    test "browser alerts writes preserve FORMAT32 preconditions, replay, and committed projection", %{tmp_dir: dir} do
+      alias AttentionServer.JSON
+      alias AttentionServer.ClientAPI.{Idempotency, Router}
+      alias AttentionServer.Repository.Postgres.{Attributes, Identities}
+      alias Exqlite.Sqlite3
+
+      {relay, _browser, backend, cookie, principal} = browser_fixture(dir)
+      origin = "https://account.example.test"
+      sqlite = Router.init(relay: relay, auth: {:browser, backend, origin})
+      postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, Identities, origin})
+      settings_conn = browser_request(:get, "/v2/settings", cookie)
+      key = "00000000-0000-4000-8000-000000000099"
+      assert %{status: 200} = initial = Router.call(settings_conn, sqlite)
+      assert [tag] = Plug.Conn.get_resp_header(initial, "etag")
+
+      for opts <- [sqlite, postgres] do
+        assert %{status: 412, assigns: %{client_api_error: "precondition_failed"}} =
+                 cookie |> alerts_request("all", ~s("stale"), key, origin) |> Router.call(opts)
+        assert %{status: 400, assigns: %{client_api_error: "invalid_field"}} =
+                 cookie |> alerts_request("invalid", tag, key, origin) |> Router.call(opts)
+      end
+
+      assert %{status: 200, resp_body: accepted} =
+               cookie |> alerts_request("all", tag, key, origin) |> Router.call(sqlite)
+      assert %{status: 200, resp_body: ^accepted} = pg =
+               cookie |> alerts_request("all", tag, key, origin) |> Router.call(postgres)
+      assert [] = Plug.Conn.get_resp_header(pg, "idempotent-replayed")
+      assert {:ok, %{"rev" => 1, "settings" => %{"alerts" => "all"}}} = JSON.decode_line(accepted <> "\n")
+
+      assert %{status: 409, assigns: %{client_api_error: "idempotency_conflict"}} =
+               cookie |> alerts_request("important", "*", key, origin) |> Router.call(postgres)
+      assert %{status: 200, resp_body: current} =
+               cookie |> alerts_request("important", "*", nil, origin) |> Router.call(sqlite)
+      assert %{status: 200, resp_body: ^current} =
+               cookie |> alerts_request("important", "*", nil, origin) |> Router.call(postgres)
+
+      for opts <- [sqlite, postgres] do
+        assert %{status: 200, resp_body: ^current} = replayed =
+                 cookie |> alerts_request("all", tag, key, origin) |> Router.call(opts)
+        assert ["true"] = Plug.Conn.get_resp_header(replayed, "idempotent-replayed")
+        assert %{status: 403} =
+                 cookie |> alerts_request("all", "*", nil, "https://another.example.test") |> Router.call(opts)
+      end
+
+      assert {:ok, %{rows: [[2, 2]]}} =
+               Transaction.query(
+                 """
+                 SELECT head, revision FROM harklight.stream_heads AS stream
+                 JOIN harklight.stream_resource_revisions AS resource USING (person_id, origin_key)
+                 WHERE person_id = $1 AND origin_key = '' AND resource_id = 'settings'
+                 """,
+                 [principal.person]
+               )
+
+      # A retained app receipt can reserve the same person-wide key. Its
+      # original response takes precedence over a browser's recent marker.
+      assert {:ok, original_body} = JSON.decode_line(accepted <> "\n")
+      digest = Idempotency.digest("PUT", ["settings", "alerts"], %{"alerts" => "all", "if_match" => tag})
+      {:ok, db} = Sqlite3.open(Path.join(dir, "relay.sqlite3"))
+      assert :ok = Idempotency.save_retained(db, principal.person, key, digest, 200, original_body)
+      :ok = Sqlite3.close(db)
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.operation_receipts
+                   (person_id, origin_key, namespace, operation_key, digest, status, response,
+                    created_at_ms, original_response)
+                 VALUES ($1, '', 'harklight_app_receipts', $2, $3, 200, $4, 1, true)
+                 """,
+                 [principal.person, key, Base.decode16!(digest, case: :lower), Attributes.encode(original_body)]
+               )
+      for opts <- [sqlite, postgres] do
+        assert %{status: 200, resp_body: ^accepted} = replayed =
+                 cookie |> alerts_request("all", tag, key, origin) |> Router.call(opts)
+        assert ["true"] = Plug.Conn.get_resp_header(replayed, "idempotent-replayed")
+      end
+    end
+
+    @tag :tmp_dir
+    test "failed final receipt update rolls back browser alerts and its stream append", %{tmp_dir: dir} do
+      alias AttentionServer.ClientAPI.Router
+      alias AttentionServer.Repository.Postgres.{Attributes, Identities}
+
+      {_relay, _browser, _backend, cookie, principal} = browser_fixture(dir)
+      origin = "https://account.example.test"
+      postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, Identities, origin})
+      settings = browser_request(:get, "/v2/settings", cookie)
+      uuid = "00000000-0000-4000-8000-000000000098"
+      assert %{status: 200, resp_body: initial} = Router.call(settings, postgres)
+
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 ALTER TABLE harklight.operation_receipts ADD CONSTRAINT fixture_alert_receipt
+                 CHECK (operation_key <> '00000000-0000-4000-8000-000000000098' OR status <> 200)
+                 """,
+                 []
+               )
+
+      assert %{status: 503} =
+               cookie |> alerts_request("all", "*", uuid, origin) |> Router.call(postgres)
+      assert %{status: 200, resp_body: ^initial} = Router.call(settings, postgres)
+      assert {:ok, %{rows: []}} =
+               Transaction.query("SELECT head FROM harklight.stream_heads WHERE person_id = $1", [principal.person])
+      assert {:ok, %{rows: []}} =
+               Transaction.query("SELECT status FROM harklight.operation_receipts WHERE operation_key = $1", [uuid])
+      actor = AttentionServer.ClientAPI.Writes.browser_actor_key(principal.person, principal.session_id)
+      address = Attributes.key({:row, :receipts, {principal.person, actor, uuid}})
+      assert {:ok, %{rows: []}} =
+               Transaction.query("SELECT body FROM harklight.compatibility_facts WHERE address = $1", [address])
+
+      assert {:ok, _} =
+               Transaction.query("ALTER TABLE harklight.operation_receipts DROP CONSTRAINT fixture_alert_receipt", [])
+      assert %{status: 200} =
+               cookie |> alerts_request("all", "*", uuid, origin) |> Router.call(postgres)
+    end
+
+    defp alerts_request(cookie, value, if_match, key, origin) do
+      conn =
+        Plug.Test.conn(:put, "/v2/settings/alerts", AttentionServer.JSON.encode!(%{"alerts" => value}))
+        |> Plug.Test.put_req_cookie("__Host-harklight", cookie)
+        |> Plug.Conn.put_req_header("origin", origin)
+        |> Plug.Conn.put_req_header("if-match", if_match)
+
+      if key, do: Plug.Conn.put_req_header(conn, "idempotency-key", key), else: conn
     end
 
     defp browser_fixture(dir) do
@@ -333,6 +461,26 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:error, :cursor_expired} = Streams.person_page(person, 0, 10)
       assert {:ok, [%{rev: 10}], false, 10} = Streams.person_page(person, 8, 10)
       assert {:error, :cursor_expired} = Streams.person_page(person, 11, 10)
+    end
+
+    test "person item removals replace the prior feed row under the same revision key" do
+      alias AttentionServer.Repository.Postgres.Streams
+
+      person = "synthetic-item-removed"
+      scope = {person, ""}
+      id = AttentionServer.ChangeLog.item_resource({person, "app:fixture", "removed"})
+      original = change(id)
+      removed = %{original | kind: "item_removed", created_at_ms: 2}
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+      assert {:ok, 1} = Transaction.run([scope], &Transaction.append(&1, scope, [original]))
+      assert {:ok, 2} = Transaction.run([scope], &Transaction.append(&1, scope, [removed]))
+      assert {:ok, [%{rev: 2, kind: "item_removed", resource_id: ^id}], false, 2} =
+               Streams.person_page(person, 0, 10)
+      assert {:ok, %{rows: [["item", 2]]}} =
+               Transaction.query(
+                 "SELECT resource_kind, revision FROM harklight.stream_resource_revisions WHERE person_id = $1",
+                 [person]
+               )
     end
 
     test "unrelated streams commit independently and same-stream revisions follow commit order" do

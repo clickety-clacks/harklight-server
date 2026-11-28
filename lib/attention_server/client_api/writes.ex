@@ -30,7 +30,7 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   import Plug.Conn
 
-  alias AttentionServer.Repository.RecipientItems
+  alias AttentionServer.Repository.{Command, RecipientItems}
   alias AttentionServer.{BrowserRecipient, ChangeLog, ConversationFiles, Engine, JSON, Relay}
 
   alias AttentionServer.ClientAPI.{
@@ -186,12 +186,26 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   @doc false
   def put_alerts(conn, %Context{} = ctx) do
+    parse_alerts(conn, &alerts(ctx.relay, ctx.principal, &1, &2, &3))
+  end
+
+  @doc false
+  def put_postgres_alerts(conn, %Context{} = ctx) do
+    parse_alerts(conn, fn alerts, if_match, key ->
+      case Command.execute(:postgres, ctx.principal, {:alerts, alerts, if_match}, key, System.system_time(:millisecond)) do
+        {:ok, _, _, _} = success -> success
+        error -> result(error, false)
+      end
+    end)
+  end
+
+  defp parse_alerts(conn, apply_alerts) do
     with {:ok, key} <- optional_key(conn),
          {:ok, if_match} <- if_match(conn),
          {:ok, body, conn} <- json_body(conn),
          :ok <- only_members(body, ["alerts"]),
          {:ok, alerts} <- string_member(body, "alerts") do
-      respond(conn, alerts(ctx.relay, ctx.principal, alerts, if_match, key))
+      respond(conn, apply_alerts.(alerts, if_match, key))
     else
       {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
@@ -1067,7 +1081,7 @@ defmodule AttentionServer.ClientAPI.Writes do
       {:reply, {:ok, %{"settings" => settings}}, _state} ->
         Projection.capture(fn ->
           Projection.run(:settings, fn ->
-            if if_match == "*" or Reads.etag(settings) in if_match_tags(if_match),
+            if settings_match?(settings, if_match),
               do: :ok,
               else: {:error, :precondition_failed}
           end)
@@ -1099,8 +1113,9 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp group_push?({:push, _, _, _, features}) when is_list(features), do: "groups" in features
   defp group_push?(_operation), do: false
 
-  defp if_match_tags(value),
-    do: value |> String.split(",") |> Enum.map(&String.trim/1)
+  @doc false
+  def settings_match?(settings, if_match),
+    do: if_match == "*" or Reads.etag(settings) in Enum.map(String.split(if_match, ","), &String.trim/1)
 
   ## Operations, as today's engine frames
 
@@ -1395,13 +1410,11 @@ defmodule AttentionServer.ClientAPI.Writes do
 
     case Engine.owner_revision(engine, person, owner_key) do
       {:ok, ^pinned} when session != "" ->
-        recipient = uuid_v4(:crypto.hash(:sha256, "client_api_v2:" <> session))
-
         {:ok,
          %{
            person: person,
            kind: :browser,
-           engine_key: BrowserRecipient.key(person, session, recipient)
+           engine_key: browser_actor_key(person, session)
          }}
 
       _ ->
@@ -1422,6 +1435,12 @@ defmodule AttentionServer.ClientAPI.Writes do
   end
 
   defp principal(_engine, _who), do: {:error, :unauthorized}
+
+  @doc false
+  def browser_actor_key(person, session) do
+    recipient = uuid_v4(:crypto.hash(:sha256, "client_api_v2:" <> session))
+    BrowserRecipient.key(person, session, recipient)
+  end
 
   defp uuid_v4(<<a::48, _::4, b::12, _::2, c::62, _::binary>>) do
     <<a::48, 4::4, b::12, 2::2, c::62>>

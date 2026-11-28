@@ -87,8 +87,9 @@ defmodule AttentionServer.ClientAPI.Router do
 
   require Logger
 
-  alias AttentionServer.ClientAPI.{Auth, Context, Errors, Projection, Reads}
+  alias AttentionServer.ClientAPI.{Auth, Context, Errors, Projection, Reads, Writes}
   alias AttentionServer.{Diagnostics, Relay}
+  alias AttentionServer.Repository.Postgres.{Identities, Settings}
 
   # Components add their route module here: C3 reads, C4 writes, C5 the feed.
   @route_modules [
@@ -172,6 +173,26 @@ defmodule AttentionServer.ClientAPI.Router do
        ) do
     ctx = %Context{principal: nil, relay: nil, request_id: request_id}
     run(conn, Reads, :get_postgres_settings, ctx, opts)
+  end
+
+  defp authenticated(
+         %{method: "PUT"} = conn,
+         %{repository: :postgres, auth: {:browser, _, origin}} = opts,
+         ["settings", "alerts"],
+         {:ok, Writes, :put_alerts, _, _},
+         request_id
+       ) do
+    with {:ok, %{kind: :browser} = principal} <- Auth.web(conn, Identities, :postgres),
+         :ok <- Settings.check_active(principal.person),
+         true <- Auth.browser_origin_ok?(conn, origin) do
+      ctx = %Context{principal: principal, relay: nil, request_id: request_id}
+      run(conn, Writes, :put_postgres_alerts, ctx, opts)
+    else
+      false -> Errors.send_error(conn, "forbidden")
+      {:ok, _native} -> Errors.send_error(conn, "not_found")
+      {:error, :unavailable} -> Errors.send_error(conn, "retry_later")
+      {:error, reason} -> Errors.send_error(conn, to_string(reason))
+    end
   end
 
   defp authenticated(conn, %{repository: :postgres}, _segments, _route, _request_id),
