@@ -1237,7 +1237,7 @@ defmodule AttentionServer.Store do
 
     case do_commit(store, next, audit, projected_entries) do
       {:ok, committed} = result ->
-        Persistence.committed(committed)
+        Persistence.committed(committed.engine)
         result
 
       other ->
@@ -1328,7 +1328,7 @@ defmodule AttentionServer.Store do
               change_log_touched: rank_change_persons(store.change_log_touched, heads, audit)
           }
 
-          Persistence.committed(committed)
+          Persistence.committed(committed.engine)
           {:ok, committed}
 
         error ->

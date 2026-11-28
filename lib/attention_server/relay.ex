@@ -27,7 +27,6 @@ defmodule AttentionServer.Relay do
     ChangeLog,
     Conversation,
     ConversationFiles,
-    DashboardInventory,
     Diagnostics,
     DeviceIdentity,
     DeviceMigration,
@@ -46,6 +45,10 @@ defmodule AttentionServer.Relay do
 
   alias AttentionServer.JSON, warn: false
   alias AttentionServer.Repository.Command
+  alias AttentionServer.Repository.CommittedRead
+  alias AttentionServer.Store.Persistence
+
+  require CommittedRead
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
@@ -967,7 +970,7 @@ defmodule AttentionServer.Relay do
 
   @impl true
   def handle_call(request, from, state) do
-    with_persistence_reads(state, fn ->
+    Persistence.with_reads(state.store.engine, fn ->
       case dispatch_call(request, from, state) do
         {:reply, {:socket_write, socket, authority, frames, completion}, next} ->
           next = rank_client_items(state, next)
@@ -982,17 +985,8 @@ defmodule AttentionServer.Relay do
     end)
   end
 
-  defp with_persistence_reads(state, fun) do
-    reader = fn committed_store, request, from ->
-      committed_state = %{state | store: committed_store}
-      # The persistence read set consists exclusively of callbacks that return
-      # their input state unchanged. Reuse their authorization/projection logic.
-      {:reply, reply, ^committed_state} = dispatch_call(request, from, committed_state)
-      reply
-    end
-
-    AttentionServer.Store.Persistence.with_reads(state.store, reader, fun)
-  end
+  defp dispatch_call(request, _from, state) when CommittedRead.supported?(request),
+    do: {:reply, CommittedRead.execute(state.store.engine, request), state}
 
   if Mix.env() == :test do
     defp dispatch_call({:request_line, key, raw}, _from, state) do
@@ -1073,30 +1067,11 @@ defmodule AttentionServer.Relay do
     end
   end
 
-  defp dispatch_call({:cursor, key}, _from, state),
-    do: {:reply, Engine.acknowledged_cursor(state.store.engine, key), state}
-
   defp dispatch_call({:device_person, key}, _from, state),
     do: {:reply, Engine.authorized_person(state.store.engine, key), state}
 
   defp dispatch_call({:account_paused?, person}, _from, state),
     do: {:reply, Engine.delivery_stopped?(state.store.engine, person), state}
-
-  defp dispatch_call({:owner_revision, person, key}, _from, state),
-    do: {:reply, Engine.owner_revision(state.store.engine, person, key), state}
-
-  defp dispatch_call({:dashboard_inventory, person, key, configured_owner_person}, _from, state) do
-    engine = state.store.engine
-
-    result =
-      if is_binary(configured_owner_person) and person == configured_owner_person do
-        DashboardInventory.for_account_owner(engine, configured_owner_person, key)
-      else
-        DashboardInventory.for_owner(engine, person, key)
-      end
-
-    {:reply, result, state}
-  end
 
   defp dispatch_call(
          {:dashboard_prioritization, person, key, configured_owner_person},
@@ -1109,16 +1084,6 @@ defmodule AttentionServer.Relay do
       {:reply, {:ok, priority_settings(state, person)}, state}
     else
       {:reply, {:error, :forbidden}, state}
-    end
-  end
-
-  defp dispatch_call({:dashboard_levels, person, key}, _from, state) do
-    case Engine.owner_identity(state.store.engine, key) do
-      {:ok, ^person, _revision} ->
-        {:reply, {:ok, %{"levels" => BounceDecision.levels(state.store.engine, person)}}, state}
-
-      _ ->
-        {:reply, {:error, :forbidden}, state}
     end
   end
 
@@ -1170,12 +1135,6 @@ defmodule AttentionServer.Relay do
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
-
-  defp dispatch_call({:owner_identity, key}, _from, state),
-    do: {:reply, Engine.owner_identity(state.store.engine, key), state}
-
-  defp dispatch_call({:agent_identity, key}, _from, state),
-    do: {:reply, Engine.agent_identity(state.store.engine, key), state}
 
   defp dispatch_call({:upload_begin, key, attrs, size}, {worker, _}, state) do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
@@ -1364,9 +1323,6 @@ defmodule AttentionServer.Relay do
         owner_key,
         "owner_agent_revoke"
       )
-
-  defp dispatch_call({:owner_list_agents, person, owner_key}, _from, state),
-    do: {:reply, Engine.owner_list_agents(state.store.engine, person, owner_key), state}
 
   defp dispatch_call({:owner_send_line, person, key, revision, socket, line}, _from, state) do
     result =
@@ -2680,7 +2636,7 @@ defmodule AttentionServer.Relay do
 
   @impl true
   def handle_info(message, state) do
-    with_persistence_reads(state, fn ->
+    Persistence.with_reads(state.store.engine, fn ->
       {:noreply, next} = dispatch_info(message, state)
       {:noreply, finalize_server_step(state, next)}
     end)
