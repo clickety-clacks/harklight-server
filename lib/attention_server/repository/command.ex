@@ -28,6 +28,10 @@ defmodule AttentionServer.Repository.Command do
     AttentionServer.Repository.Postgres.PersonSettings.execute(actor, request, key, at)
   end
 
+  def execute(:postgres, %{kind: :device} = actor, {:alerts, _value, _if_match} = request, key, at) do
+    AttentionServer.Repository.Postgres.PersonSettings.execute(actor, request, key, at)
+  end
+
   def execute(:postgres, %{kind: :owner, person: person, key: key}, {:dashboard_levels, rows}, nil, at) do
     AttentionServer.Repository.Postgres.OwnerSettings.save_levels(person, key, rows, at)
   end
