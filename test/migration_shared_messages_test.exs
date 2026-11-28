@@ -19,6 +19,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     @group "a2000000-0000-4000-8000-000000000001"
     @shared "shared_synthetic-collision"
 
+    @tag timeout: 120_000
     test "shared records retain historical authority and frozen revisions beside ordinary collisions" do
       uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
       assert uri.host in ["localhost", "127.0.0.1"]
@@ -106,6 +107,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         historical = SharedMessages.historical_record(source.shared_messages[@shared], revision)
         assert read_fact(db, "shared_revision_files", {@shared, revision}) == Map.get(historical, :files, [])
       end
+      verify_reader_fact_drift(db, identity, bundle, source)
       verify_link_drift(db, identity, bundle)
       alias AttentionServer.Migration.VerifySharedMessages
       assert {:ok, verified} = VerifySharedMessages.run(db, identity, bundle)
@@ -234,6 +236,61 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:ok, message} = Attributes.decode(body)
         assert message == historical.message
       end
+    end
+
+    defp verify_reader_fact_drift(db, identity, bundle, source) do
+      alias AttentionServer.Migration.VerifySharedReaderFacts
+      frames = Path.join(bundle, "records.frames")
+      before = :crypto.hash(:sha256, File.read!(frames))
+      expected = %{
+        "shared_read_access" => map_size(source.persons),
+        "shared_revision_scope" => map_size(source.shared_recipients),
+        "shared_revision_files" => Enum.reduce(source.shared_messages, 0, fn {_, r}, n ->
+          n + length(Enum.uniq([r.revision | Map.keys(Map.get(r, :history, %{}))]))
+        end)
+      }
+      assert expected["shared_read_access"] > 256
+      assert {:ok, ^expected} = VerifySharedReaderFacts.run(db, identity, bundle)
+      for {family, key, bad} <- [
+        {"shared_read_access", @outside, true},
+        {"shared_read_access", @sender, false},
+        {"shared_revision_scope", {@first, source.shared_recipients[{@shared, @first}].item_id},
+          %{group?: false, frozen_revision: 999}},
+        {"shared_revision_files", {@shared, 1}, []}
+      ] do
+        # The source fixture has a real nonempty uploaded revision and a removed
+        # group with frozen recipients; the source API oracle above is retained.
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx,
+            "UPDATE harklight.compatibility_facts SET body=$3 WHERE family=$1 AND address=$2",
+            [family, Attributes.key(key), Attributes.encode(bad)])
+          assert {:error, {:shared_reader_fact_mismatch, ^family, _}} = VerifySharedReaderFacts.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^expected} = VerifySharedReaderFacts.run(db, identity, bundle)
+      end
+      for {family, key} <- [
+        {"shared_read_access", @outside},
+        {"shared_revision_scope", {@first, source.shared_recipients[{@shared, @first}].item_id}},
+        {"shared_revision_files", {@shared, 2}}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx,
+            "DELETE FROM harklight.compatibility_facts WHERE family=$1 AND address=$2", [family, Attributes.key(key)])
+          assert {:error, {:shared_reader_fact_mismatch, ^family, _}} = VerifySharedReaderFacts.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^expected} = VerifySharedReaderFacts.run(db, identity, bundle)
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx,
+            "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES($1,$2,$3)",
+            [family, Attributes.key({:unrelated, key}), Attributes.encode(false)])
+          assert {:error, {:shared_reader_count_mismatch, ^family}} = VerifySharedReaderFacts.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^expected} = VerifySharedReaderFacts.run(db, identity, bundle)
+      end
+      assert :crypto.hash(:sha256, File.read!(frames)) == before
     end
 
     defp import_entry_uploads(db, identity, bundle, source) do
@@ -381,6 +438,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       File.write!(Path.join(store.upload_dir, @entry_upload), entry_bytes)
       entry_files = AttentionServer.ClientAPI.SharedAttachments.references([{entry_metadata, nil}])
       {engine, :ok, touched} = Engine.with_touches(store.engine, fn engine ->
+        engine = Enum.reduce(1..260, engine, fn n, acc ->
+          person = "a9000000-0000-4000-8000-" <> String.pad_leading(Integer.to_string(n), 12, "0")
+          {:ok, next} = Engine.setup_person(acc, person)
+          next
+        end)
         engine = engine |> Engine.put_row(:uploads, @upload, metadata) |> Engine.put_row(:uploads, @entry_upload, entry_metadata)
         engine = Enum.reduce(Enum.with_index([@sender, @first, @second, @outside]), engine, fn {person, n}, acc ->
           {:ok, next, _} = Engine.hosted_account_create(acc, "shared-fixture-#{n}", false, person, String.duplicate(Integer.to_string(n + 1), 64))

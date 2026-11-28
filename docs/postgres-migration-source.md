@@ -649,3 +649,11 @@ original journal position, then accepted-event payload, then the legacy empty
 fallback. It never uses the imported availability or conversation projection as
 its oracle. Exact scoped values and counts reject missing, changed or extra
 facts. The temporary index is discarded on close; neither store is changed.
+
+`VerifySharedReaderFacts.run/3` compares shared access (including explicit false),
+frozen revision/group scope, and every historical ordered file-descriptor list
+against sealed source frames, then closes all three destination family counts.
+A file-backed temporary index and 256-row keyset pages bound its working set;
+destination membership and recipient rows are not the expected-value oracle.
+This checks reader facts only: upload content, scoped relational links, shared
+message history and HTTP visibility still require their separate validation.
