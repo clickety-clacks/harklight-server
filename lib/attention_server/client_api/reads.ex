@@ -140,6 +140,19 @@ defmodule AttentionServer.ClientAPI.Reads do
     do: respond(conn, settings(ctx.relay, ctx.principal), &etag(&1["settings"]))
 
   @doc false
+  def get_postgres_settings(conn, %Context{}) do
+    result =
+      with [] <- get_req_header(conn, "authorization"),
+           cookie when is_binary(cookie) <- AttentionServer.ClientAPI.Auth.browser_cookie(conn) do
+        AttentionServer.Repository.Postgres.Settings.browser(cookie)
+      else
+        _ -> {:error, :unauthorized}
+      end
+
+    respond(conn, result, &etag(&1["settings"]))
+  end
+
+  @doc false
   def get_me(conn, %Context{} = ctx) do
     case SharedCapability.parse(conn) do
       {:ok, %{shared?: true} = capability} ->
