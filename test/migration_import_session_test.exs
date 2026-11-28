@@ -860,7 +860,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         body = %{"sender_id" => sender, "message_id" => external_id,
           "created_at" => 1, "title" => "First historical revision", "body" => "Original content",
           "message_type" => "fyi", "answer_ui" => AttentionServer.Message.seen_descriptor()}
-        frame = %{"type" => "forward", "op_id" => "30000000-0000-4000-8000-000000000020",
+        frame = %{"type" => "forward", "op_id" => "95000000-0000-4000-8000-000000000020",
           "session_handle" => sample.session_handle, "message" => body}
         at = sample.accepted_at + 100
         {engine, reply} = Engine.request_command(engine, sample.origin, frame, at)
@@ -868,7 +868,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         engine = Enum.reduce(2..3, engine, fn revision, engine ->
           frame = %{"type" => "conversation_revise", "sender_id" => sender,
             "message_id" => external_id, "base_revision" => revision - 1,
-            "op_id" => "30000000-0000-4000-8000-00000000002#{revision}",
+            "op_id" => "95000000-0000-4000-8000-00000000002#{revision}",
             "message" => Map.put(body, "body", "Historical revision #{revision}")}
           {engine, reply} = Engine.request_command(engine, sample.origin, frame, at + revision)
           assert {:ok, _} = reply
