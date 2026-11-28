@@ -26,7 +26,12 @@ try do
       "session" => "10000000-0000-4000-8000-000000000001",
       "message" => %{"created_at" => n, "title" => "Retained history #{n}", "text" => payload}}
     principal = %{kind: :device, person: person, key: origin}
-    digest = :crypto.hash(:sha256, JSON.encode!(body))
+    # Match AgentWrites.write_digest/3 at the HTTP boundary. Passing raw hash
+    # bytes to the internal execute call creates a receipt no HTTP request can
+    # produce and which the importer correctly refuses.
+    digest = AttentionServer.ClientAPI.Idempotency.digest(
+      "POST", ["v2", "agent", "messages"], %{"body" => body, "if_match" => []})
+    {:ok, <<_::256>>} = Base.decode16(digest, case: :lower)
     input = {principal, :send, %{}, key, digest, [], body}
     {:ok, 200, _, false} = GenServer.call(relay,
       {:client_api, AttentionServer.ClientAPI.AgentWrites, {:execute, input, key, []}}, :infinity)
