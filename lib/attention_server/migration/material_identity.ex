@@ -26,7 +26,7 @@ defmodule AttentionServer.Migration.MaterialIdentity do
          {:ok, ^fingerprint} <- private_key(Path.join(bundle, "material/owner/identity.key")),
          {:ok, ^fingerprint} <- owner(bundle, manifest, person),
          :ok <- tls_identity(bundle, manifest, tls),
-         :ok <- dashboard_identity(bundle, configured),
+         :ok <- dashboard_identity(bundle, configured, tls),
          :ok <- auxiliary_sources(manifest) do
       :ok
     else
@@ -36,16 +36,15 @@ defmodule AttentionServer.Migration.MaterialIdentity do
     end
   end
 
-  defp dashboard_identity(bundle, configured) do
-    case {configured["ATTENTION_SERVER_DASHBOARD_CERTFILE"], configured["ATTENTION_SERVER_DASHBOARD_KEYFILE"]} do
-      {nil, nil} -> :ok
-      {cert, key} when is_binary(cert) and is_binary(key) ->
-        with {:ok, fingerprint} <- certificate(Path.join(bundle, cert)),
-             {:ok, ^fingerprint} <- private_key(Path.join(bundle, key)) do
-          :ok
-        else
-          _ -> {:error, :material_dashboard_identity_mismatch}
-        end
+  defp dashboard_identity(bundle, configured, tls) do
+    # Runtime resolves these overrides independently. A one-sided override can
+    # pair with the already validated Server certificate or private key.
+    cert = configured["ATTENTION_SERVER_DASHBOARD_CERTFILE"] || tls["cert"]
+    key = configured["ATTENTION_SERVER_DASHBOARD_KEYFILE"] || tls["key"]
+    with {:ok, fingerprint} <- certificate(Path.join(bundle, cert)),
+         {:ok, ^fingerprint} <- private_key(Path.join(bundle, key)) do
+      :ok
+    else
       _ -> {:error, :material_dashboard_identity_mismatch}
     end
   end
