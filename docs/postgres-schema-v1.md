@@ -118,6 +118,20 @@ fact. No record contains a whole Engine or unbounded feed.
 
 ## FORMAT32 side-table coverage
 
+Certificate authority reads these typed `compatibility_facts` by primary key.
+The family is the SQLite table name and the address is
+`Attributes.key(primary_key)`. The body encodes the ordered source columns.
+
+| Family | Primary key | Body term |
+| --- | --- | --- |
+| `harklight_auth_schema` | `1` | `[1, minimum_generation, device_certificates_disabled]` with an integer disable flag |
+| `harklight_migration_roster` | device key | `[device_id, person_id, phase]` |
+
+An absent auth schema fact represents a pre-generation source. An absent
+roster fact for an enrolled device follows the sender-grant and native-session
+overlap rules. The same committed read checks these facts and the normalized
+principal, sender grants and native session rows.
+
 - Import authoritative person and Agent heads, floors and seed revisions from
   `client_change_log_meta` and `agent_change_log_meta`. Readable source rows
   from `client_changes`, `agent_changes` and `agent_item_advisory_changes`

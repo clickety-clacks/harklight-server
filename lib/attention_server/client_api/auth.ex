@@ -50,14 +50,22 @@ defmodule AttentionServer.ClientAPI.Auth do
   @write_methods ~w(POST PUT PATCH DELETE)
 
   @doc "The enrolled principal for a request on the device listener."
-  @spec device(Plug.Conn.t(), GenServer.server()) ::
-          {:ok, Principal.t()} | {:error, :unauthorized}
+  @spec device(Plug.Conn.t(), GenServer.server() | {:postgres, :self_hosted | :saas}) ::
+          {:ok, Principal.t()} | {:error, :unauthorized | :unavailable}
   def device(conn, relay) do
     with %{ssl_cert: der} when is_binary(der) <- Plug.Conn.get_peer_data(conn),
          {:ok, key} <- DeviceIdentity.from_certificate(der) do
       enrolled_principal(relay, key)
     else
       _ -> {:error, :unauthorized}
+    end
+  end
+
+  defp enrolled_principal({:postgres, mode}, key) do
+    case AttentionServer.Repository.Postgres.Certificates.resolve(key, mode) do
+      {:ok, person, kind} -> {:ok, %Principal{person: person, kind: kind, key: key}}
+      {:error, :storage_unavailable} -> {:error, :unavailable}
+      {:error, :unauthorized} -> {:error, :unauthorized}
     end
   end
 
@@ -106,13 +114,11 @@ defmodule AttentionServer.ClientAPI.Auth do
   end
 
   def web(conn, backend, relay) do
-    cookie = browser_cookie(conn)
-
-    case {cookie, Plug.Conn.get_req_header(conn, "authorization")} do
-      {_, []} ->
+    case web_credential(conn) do
+      {:browser, _cookie} ->
         browser(conn, backend)
 
-      {nil, ["Bearer " <> secret]} ->
+      {:native, secret} ->
         with {:ok, %{device_id: device, person_id: person, hash: hash, pending: pending}} <-
                native_session(relay, secret) do
           {:ok, %Principal{kind: :device, key: device, person: person, session_id: hash, pending: pending}}
@@ -121,13 +127,21 @@ defmodule AttentionServer.ClientAPI.Auth do
           _ -> {:error, :unauthorized}
         end
 
-      _ ->
+      :missing ->
         {:error, :unauthorized}
     end
   end
 
   @doc false
-  def browser_cookie(conn), do: Map.get(Plug.Conn.fetch_cookies(conn).req_cookies, @cookie)
+  def web_credential(conn) do
+    case {browser_cookie(conn), Plug.Conn.get_req_header(conn, "authorization")} do
+      {cookie, []} when is_binary(cookie) -> {:browser, cookie}
+      {nil, ["Bearer " <> secret]} -> {:native, secret}
+      _ -> :missing
+    end
+  end
+
+  defp browser_cookie(conn), do: Map.get(Plug.Conn.fetch_cookies(conn).req_cookies, @cookie)
 
   @doc """
   Whether a browser request may proceed past the origin check. Reads pass.
