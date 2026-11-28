@@ -108,6 +108,104 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
     end
 
     @tag :tmp_dir
+    test "authorized ordinary history streams PostgreSQL text with FORMAT32 wire bytes", %{tmp_dir: dir} do
+      alias AttentionServer.{JSON, LargeData}
+      alias AttentionServer.Repository.RecipientItems
+      alias AttentionServer.Repository.Postgres.LargeText
+
+      size = LargeText.chunk_bytes()
+      # Split multibyte UTF-8 across both database chunk boundaries.
+      parts = [
+        :binary.copy("a", size - 1) <> <<0xF0>>,
+        <<0x9F, 0x92, 0xA1>> <> :binary.copy("b", size - 4) <> <<0xC3>>,
+        <<0xA9, 0x22, 0x5C, 0x0A, 0x09, 0x01>>
+      ]
+
+      digest = :crypto.hash(:sha256, parts)
+      length = IO.iodata_length(parts)
+      assert length > 2 * 1024 * 1024
+      hex = Base.encode16(digest, case: :lower)
+      assert {:ok, reference} = LargeText.reference(hex, length)
+      assert :ok = LargeText.stage(reference)
+
+      for {part, index} <- Enum.with_index(parts) do
+        assert :ok = LargeText.put_chunk(reference, index, part)
+      end
+
+      person = "synthetic-large-text-person"
+      origin = "synthetic-large-text-origin"
+      body = %{"title" => "Historical text", "body" => reference}
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 1)",
+                 [origin, person]
+               )
+
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.messages
+                   (id, person_id, origin_key, sender_id, message_id, revision, accepted_at_ms, accepted_position)
+                 VALUES ('large-text-item', $1, $2, 'app:fixture', 'historical', 1, 20, 9)
+                 """,
+                 [person, origin]
+               )
+
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.message_revisions VALUES ('large-text-item', 1, 20, $1)",
+                 [Attributes.encode(body)]
+               )
+
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.message_recipients (message_id, person_id, item_id) VALUES ('large-text-item', $1, 'i9')",
+                 [person]
+               )
+
+      assert {:error, :not_found} = RecipientItems.fetch(:postgres, "another-person", "i9")
+      assert {:ok, {^person, "app:fixture", "historical"}, %{message: ^body}} =
+               RecipientItems.fetch(:postgres, person, "i9")
+
+      wire = %{"message" => body}
+      assert_raise ArgumentError, "large text unavailable", fn ->
+        wire |> JSON.encode_stream() |> Stream.run()
+      end
+
+      assert :ok = LargeText.complete(reference)
+      path = Path.join(dir, "format32-body")
+      File.write!(path, parts)
+      source = %LargeData.Ref{id: hex, sha256: hex, size: length, path: path}
+      legacy_wire = %{"message" => %{body | "body" => source}}
+      assert streamed_signature(wire) == streamed_signature(legacy_wire)
+
+      # Synthetic out-of-band corruption keeps the length and publication
+      # marker, but must abort encoding before it closes the JSON string.
+      assert {:ok, _} =
+               Transaction.query(
+                 "UPDATE harklight.large_text_chunks SET bytes = $2 WHERE sha256 = $1 AND chunk_number = 2",
+                 [digest, <<0xA9, 0x22, 0x5C, 0x0A, 0x09, 0x02>>]
+               )
+
+      assert_raise ArgumentError, "large text checksum mismatch", fn ->
+        wire |> JSON.encode_stream() |> Stream.run()
+      end
+    end
+
+    defp streamed_signature(wire) do
+      {hash, length} =
+        wire
+        |> AttentionServer.JSON.encode_stream()
+        |> Enum.reduce({:crypto.hash_init(:sha256), 0}, fn segment, {hash, length} ->
+          assert byte_size(segment) <= 6 * 64 * 1024
+          {:crypto.hash_update(hash, segment), length + byte_size(segment)}
+        end)
+
+      {:crypto.hash_final(hash), length}
+    end
+
+    @tag :tmp_dir
     test "a FORMAT32 browser cookie keeps its principal after projection to PostgreSQL", %{tmp_dir: dir} do
       alias AttentionServer.DashboardBrowserSession
       alias AttentionServer.ClientAPI.{Auth, Router}

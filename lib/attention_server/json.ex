@@ -711,6 +711,10 @@ defmodule AttentionServer.JSON do
     Stream.concat([once("\""), AttentionServer.LargeData.escaped_stream(ref), once("\"")])
   end
 
+  defp encode_value_stream(%AttentionServer.Repository.Postgres.LargeText.Ref{} = ref) do
+    Stream.concat([once("\""), AttentionServer.Repository.Postgres.LargeText.escaped_stream(ref), once("\"")])
+  end
+
   defp encode_value_stream(%DecimalToken{} = value), do: once(encode!(value))
 
   defp encode_value_stream(value)
