@@ -1569,7 +1569,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "SELECT id FROM harklight.people WHERE id<>$1 LIMIT 1", [person])
       assert {:error, :synthetic_missing_upload} = Postgrex.transaction(db, fn tx ->
         assert {:ok, _} = ImportSession.query(tx, "DELETE FROM harklight.uploads WHERE id=$1", [@ordinary_entry_upload])
-        assert {:error, :ordinary_entry_upload_scope_mismatch} = ImportEntryUploads.run(tx, identity, bundle)
+        # The prerequisite byte importer rejects the missing manifest before
+        # the entry-link scope query is reached.
+        assert {:error, :upload_manifest_mismatch} = ImportEntryUploads.run(tx, identity, bundle)
         Postgrex.rollback(tx, :synthetic_missing_upload)
       end)
       for {column, bad, good} <- [
