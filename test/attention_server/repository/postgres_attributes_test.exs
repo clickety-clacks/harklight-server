@@ -1,7 +1,7 @@
 defmodule AttentionServer.Repository.PostgresAttributesTest do
   use ExUnit.Case, async: true
   alias AttentionServer.JSON.DecimalToken
-  alias AttentionServer.Repository.Postgres.Attributes
+  alias AttentionServer.Repository.Postgres.{Attributes, LargeText}
 
   test "typed attributes round-trip through JSON without changing keys or decimal lexemes" do
     value = %{
@@ -18,18 +18,23 @@ defmodule AttentionServer.Repository.PostgresAttributesTest do
   end
 
   test "a cold VM decodes shared facts without seeding the modules in that VM" do
+    assert {:ok, ref} = LargeText.reference(String.duplicate("ad", 32), 2_097_169)
+    assert {:error, :invalid_large_text_reference} = LargeText.reference(String.duplicate("AD", 32), 2_097_169)
+
     encoded =
       Attributes.encode(%{
         {:origin, "synthetic"} => %{
           hosted_ref: {"external-org", "external-group"},
           reminder: %{outcome: :unseen_interval_elapsed},
-          cursor: %DecimalToken{raw: "1.2300"}
+          cursor: %DecimalToken{raw: "1.2300"},
+          body: ref
         }
       })
 
     script = """
     false = :code.is_loaded(AttentionServer.SharedReminders)
     false = :code.is_loaded(AttentionServer.Groups)
+    false = :code.is_loaded(AttentionServer.Repository.Postgres.LargeText.Ref)
     envelope = %{"encoding" => "erlang-etf-v1", "data" => System.fetch_env!("HARKLIGHT_TYPED_FIXTURE")}
     {:ok, fact} = AttentionServer.Repository.Postgres.Attributes.decode(envelope)
     ^envelope = AttentionServer.Repository.Postgres.Attributes.encode(fact)

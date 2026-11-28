@@ -55,6 +55,58 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       :ok
     end
 
+    test "shared large text verifies actual multi-chunk bytes before bounded reads" do
+      alias AttentionServer.Repository.Postgres.LargeText
+
+      chunk = LargeText.chunk_bytes()
+      parts = [:binary.copy("a", chunk), :binary.copy("b", chunk), "final UTF-8 text ☃"]
+      [first, middle, last] = parts
+      hash = :crypto.hash(:sha256, parts) |> Base.encode16(case: :lower)
+      size = 2 * chunk + byte_size(last)
+      assert size > 2 * 1024 * 1024
+      assert {:ok, ref} = LargeText.reference(hash, size)
+      assert {:ok, wrong_size} = LargeText.reference(hash, size + 1)
+
+      assert :ok = LargeText.stage(ref)
+      assert {:error, :large_text_conflict} = LargeText.stage(wrong_size)
+      assert :ok = LargeText.put_chunk(ref, 0, first)
+      assert :ok = LargeText.put_chunk(ref, 0, first)
+      assert {:error, :large_text_conflict} = LargeText.put_chunk(ref, 0, middle)
+      assert {:error, :invalid_large_text_chunk} = LargeText.put_chunk(ref, 1, last)
+      assert {:error, :not_found} = LargeText.read_chunk(ref, 0)
+      assert {:error, :incomplete_large_text} = LargeText.complete(ref)
+      assert :ok = LargeText.put_chunk(ref, 1, middle)
+      assert :ok = LargeText.put_chunk(ref, 2, last)
+      assert :ok = LargeText.complete(ref)
+      assert :ok = LargeText.complete(ref)
+      assert :ok = LargeText.stage(ref)
+      assert :ok = LargeText.put_chunk(ref, 2, last)
+
+      observer = self()
+      query = fn query, [_, ^size, number, true] = params ->
+        send(observer, {:chunk_query, number})
+        Transaction.query(query, params)
+      end
+
+      assert {:ok, ^middle} = LargeText.read_chunk(ref, 1, query)
+      assert_receive {:chunk_query, 1}
+      refute_received {:chunk_query, _}
+      assert {:ok, ^last} = LargeText.read_chunk(ref, 2)
+      assert {:error, :not_found} = LargeText.read_chunk(ref, 3)
+      assert {:error, :not_found} = LargeText.read_chunk(wrong_size, 0)
+    end
+
+    test "matching length with the wrong digest remains unpublished" do
+      alias AttentionServer.Repository.Postgres.LargeText
+
+      hash = :crypto.hash(:sha256, "expected") |> Base.encode16(case: :lower)
+      assert {:ok, ref} = LargeText.reference(hash, 8)
+      assert :ok = LargeText.stage(ref)
+      assert :ok = LargeText.put_chunk(ref, 0, "replaced")
+      assert {:error, :large_text_checksum_mismatch} = LargeText.complete(ref)
+      assert {:error, :not_found} = LargeText.read_chunk(ref, 0)
+    end
+
     @tag :tmp_dir
     test "a FORMAT32 browser cookie keeps its principal after projection to PostgreSQL", %{tmp_dir: dir} do
       alias AttentionServer.DashboardBrowserSession
