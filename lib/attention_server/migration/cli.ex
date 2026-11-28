@@ -2,6 +2,13 @@ defmodule AttentionServer.Migration.CLI do
   @moduledoc false
   alias AttentionServer.Migration.Bundle
 
+  # Capability discovery is read-only and does not open a receipt or database.
+  # Status alone does not imply that the complete upgrade pipeline is available.
+  def run(["capabilities"]) do
+    {:ok, %{"contract_version" => 1, "command" => "capabilities",
+      "commands" => ["export", "verify", "status"], "migration_ready" => false}}
+  end
+
   def run(["status", "--receipt", path]) do
     with {:ok, identity} <- AttentionServer.Migration.ImportReceipt.load(path) do
       AttentionServer.Migration.Connection.with_connection(System.get_env(), fn db ->
