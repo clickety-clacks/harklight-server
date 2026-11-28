@@ -1437,6 +1437,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       try do
         assert {:error, :stream_source_changed} = VerifyStreamHeads.run(db, identity, bundle, changing_query)
       after
+        # Both SQLite connections are closed now. Restore only this disposable
+        # negative-test copy, including any WAL retained by the read-only close.
+        for suffix <- ["-wal", "-shm", "-journal"], do: File.rm(source_file <> suffix)
         File.write!(source_file, original_bytes)
       end
       assert {:ok, ^heads} = VerifyStreamHeads.run(db, identity, bundle)
