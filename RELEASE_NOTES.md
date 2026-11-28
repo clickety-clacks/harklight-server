@@ -4,6 +4,9 @@ Browser replies with attachments can now be posted to shared messages without
 the Server returning an error. The attachment belongs to the person who sent
 the reply, and the same people can open it as when the reply is sent from the app.
 
+The Harklight skill and the Hosted Agent guide now give tested waiting
+instructions for Claude Code and Codex and say which setups have not been tested.
+
 This release includes internal groundwork for a future PostgreSQL storage
 option that remains disabled and leaves existing installs on FORMAT32.
 
