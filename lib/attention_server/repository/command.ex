@@ -27,6 +27,10 @@ defmodule AttentionServer.Repository.Command do
     AttentionServer.Repository.Postgres.AlertSettings.execute(actor, value, if_match, key, at)
   end
 
+  def execute(:postgres, %{kind: :owner, person: person, key: key}, {:dashboard_levels, rows}, nil, at) do
+    AttentionServer.Repository.Postgres.OwnerSettings.save_levels(person, key, rows, at)
+  end
+
   def execute(store, actor, frame, sources, at) do
     case Engine.request_command(store.engine, actor, frame, at) do
       {next, {:ok, _} = reply} -> {record_sources(next, sources), reply}

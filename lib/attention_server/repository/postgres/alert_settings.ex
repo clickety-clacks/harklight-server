@@ -133,18 +133,7 @@ defmodule AttentionServer.Repository.Postgres.AlertSettings do
     attributes = view.attributes
     next = if value == "all", do: Map.put(attributes, :alert_choices, value), else: Map.delete(attributes, :alert_choices)
 
-    if next == attributes do
-      :ok
-    else
-      scope = {person, ""}
-      change = %{kind: "settings", resource_id: "settings", session_handle: nil, created_at_ms: at, first_seen_at_ms: nil}
-
-      with {:ok, head} <- Transaction.lock_stream(scope, view.seed),
-           {:ok, _} <- Transaction.query("UPDATE harklight.people SET settings = $2 WHERE id = $1", [person, Attributes.encode(next)]),
-           {:ok, _} <- Transaction.append(%{scope => head}, scope, [change]) do
-        :ok
-      end
-    end
+    with {:ok, _} <- Settings.write(person, view, next, at), do: :ok
   end
 
   defp result({:ok, {status, body, replayed?}}), do: {:ok, status, body, replayed?}
