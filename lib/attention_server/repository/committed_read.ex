@@ -49,6 +49,9 @@ defmodule AttentionServer.Repository.CommittedRead do
   def execute(engine, {:dashboard_inventory, person, key, _configured_owner}),
     do: DashboardInventory.for_owner(engine, person, key)
 
+  def execute(:postgres, {:dashboard_levels, person, key}),
+    do: AttentionServer.Repository.Postgres.OwnerSettings.levels(person, key)
+
   def execute(engine, {:dashboard_levels, person, key}) do
     case Engine.owner_identity(engine, key) do
       {:ok, ^person, _revision} -> {:ok, %{"levels" => BounceDecision.levels(engine, person)}}
