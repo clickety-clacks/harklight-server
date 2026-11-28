@@ -427,7 +427,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         verify_auth(db, bundle, manifest)
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert :ok = ImportStreams.run(db, identity, bundle)
+        assert {:ok, _} = AttentionServer.Migration.VerifyStreamPositions.run(db, identity, bundle)
         verify_streams(db, bundle, manifest)
+        verify_stream_position_drift(db, identity, bundle)
         assert :ok = ImportReceipts.run(db, identity, bundle)
         assert :ok = ImportReceipts.run(db, identity, bundle)
         verify_receipts(db, bundle, manifest)
@@ -1380,6 +1382,33 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, %{rows: [[^expected_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts", [])
       assert {:ok, %{rows: [[2]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-same-key'", [])
       assert {:ok, %{rows: [[1]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-agent-key' AND origin_key<>''", [])
+    end
+
+    defp verify_stream_position_drift(db, identity, bundle) do
+      alias AttentionServer.Migration.VerifyStreamPositions
+      assert {:ok, counts} = VerifyStreamPositions.run(db, identity, bundle)
+      assert counts.revisions > 0 and counts.changes > 0
+      for {sql, error} <- [
+        {"UPDATE harklight.stream_resource_revisions SET revision=revision+100", :stream_revision_mismatch},
+        {"UPDATE harklight.stream_resource_revisions SET first_seen_at_ms=coalesce(first_seen_at_ms,0)+100", :stream_revision_mismatch},
+        {"UPDATE harklight.stream_changes SET created_at_ms=created_at_ms+100", :stream_change_mismatch},
+        {"UPDATE harklight.stream_changes SET session_handle='changed-session'", :stream_change_mismatch}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: n}} = ImportSession.query(tx, sql, [])
+          assert n > 0
+          assert {:error, ^error} = VerifyStreamPositions.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = VerifyStreamPositions.run(db, identity, bundle)
+      end
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, _} = ImportSession.query(tx,
+          "INSERT INTO harklight.stream_resource_revisions(person_id,origin_key,resource_kind,resource_id,revision) SELECT person_id,origin_key,'item','item:extra-synthetic',revision FROM harklight.stream_resource_revisions LIMIT 1", [])
+        assert {:error, {:stream_count_mismatch, :revisions}} = VerifyStreamPositions.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^counts} = VerifyStreamPositions.run(db, identity, bundle)
     end
 
     defp verify_streams(db, bundle, manifest) do
