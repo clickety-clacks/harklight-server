@@ -489,6 +489,21 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert %{status: 400, assigns: %{client_api_error: "unsupported"}} =
                read.(Plug.Conn.put_req_header(request, "harklight-features", "shared_messages"))
 
+      assert {:ok, _} = Transaction.query(
+        """
+        INSERT INTO harklight.messages (id, person_id, origin_key, sender_id, message_id, kind, revision, accepted_at_ms)
+        VALUES ('history', $1, $2, 'app:fixture', 'history', 'shared', 1, 1)
+        """, [person, origin])
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.message_revisions VALUES ('history', 1, 1, $1)",
+        [Attributes.encode(%{"title" => "Shared history"})])
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.message_recipients VALUES ('history', $1, 'i99', NULL, $2)",
+        [person, Attributes.encode(%{visible: true})])
+      assert {:error, :not_found} = RecipientItems.fetch(:postgres, person, "i99")
+      assert {:error, :not_found} = RecipientItems.revision(:postgres, person, "i99", 1)
+      assert %{status: 404} = read.(browser_request(:get, "/v2/items/i99/revisions/1", cookie))
+
       assert {:ok, _} =
                Transaction.query("UPDATE harklight.message_recipients SET attributes = $2 WHERE person_id = $1", [
                  person, Attributes.encode(%{visible: false})

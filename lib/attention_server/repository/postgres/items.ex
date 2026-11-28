@@ -31,6 +31,7 @@ defmodule AttentionServer.Repository.Postgres.Items do
            FROM harklight.message_recipients AS recipient
            JOIN harklight.messages AS message
              ON message.id = recipient.message_id AND message.person_id = recipient.person_id
+             AND message.kind = 'ordinary'
            JOIN harklight.message_revisions AS revision
              ON revision.message_id = message.id AND revision.revision = $3
              AND revision.revision <= message.revision
@@ -91,7 +92,7 @@ defmodule AttentionServer.Repository.Postgres.Items do
                   message.free_order, message.accepted_at_ms, message.terminal,
                   message.attributes, revision.body
            FROM harklight.message_recipients AS recipient
-           JOIN harklight.messages AS message ON message.id = recipient.message_id
+           JOIN harklight.messages AS message ON message.id = recipient.message_id AND message.kind = 'ordinary'
            JOIN harklight.message_revisions AS revision
              ON revision.message_id = message.id AND revision.revision = message.revision
            WHERE recipient.person_id = $1 AND recipient.item_id = $2
