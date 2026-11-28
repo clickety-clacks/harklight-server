@@ -632,6 +632,13 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:ok, ^uploads_verified} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
 
         verify_revision_files(db, identity, bundle, manifest)
+        assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
+        extra_hash = :crypto.hash(:sha256, "")
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.large_texts(sha256,size_bytes,verified) VALUES($1,0,true)", [extra_hash])
+        assert {:error, :large_text_hash_count_mismatch} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db, "DELETE FROM harklight.large_texts WHERE sha256=$1", [extra_hash])
+        assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
