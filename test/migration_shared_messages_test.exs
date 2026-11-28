@@ -133,6 +133,37 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "DELETE FROM harklight.message_revisions WHERE message_id=$1 AND revision=99", [@shared])
       assert {:ok, ^verified} = VerifySharedMessages.run(db, identity, bundle)
       assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+      alias AttentionServer.Migration.ImportSharedConversations
+      assert {:ok, _} = ImportSession.query(db, """
+        CREATE FUNCTION harklight.fail_shared_entry() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.id='shared-retained-turn' THEN RAISE EXCEPTION 'synthetic interruption'; END IF; RETURN NEW; END $$
+        """, [])
+      assert {:ok, _} = ImportSession.query(db,
+        "CREATE TRIGGER fail_shared_entry BEFORE INSERT ON harklight.conversation_entries FOR EACH ROW EXECUTE FUNCTION harklight.fail_shared_entry()", [])
+      assert {:error, _} = ImportSharedConversations.run(db, identity, bundle)
+      assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "shared/conversations-shared_entries/v1")
+      assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_shared_entry ON harklight.conversation_entries", [])
+      assert :ok = ImportSharedConversations.run(db, identity, bundle)
+      assert :ok = ImportSharedConversations.run(db, identity, bundle)
+      assert map_size(source.shared_entries) > 0
+      assert map_size(source.shared_answers) > 0
+      for {id, entry} <- source.shared_entries do
+        assert {:ok, %{rows: [[position, revision, "reply", body]]}} = ImportSession.query(db,
+          "SELECT position,request_revision,kind,body FROM harklight.conversation_entries WHERE conversation_id=$1 AND id=$2", [@shared, id])
+        assert position == entry.position
+        assert revision == entry.request_revision
+        assert {:ok, ^entry} = Attributes.decode(body)
+      end
+      for {id, answer} <- source.shared_answers do
+        assert {:ok, %{rows: [[person, revision, body]]}} = ImportSession.query(db,
+          "SELECT person_id,request_revision,body FROM harklight.answers WHERE message_id=$1 AND id=$2", [@shared, id])
+        assert person == answer.person
+        assert revision == answer.request_revision
+        assert {:ok, ^answer} = Attributes.decode(body)
+      end
+      expected_read = source.shared_recipients[{@shared, @second}].read_position
+      assert {:ok, %{rows: [[^expected_read]]}} = ImportSession.query(db,
+        "SELECT position FROM harklight.read_positions WHERE conversation_id=$1 AND person_id=$2", [@shared, @second])
       # Both ordinary tuple consumers must still resolve the ordinary row.
       assert :ok = ImportConversations.run(db, identity, bundle)
       assert :ok = ImportEntries.run(db, identity, bundle)
@@ -210,8 +241,16 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         {:ok, engine, _} = Groups.replace_hosted(engine, {"shared-business", "team"}, @group, "Retained group", [@sender, @first, @second], 1)
         attrs = %{id: @shared, sender_person: @sender, sender_key: @origin,
           sender_id: "app:shared-fixture", message: %{"title" => "First shared revision"},
-          answer_policy: nil, files: files, group_id: @group, group_name: "Retained group"} |> Map.put("created_at_ms", 100)
+          answer_policy: :everyone, files: files, group_id: @group, group_name: "Retained group"} |> Map.put("created_at_ms", 100)
         {:ok, engine, record, _} = SharedMessages.create(engine, attrs, [@first, @second], nil)
+        entry = %{id: "shared-retained-turn", at_ms: 101, text: "Retained discussion",
+          speaker: %{"kind" => "person", "id" => @first}}
+        {:ok, engine, _} = SharedMessages.reply(engine, record, {:person, @first}, entry)
+        record = engine.shared_messages[@shared]
+        {:ok, engine} = SharedMessages.read_position(engine, record, @second,
+          engine.shared_recipients[{@shared, @second}], SharedMessages.recipient_entry_id(entry.id, @second))
+        {:ok, engine, _} = AttentionServer.SharedAnswers.answer(engine, record,
+          engine.shared_recipients[{@shared, @first}], @first, 1, {:comment, "Retained answer"}, 102)
         {:ok, engine, _} = Groups.replace_hosted(engine, {"shared-business", "team"}, @group, "Retained group", [@sender, @second], 2)
         {:ok, engine} = SharedMessages.revise(engine, record, 1, %{"title" => "Second shared revision"}, [], 200)
         {:ok, engine} = Groups.delete_hosted(engine, {"shared-business", "team"})
