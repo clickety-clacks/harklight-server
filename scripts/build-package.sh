@@ -26,6 +26,11 @@ install -m 644 SELF_HOST.md "$stage/$name/SELF_HOST.md"
 install -m 644 GUIDED_JOIN.md "$stage/$name/GUIDED_JOIN.md"
 mkdir -p "$stage/$name/fixtures/compatibility"
 install -m 644 scripts/compatibility/profile.exs "$stage/$name/fixtures/compatibility/profile.exs"
+install -m 755 scripts/compatibility/run.sh "$stage/$name/fixtures/compatibility/run.sh"
+for fixture in run.exs scenarios.exs README.md; do
+  install -m 644 "scripts/compatibility/$fixture" "$stage/$name/fixtures/compatibility/$fixture"
+done
+install -m 644 support/tls_fixtures.ex "$stage/$name/fixtures/compatibility/tls_fixtures.ex"
 "$repo_dir/scripts/build-skills.sh" "$stage/$name/skills"
 cp -a third_party "$stage/$name/THIRD_PARTY"
 for application in "$stage/$name"/lib/*; do
