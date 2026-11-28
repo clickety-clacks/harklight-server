@@ -92,6 +92,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         seed_historical_messages(source_path)
         expected_organizations = seed_organizations(source_path, epoch)
         expected_recipients = source_recipient_expectations(source_path)
+        expected_subscriptions = source_subscription_expectations(source_path)
         {:ok, sqlite} = Exqlite.Sqlite3.open(source_path)
 
         {:ok, rows} =
@@ -441,6 +442,40 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           assert {:ok, %{rows: [[^seen, actual]]}} = ImportSession.query(db,
             "SELECT seen_revision,attributes FROM harklight.message_recipients WHERE message_id=$1 AND person_id=$2", [id, person])
           assert {:ok, ^metadata} = Attributes.decode(actual)
+        end
+        assert {:ok, _} = ImportSession.query(db, """
+          CREATE FUNCTION harklight.fail_subscription_head() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN
+            IF NEW.family='device_subscription_heads' THEN RAISE EXCEPTION 'synthetic interruption'; END IF;
+            RETURN NEW;
+          END $$
+          """, [])
+        assert {:ok, _} = ImportSession.query(db, """
+          CREATE TRIGGER fail_subscription_head BEFORE INSERT ON harklight.compatibility_facts
+          FOR EACH ROW EXECUTE FUNCTION harklight.fail_subscription_head()
+          """, [])
+        assert {:error, _} = AttentionServer.Migration.ImportSubscriptions.run(db, identity, bundle)
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+          "SELECT count(*) FROM harklight.compatibility_facts WHERE family IN ('device_subscription_heads','device_subscription_senders')", [])
+        assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "devices/subscriptions/v1")
+        assert {:ok, _} = ImportSession.query(db,
+          "DROP TRIGGER fail_subscription_head ON harklight.compatibility_facts", [])
+        assert :ok = AttentionServer.Migration.ImportSubscriptions.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportSubscriptions.run(db, identity, bundle)
+        for {person, device, revision, senders} <- expected_subscriptions do
+          assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+            "SELECT body FROM harklight.compatibility_facts WHERE family='device_subscription_heads' AND address=$1",
+            [Attributes.key({person, device})])
+          assert {:ok, ^revision} = Attributes.decode(body)
+          for sender <- senders do
+            assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+              "SELECT body FROM harklight.compatibility_facts WHERE family='device_subscription_senders' AND address=$1",
+              [Attributes.key({person, device, revision, sender})])
+            assert {:ok, true} = Attributes.decode(body)
+          end
+          assert {:ok, %{rows: []}} = ImportSession.query(db,
+            "SELECT body FROM harklight.compatibility_facts WHERE family='device_subscription_senders' AND address=$1",
+            [Attributes.key({person, device, revision, "app:never-subscribed"})])
         end
         verify_messages(db, bundle, manifest)
         verify_receipt_replay(session_person, {agent_person, agent_key}, receipt_digest)
@@ -918,6 +953,18 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert actual == File.read!(path)
       assert byte_size(actual) == size
       assert {:error, :not_found} = Uploads.read_chunk(person, id, count)
+    end
+
+    defp source_subscription_expectations(path) do
+      {:ok, store} = AttentionServer.Store.open_relay(path)
+      expected = Enum.flat_map(store.engine.devices, fn {device, %{person: person} = principal} ->
+        case Map.get(store.engine.subscriptions, {person, device}) do
+          %{revision: revision, senders: senders} -> [{person, device, revision, Enum.sort(senders)}]
+          nil -> if principal.revoked, do: [], else: [{person, device, 0, []}]
+        end
+      end)
+      :ok = AttentionServer.Store.close(store)
+      expected
     end
 
     defp source_recipient_expectations(path) do
