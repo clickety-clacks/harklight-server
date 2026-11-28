@@ -728,3 +728,21 @@ comparison. Dynamic LargeText path families additionally require
 `VerifyLargeText`'s source-reference and content closure. Successful inventory
 alone never transitions lifecycle state, validates material, reconciles pending
 runtime work or enables migration readiness.
+
+
+### Combined comparison report
+
+`Migration.ValidationReport.run(connection, identity, bundle, material_root)`
+runs the fixed set of 26 database comparisons and the completed private material
+checks. PostgreSQL comparisons share a repeatable-read, read-only transaction;
+source sealing and material are checked again before returning. Failure returns
+an error without a successful prefix report. A successful result includes each
+comparison's counts, the immutable import identity, material manifest and a
+SHA-256 over the report encoded as deterministic ETF minor version 2. No secret
+file contents appear in the report.
+
+This API does not publish a report file or change import lifecycle state. The
+future validate command must bind the complete report to the guarded lifecycle
+transition. A successful comparison report also does not prove runtime pending
+work reconciliation, saved-baseline continuation, material installation or the
+required client/release rehearsals. Migration readiness remains disabled.
