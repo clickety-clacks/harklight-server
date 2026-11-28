@@ -90,7 +90,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, [%{rev: 3}], false, 3} = Streams.agent_page(agent, 2, 10, nil, true)
     end
 
-    test "a concurrent retention pass keeps page bounds and rows in one snapshot" do
+    test "append waits for retention to release the stream head and keeps the imported high" do
       alias AttentionServer.Repository.Postgres.Streams
 
       person = "synthetic-retention"
@@ -125,8 +125,30 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
         end)
 
       assert_receive :row_locked, 2_000
+
+      head_blocker =
+        Task.async(fn ->
+          Transaction.run([scope], fn _ ->
+            send(observer, :head_locked)
+            receive do: (:release_head -> {:ok, :released})
+          end)
+        end)
+
+      assert_receive :head_locked, 2_000
       prune = Task.async(fn -> Streams.prune(scope, 50) end)
-      await_lock_wait("stream_changes", 100)
+      await_lock_wait("SELECT head FROM harklight.stream_heads", 100)
+      send(head_blocker.pid, :release_head)
+      assert {:ok, :released} = Task.await(head_blocker)
+      await_lock_wait("DELETE FROM harklight.stream_changes", 100)
+
+      new_change = %{change("new") | created_at_ms: 100}
+
+      append =
+        Task.async(fn ->
+          Transaction.run([scope], &Transaction.append(&1, scope, [new_change]))
+        end)
+
+      await_lock_wait("SELECT head FROM harklight.stream_heads", 100)
 
       assert {:ok, [%{rev: 1}], false, 1} = Streams.person_page(person, 0, 10)
       assert {:ok, [], false, 8} = Streams.person_page(person, 8, 10)
@@ -134,10 +156,11 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       send(blocker.pid, :release_row)
       assert {:ok, :released} = Task.await(blocker)
       assert {:ok, 1} = Task.await(prune)
+      assert {:ok, 10} = Task.await(append)
       assert {:ok, 1} = Streams.prune(scope, 50)
       assert {:error, :cursor_expired} = Streams.person_page(person, 0, 10)
-      assert {:ok, [], false, 8} = Streams.person_page(person, 8, 10)
-      assert {:error, :cursor_expired} = Streams.person_page(person, 10, 10)
+      assert {:ok, [%{rev: 10}], false, 10} = Streams.person_page(person, 8, 10)
+      assert {:error, :cursor_expired} = Streams.person_page(person, 11, 10)
     end
 
     test "unrelated streams commit independently and same-stream revisions follow commit order" do
@@ -268,7 +291,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
           end)
         end)
 
-      await_lock_wait("stream_heads", 100)
+      await_lock_wait("harklight.stream_heads", 100)
 
       # A caller using the original reverse order would already hold right.
       assert {:ok, :right_available} =
@@ -299,9 +322,9 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, :forward} = Task.await(forward)
     end
 
-    defp await_lock_wait(table, 0), do: flunk("request did not wait for a lock on #{table}")
+    defp await_lock_wait(statement, 0), do: flunk("request did not wait on #{statement}")
 
-    defp await_lock_wait(table, remaining) do
+    defp await_lock_wait(statement, remaining) do
       assert {:ok, %{rows: [[waiting?]]}} =
                Transaction.query(
                  """
@@ -311,12 +334,12 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                      AND query LIKE $1
                  )
                  """,
-                 ["%harklight.#{table}%"]
+                 ["%#{statement}%"]
                )
 
       unless waiting? do
         Process.sleep(10)
-        await_lock_wait(table, remaining - 1)
+        await_lock_wait(statement, remaining - 1)
       end
     end
 
@@ -446,7 +469,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
         end)
 
       assert_receive :second_started, 2_000
-      await_lock_wait("operation_receipts", 100)
+      await_lock_wait("harklight.operation_receipts", 100)
       send(first.pid, :finish_operation)
       assert {:ok, {200, %{"result" => "first"}, false}} = Task.await(first)
       assert {:ok, {200, %{"result" => "first"}, true}} = Task.await(other)
