@@ -817,6 +817,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           schema: AttentionServer.Repository.Postgres.Schema.digest()}
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert :ok = ImportStreams.run(db, identity, bundle)
+        assert {:ok, _} = AttentionServer.Migration.VerifyStreamPositions.run(db, identity, bundle)
+        assert {:ok, %{epoch: ^epoch}} = AttentionServer.Migration.VerifyStreamHeads.run(db, identity, bundle)
         start_supervised!({Repo, config})
         assert {:ok, [], false, ^head} = Streams.person_page(person, head, 50)
         assert {:error, :cursor_expired} = Streams.person_page(person, head - 1, 50)
