@@ -617,6 +617,18 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:error, :upload_chunk_source_mismatch} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
         assert {:ok, _} = ImportSession.query(db,
           "UPDATE harklight.upload_chunks SET bytes=$3 WHERE upload_id=$1 AND chunk_number=$2", [upload_id, ordinal, bytes])
+        assert {:ok, %{rows: [[source_size, chunk_count]]}} = ImportSession.query(db,
+          "SELECT size_bytes,(SELECT count(*) FROM harklight.upload_chunks WHERE upload_id=$1) FROM harklight.uploads WHERE id=$1", [upload_id])
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.uploads SET size_bytes=size_bytes+1 WHERE id=$1", [upload_id])
+        assert {:error, :upload_source_mismatch} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.uploads SET size_bytes=$2 WHERE id=$1", [upload_id, source_size])
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.upload_chunks(upload_id,chunk_number,bytes) VALUES($1,$2,$3)", [upload_id, chunk_count, "extra"])
+        assert {:error, :upload_source_mismatch} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "DELETE FROM harklight.upload_chunks WHERE upload_id=$1 AND chunk_number=$2", [upload_id, chunk_count])
         assert {:ok, ^uploads_verified} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
 
         stop_supervised!(Repo)
