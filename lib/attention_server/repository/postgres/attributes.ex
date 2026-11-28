@@ -2,6 +2,7 @@ defmodule AttentionServer.Repository.Postgres.Attributes do
   @moduledoc false
 
   alias AttentionServer.Store.StoredTerms
+  alias AttentionServer.Repository.Postgres.LargeText.Ref
 
   @encoding "erlang-etf-v1"
   @options [:deterministic, {:minor_version, 2}]
@@ -16,6 +17,7 @@ defmodule AttentionServer.Repository.Postgres.Attributes do
       when map_size(envelope) == 2 and is_binary(data) do
     with {:ok, payload} <- Base.decode64(data) do
       :ok = StoredTerms.load_keyed_atoms()
+      Code.ensure_loaded!(Ref)
 
       case :erlang.binary_to_term(payload, [:safe, :used]) do
         {value, used} when used == byte_size(payload) -> {:ok, value}
