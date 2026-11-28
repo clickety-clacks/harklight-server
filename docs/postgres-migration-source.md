@@ -426,3 +426,12 @@ Start a fresh unpublished destination and new receipt for that new bundle. An
 existing format-1 destination remains unpublished; do not reuse its receipt with
 the replacement bundle. This changes the migration bundle format, not FORMAT32
 or the client protocol. Unknown newer bundle versions also refuse explicitly.
+
+`LargeTextSource.scan/2` verifies each exported large-text reference against the
+export's read-only database copy: exact typed path, addressed record checksum,
+marker, byte length and content digest. It streams the reference table and uses
+indexed record lookups, so it does not reconstruct the whole Engine or load an
+entire text into memory. It never infers a reference from marker-looking literal
+text. This is source preparation only; PostgreSQL chunk publication, normalized
+reference projection and client wire parity require the landed large-text schema
+and consumer and remain separate validation gates.
