@@ -60,7 +60,13 @@ locking the import state row. Checkpoint ordinal zero means no frame consumed.
 After verifying the rows, referenced content, counts and closure, record the
 validated manifest digest and transition `loading` to `validated`. The
 installer activates in a separate transaction after verification, with the same
-import identity and manifest digest. An opted-in runtime must require both
+import identity and manifest digest. Guard the update with the import ID,
+source digest, schema digest, validated manifest digest, and prior phase
+`validated`. Require exactly one matched row. The database requires inserts
+to begin in `loading`, rejects skipped or reversed phase transitions, and
+prevents replacing the source, schema, import identity or validated manifest.
+Restarting from scratch requires a new unpublished destination. An opted-in
+runtime must require both
 schema version 1 and `phase = 'active'` plus the server identity row. The
 identity row alone cannot publish partial imports. An isolated fresh database
 uses the same lifecycle with a manifest describing the newly provisioned

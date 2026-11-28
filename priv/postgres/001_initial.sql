@@ -29,6 +29,42 @@ CREATE TABLE import_state (
   CHECK ((phase = 'loading') = (manifest_sha256 IS NULL))
 );
 
+CREATE FUNCTION guard_import_state() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE check_violation USING MESSAGE = 'import ownership cannot be removed';
+  ELSIF TG_OP = 'INSERT' THEN
+    IF NEW.phase <> 'loading' THEN
+      RAISE check_violation USING MESSAGE = 'an import must begin in loading';
+    END IF;
+  ELSE
+    IF ROW(OLD.singleton, OLD.import_id, OLD.source_sha256, OLD.schema_sha256)
+       IS DISTINCT FROM
+       ROW(NEW.singleton, NEW.import_id, NEW.source_sha256, NEW.schema_sha256) THEN
+      RAISE check_violation USING MESSAGE = 'import identity cannot change';
+    END IF;
+
+    IF OLD.phase <> 'loading' AND OLD.manifest_sha256 IS DISTINCT FROM NEW.manifest_sha256 THEN
+      RAISE check_violation USING MESSAGE = 'validated manifest cannot change';
+    END IF;
+
+    IF OLD.phase <> NEW.phase AND NOT (
+      (OLD.phase = 'loading' AND NEW.phase = 'validated') OR
+      (OLD.phase = 'validated' AND NEW.phase = 'active')
+    ) THEN
+      RAISE check_violation USING MESSAGE = 'invalid import phase transition';
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER import_state_transition
+BEFORE INSERT OR UPDATE OR DELETE ON import_state
+FOR EACH ROW EXECUTE FUNCTION guard_import_state();
+
 CREATE TABLE import_checkpoints (
   import_id text REFERENCES import_state (import_id),
   family text,
