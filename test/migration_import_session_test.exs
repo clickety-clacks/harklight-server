@@ -661,6 +661,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         verify_revision_files(db, identity, bundle, manifest)
         verify_item_facts(db, identity, bundle, manifest)
         verify_file_fact_drift(db, identity, bundle)
+        verify_availability_drift(db, identity, bundle)
         verify_message_drift(db, identity, bundle)
         verify_recipient_drift(db, identity, bundle)
         verify_authority_drift(db, identity, bundle)
@@ -1925,6 +1926,81 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:error, {:recipient_state_mismatch, :answer, _}} = VerifyRecipientState.run(db, identity, bundle)
       assert {:ok, _} = ImportSession.query(db, "UPDATE harklight.answers SET body=$2 WHERE id=$1", [answer, body])
       assert {:ok, ^result} = VerifyRecipientState.run(db, identity, bundle)
+    end
+
+    defp verify_availability_drift(db, identity, bundle) do
+      verifier = AttentionServer.Migration.VerifyAvailability
+      assert {:ok, %{availability: n} = counts} = verifier.run(db, identity, bundle)
+      assert n > 0
+      for sql <- [
+        "UPDATE harklight.compatibility_facts SET body='{}'::jsonb WHERE family='ordinary_item_availability'",
+        "DELETE FROM harklight.compatibility_facts WHERE family='ordinary_item_availability'"
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: ^n}} = ImportSession.query(tx, sql, [])
+          assert {:error, {:availability_fact_mismatch, _}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, _} = ImportSession.query(tx,
+          "INSERT INTO harklight.compatibility_facts VALUES('ordinary_item_availability',$1,$2::text::jsonb)",
+          [Attributes.key({"synthetic-other-person", "i999999"}), JSON.encode!(Attributes.encode({"not_listening", nil}))])
+        assert {:error, :availability_count_or_identity_mismatch} = verifier.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      availability_source_changes(db, identity, bundle, counts)
+    end
+
+    defp availability_source_changes(db, identity, bundle, counts) do
+      alias AttentionServer.Migration.VerifyAvailability
+      source = Path.join(bundle, "source.sqlite3")
+      original = File.read!(source)
+      # Keep the writer open after a real commit so its WAL is not checkpointed
+      # on close. This demonstrates changed effective state with identical main bytes.
+      {:ok, writer} = Exqlite.Sqlite3.open(source)
+      try do
+        query = fn connection, sql, params ->
+          result = ImportSession.query(connection, sql, params)
+          if String.starts_with?(sql, "SELECT count(*) FROM harklight.compatibility_facts WHERE family='ordinary_item_availability'") do
+            assert :ok = Exqlite.Sqlite3.execute(writer, """
+              PRAGMA wal_autocheckpoint=0;
+              INSERT INTO client_change_log_epoch(id,epoch) VALUES(1,999)
+              ON CONFLICT(id) DO UPDATE SET epoch=999;
+              """)
+            assert {:ok, [[999]]} = AttentionServer.Store.RecordTable.select(writer,
+              "SELECT epoch FROM client_change_log_epoch WHERE id=1")
+            assert File.stat!(source <> "-wal").size > 0
+            assert File.read!(source) == original
+          end
+          result
+        end
+        assert {:error, :bundle_source_pending_writes} = VerifyAvailability.run(db, identity, bundle, query)
+        assert File.stat!(source <> "-wal").size > 0
+      after
+        Exqlite.Sqlite3.close(writer)
+        # Restore only this disposable test copy after the writer is closed.
+        for suffix <- ["-wal", "-shm", "-journal"], do: File.rm(source <> suffix)
+        File.write!(source, original)
+      end
+      assert {:ok, ^counts} = VerifyAvailability.run(db, identity, bundle)
+      journal = source <> "-journal"
+      query = fn connection, sql, params ->
+        result = ImportSession.query(connection, sql, params)
+        if String.starts_with?(sql, "SELECT count(*) FROM harklight.compatibility_facts WHERE family='ordinary_item_availability'"),
+          do: File.write!(journal, "synthetic pending journal")
+        result
+      end
+      try do
+        assert {:error, :bundle_source_pending_writes} = VerifyAvailability.run(db, identity, bundle, query)
+        assert File.read!(journal) == "synthetic pending journal"
+        assert File.read!(source) == original
+      after
+        File.rm!(journal)
+      end
+      assert {:ok, ^counts} = VerifyAvailability.run(db, identity, bundle)
     end
 
     defp verify_file_fact_drift(db, identity, bundle) do

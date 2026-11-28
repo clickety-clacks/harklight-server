@@ -641,3 +641,17 @@ using the shared FORMAT32 selectors. Raw upload metadata is checked against the
 source before it is used for projection. Exact keys and family counts reject
 missing, changed or extra reader facts. Upload byte and relational link closure
 remain separate required checks; this comparison does not publish an import.
+
+`Migration.VerifyAvailability.run/3` compares committed ordinary availability
+using a temporary file-backed index built from sealed source frames. It applies
+source item state, then session cache, then the latest availability event by
+original journal position, then accepted-event payload, then the legacy empty
+fallback. It never uses the imported availability or conversation projection as
+its oracle. Exact scoped values and counts reject missing, changed or extra
+facts. The temporary index is discarded on close; neither store is changed.
+
+Bundle verification checks the copied source database together with its WAL and
+rollback journal before and after reading bundle contents. Sidecars must be
+absent or empty; a nonempty sidecar refuses even if the main database hash is
+unchanged. All verifiers share this check. It never opens, checkpoints, clears
+or otherwise modifies the copied source to make validation pass.

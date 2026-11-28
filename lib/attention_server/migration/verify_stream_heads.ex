@@ -1,6 +1,6 @@
 defmodule AttentionServer.Migration.VerifyStreamHeads do
   @moduledoc false
-  alias AttentionServer.Migration.{Bundle, Frames, ImportSession, Source, VerifyFacts}
+  alias AttentionServer.Migration.{Bundle, BundleValidation, Frames, ImportSession, VerifyFacts}
   alias AttentionServer.Store.RecordTable
   alias Exqlite.Sqlite3
 
@@ -9,7 +9,6 @@ defmodule AttentionServer.Migration.VerifyStreamHeads do
   def run(db, identity, bundle, query \\ &ImportSession.query/3) do
     with {:ok, _} <- VerifyFacts.run(db, identity, bundle),
          {:ok, manifest, _} <- Bundle.verify(bundle),
-         :ok <- no_pending_writes(bundle),
          {:ok, source} <- Sqlite3.open(Path.join(bundle, "source.sqlite3"), mode: :readonly) do
       try do
         with :ok <- temporary_heads(source),
@@ -33,27 +32,10 @@ defmodule AttentionServer.Migration.VerifyStreamHeads do
   end
 
   defp source_unchanged(bundle, manifest) do
-    expected = manifest.source
-    with :ok <- no_pending_writes(bundle),
-         {:ok, %{size: size, sha256: hash}} <- Source.file_observation(Path.join(bundle, "source.sqlite3")),
-         true <- size == expected.source_bytes and hash == expected.source_sha256 do
-      :ok
-    else
+    case BundleValidation.sealed_source(bundle, manifest.source) do
+      :ok -> :ok
       _ -> {:error, :stream_source_changed}
     end
-  end
-
-  # The sealed copy has no pending writes. A separate SQLite writer can commit
-  # into WAL while this read-only connection remains open, without changing the
-  # main file yet. Never checkpoint or clear these files to make it admissible.
-  defp no_pending_writes(bundle) do
-    Enum.reduce_while(["-wal", "-journal"], :ok, fn suffix, :ok ->
-      case File.lstat(Path.join(bundle, "source.sqlite3" <> suffix)) do
-        {:error, :enoent} -> {:cont, :ok}
-        {:ok, %{type: :regular, size: 0}} -> {:cont, :ok}
-        _ -> {:halt, {:error, :stream_source_changed}}
-      end
-    end)
   end
 
   # The source database is read-only. This connection-local temporary index
