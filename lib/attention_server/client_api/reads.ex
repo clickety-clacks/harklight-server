@@ -36,7 +36,7 @@ defmodule AttentionServer.ClientAPI.Reads do
   alias AttentionServer.ClientAPI.{Context, Errors, PeopleProfiles, Projection, Resources, Search, SharedAttachments, SharedCapability, SharedContinuation, SharedReads}
   alias AttentionServer.ClientAPI.Auth
   alias AttentionServer.Repository.RecipientItems
-  alias AttentionServer.Repository.Postgres.{Identities, Settings, SharedAccess, Transaction}
+  alias AttentionServer.Repository.Postgres.{DeviceMe, Identities, Settings, SharedAccess, Transaction}
 
   # The client features still behind an operator flag at 0.2 (contract §4).
   @client_features ~w(server_matched_push_routing priority_level_editing)
@@ -220,6 +220,44 @@ defmodule AttentionServer.ClientAPI.Reads do
         respond(conn, call(ctx.relay, {:me_profile, ctx.principal, capability}))
       {:ok, %{shared?: false}} -> respond(conn, me(ctx.relay, ctx.principal))
       error -> respond(conn, error)
+    end
+  end
+
+  @doc false
+  def get_postgres_me(conn, %Context{} = ctx, mode, flags_path, upload_cap) do
+    result =
+      Transaction.snapshot(fn ->
+        with {:ok, %{kind: :device, person: person, key: key} = principal} <-
+               Auth.device(conn, {:postgres, mode}),
+             {:ok, capability} <- SharedCapability.parse(conn),
+             :ok <- SharedAccess.check(person, capability, ctx.shared_features),
+             {:ok, view} <- DeviceMe.read(person, key, mode, capability.shared?) do
+          {flags, _warned} = FeatureFlags.read(flags_path, true)
+          organizations = if ctx.shared_features.shared_messages, do: view.organizations, else: []
+
+          response =
+            principal
+            |> me_base(view.instance, view.paused?, flags, upload_cap)
+            |> me_organization_features(organizations, ctx.shared_features.groups)
+            |> Map.put("sender_names", view.sender_names)
+
+          response =
+            if view.migration?,
+              do: put_in(response, ["features", "auth_migration"], true),
+              else: response
+
+          {:ok, if(capability.shared?, do: put_in(response, ["principal", "profile"], view.profile), else: response)}
+        else
+          {:ok, _agent} -> {:error, :forbidden}
+          {:error, :unavailable} -> {:error, :retry_later}
+          {:error, token, field} -> {:error, {token, field}}
+          {:error, _} = error -> error
+        end
+      end)
+
+    case result do
+      {:error, {token, field}} -> respond(conn, {:error, token, field})
+      other -> respond(conn, other)
     end
   end
 
@@ -656,44 +694,20 @@ defmodule AttentionServer.ClientAPI.Reads do
     engine = state.store.engine
 
     with {:ok, principal} <- principal(engine, key) do
-      response = %{
-        "server" => %{"id" => engine.relay_instance_id},
-        "principal" => enrollment_ids(principal),
-        "account" => %{
-          "state" =>
-            if(Engine.delivery_stopped?(engine, principal.person), do: "paused", else: "active")
-        },
-        "features" =>
-          @client_features
-          |> Map.new(&{&1, Map.get(flags, &1) == true})
-          |> Map.put("handoff_captions", true)
-          |> Map.put("alarm", true)
-          |> migration_feature(state, key),
-        "limits" => %{
-          "upload_cap_bytes_per_file" =>
-            if(state.upload_cap == :none, do: "none", else: state.upload_cap),
-          "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
-          "answer_ui_limits" => UI1.published_limits(),
-          "retention_days" => @retention_days
-        }
-      }
+      person = principal.person
+      organizations =
+        if state.shared_messages,
+          do: engine |> SharedMessages.organizations(person) |> Enum.sort(),
+          else: []
 
       response =
-        if shared_available?(state, principal.person) do
-          ids = engine |> SharedMessages.organizations(principal.person) |> Enum.sort()
-          response
-          |> put_in(["features", "shared_messages"], true)
-          |> put_in(["principal", "organization_ids"], ids)
-        else
-          response
-        end
+        principal
+        |> me_base(engine.relay_instance_id, Engine.delivery_stopped?(engine, person), flags, state.upload_cap)
+        |> update_in(["features"], &migration_feature(&1, state, key))
+        |> me_organization_features(organizations, state.groups and state.store.mode == :keyed)
+        |> with_sender_names(engine, principal)
 
-      response =
-        if AttentionServer.ClientAPI.GroupRoutes.available(state, principal.person) == :ok,
-          do: put_in(response, ["features", "groups"], true),
-          else: response
-
-      {:ok, with_sender_names(response, engine, principal)}
+      {:ok, response}
     end
   end
 
@@ -805,6 +819,36 @@ defmodule AttentionServer.ClientAPI.Reads do
       Projection.probe(:file)
       Resources.file_source(engine, person, file_id)
     end)
+  end
+
+  defp me_base(principal, instance, paused?, flags, upload_cap) do
+    %{
+      "server" => %{"id" => instance},
+      "principal" => enrollment_ids(principal),
+      "account" => %{"state" => if(paused?, do: "paused", else: "active")},
+      "features" =>
+        @client_features
+        |> Map.new(&{&1, Map.get(flags, &1) == true})
+        |> Map.put("handoff_captions", true)
+        |> Map.put("alarm", true),
+      "limits" => %{
+        "upload_cap_bytes_per_file" => if(upload_cap == :none, do: "none", else: upload_cap),
+        "inline_decoded_bytes_per_entry" => ConversationFiles.inline_limit(),
+        "answer_ui_limits" => UI1.published_limits(),
+        "retention_days" => @retention_days
+      }
+    }
+  end
+
+  defp me_organization_features(response, [], _groups?), do: response
+
+  defp me_organization_features(response, organizations, groups?) do
+    response =
+      response
+      |> put_in(["features", "shared_messages"], true)
+      |> put_in(["principal", "organization_ids"], organizations)
+
+    if groups?, do: put_in(response, ["features", "groups"], true), else: response
   end
 
   defp migration_feature(features, state, %{kind: :device, session_id: nil, person: person, key: id}) do

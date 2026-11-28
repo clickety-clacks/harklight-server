@@ -1583,8 +1583,8 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
 
     @tag :tmp_dir
     test "PostgreSQL certificate authority follows FORMAT32 migration and sender rules", %{tmp_dir: dir} do
-      alias AttentionServer.{DeviceIdentity, Relay, TLSFixtures}
-      alias AttentionServer.ClientAPI.Auth
+      alias AttentionServer.{DeviceIdentity, JSON, Relay, TLSFixtures}
+      alias AttentionServer.ClientAPI.{Auth, Router}
       alias AttentionServer.Store.{AuthSchema, RecordTable}
       alias Exqlite.Sqlite3
 
@@ -1594,7 +1594,9 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       agent_id = "00000000-0000-4000-8000-000000000001"
       sender_pattern = "app:synthetic"
       path = Path.join(dir, "certificates.sqlite3")
-      opts = [store_path: path, agent_fixture_mode: true]
+      flags_path = Path.join(dir, "feature-flags.json")
+      File.write!(flags_path, ~s({"priority_level_editing":true}))
+      opts = [store_path: path, agent_fixture_mode: true, feature_flags_path: flags_path, upload_cap: 2048]
       relay = start_supervised!({Relay, opts})
       assert :ok = Relay.setup_person(relay, person)
       assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
@@ -1632,6 +1634,10 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       {agent, _} = credentials["unknown"]
 
       check = fn relay, mode, expected ->
+        current = Router.init(relay: relay, auth: :device)
+        postgres = Router.init(relay: nil, repository: :postgres, auth: :device,
+          deployment_mode: mode, feature_flags_path: flags_path, upload_cap: 2048)
+
         for {name, kind} <- expected do
           {key, conn} = Map.fetch!(credentials, name)
           actual = Auth.device(conn, relay)
@@ -1642,10 +1648,24 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
           end
 
           assert Auth.device(conn, {:postgres, mode}) == actual
+
+          old = Router.call(conn, current)
+          new = Router.call(conn, postgres)
+          assert old.status == new.status
+
+          if new.status == 200 do
+            assert {:ok, expected} = JSON.decode_line(old.resp_body <> "\n")
+            assert {:ok, observed} = JSON.decode_line(new.resp_body <> "\n")
+            # This unit fixture creates two independent server identities.
+            assert Map.delete(expected, "server") == Map.delete(observed, "server")
+            assert observed["server"] == %{"id" => "fixture"}
+          end
         end
       end
 
       admitted = [{"a1", :device}, {"a2", :device}, {"b1", :device}, {"unknown", :agent}]
+      check.(relay, :self_hosted, admitted)
+      File.write!(flags_path, ~s({"server_matched_push_routing":true}))
       check.(relay, :self_hosted, admitted)
       stop_supervised!(Relay)
 

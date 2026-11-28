@@ -72,9 +72,12 @@ defmodule AttentionServer.ClientAPI.PeopleProfiles do
         %{label: label} -> label
         nil -> nil
       end
-      %{"display_name" => hosted_label || "Harklight person", "handle" => nil}
+      default_profile(hosted_label)
     end)
   end
+
+  def default_profile(hosted_label),
+    do: %{"display_name" => hosted_label || "Harklight person", "handle" => nil}
 
   def speaker(engine, person) do
     Map.merge(for_person(engine, person), %{"kind" => "person", "id" => person})

@@ -4,6 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.CLIPipelineTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON}
+    alias AttentionServer.ClientAPI.Router
     alias AttentionServer.Migration.{CLI, ImportPipeline}
 
     @tag timeout: 600_000
@@ -14,8 +15,20 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       on_exit(fn -> File.rm_rf!(root) end)
       fixture = CompatibilityScenarios.fixture(Path.join(root, "source"))
       {:ok, relay} = CompatibilityScenarios.start(fixture)
-      history = try do
-        CompatibilityScenarios.run(relay, fixture)
+      {history, shared_profiles} = try do
+        history = CompatibilityScenarios.run(relay, fixture)
+        opts = Router.init(relay: relay, auth: :device)
+
+        shared_profiles =
+          for role <- [:phone, :other], into: %{} do
+            assert %{status: 200, resp_body: body} =
+                     Router.call(device_me_conn(fixture, role, "shared_messages,groups"), opts)
+
+            assert {:ok, profile} = JSON.decode_line(body <> "\n")
+            {role, profile}
+          end
+
+        {history, shared_profiles}
       after
         GenServer.stop(relay)
       end
@@ -76,6 +89,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert resumed["material"] == validated["material"]
         assert {:ok, %{"migration_ready" => false}} = CLI.run(["capabilities"])
         assert {:error, :invalid_arguments} = CLI.run(["activate", "--receipt", receipt])
+        verify_device_me(fixture, history, shared_profiles, uri.port, password)
       after
         Enum.each(previous, fn {key, value} ->
           if is_nil(value), do: System.delete_env(key), else: System.put_env(key, value)
@@ -83,6 +97,39 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       end
       assert File.read!(source) == original
       assert {:ok, _} = CLI.run(["verify", bundle])
+    end
+
+    defp verify_device_me(fixture, history, shared_profiles, port, password_file) do
+      alias AttentionServer.Repository.Postgres.{Repo, Transaction}
+
+      start_supervised!({Repo, hostname: "127.0.0.1", port: port,
+        username: "harklight_migrator", password: File.read!(password_file), database: "migration_cli"})
+      assert {:error, :postgres_not_active} = Transaction.verify_ready()
+      opts = Router.init(relay: nil, repository: :postgres, auth: :device,
+        deployment_mode: :self_hosted, shared_messages: true, groups: true)
+
+      for {role, role_name} <- [{:phone, "phone"}, {:other, "other"}] do
+        row = Enum.find(history["observations"], &(&1["role"] == role_name and &1["path"] == "/v2/me"))
+        assert row["headers"] == []
+        assert %{status: 200, resp_body: body} = Router.call(device_me_conn(fixture, role), opts)
+        assert {:ok, observed} = JSON.decode_line(body <> "\n")
+        assert observed == row["body"], inspect(CompatibilityScenarios.differences(row["body"], observed))
+
+        assert %{status: 200, resp_body: body} =
+                 Router.call(device_me_conn(fixture, role, "shared_messages,groups"), opts)
+        assert {:ok, shared} = JSON.decode_line(body <> "\n")
+        assert shared == shared_profiles[role]
+      end
+
+      assert {:error, :postgres_not_active} = Transaction.verify_ready()
+    end
+
+    defp device_me_conn(fixture, role, features \\ nil) do
+      conn =
+        Plug.Test.conn(:get, "/v2/me")
+        |> Plug.Test.put_peer_data(%{address: {127, 0, 0, 1}, port: 1, ssl_cert: Map.fetch!(fixture.ders, role)})
+
+      if features, do: Plug.Conn.put_req_header(conn, "harklight-features", features), else: conn
     end
   end
 end
