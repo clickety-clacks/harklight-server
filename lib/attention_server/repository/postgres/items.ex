@@ -42,7 +42,7 @@ defmodule AttentionServer.Repository.Postgres.Items do
            [person, item, revision]
          ) do
       {:ok, %{rows: [[attributes, body, head]]}} ->
-        with :ok <- revision_visibility(attributes),
+        with {:ok, _visibility} <- recipient_attributes(attributes),
              {:ok, message} when is_map(message) and not is_struct(message) <- Attributes.decode(body),
              {:ok, files} <- revision_files(person, item, revision) do
           {:ok, %{"rev" => head, "revision" => %{
@@ -60,9 +60,9 @@ defmodule AttentionServer.Repository.Postgres.Items do
 
   def recipient_revision(_person, _item, _revision), do: {:error, :not_found}
 
-  defp revision_visibility(attributes) do
+  def recipient_attributes(attributes) do
     case Attributes.decode(attributes) do
-      {:ok, %{visible: true}} -> :ok
+      {:ok, %{visible: true} = attributes} -> {:ok, attributes}
       {:ok, %{visible: false}} -> {:error, :not_found}
       _ -> {:error, :storage_unavailable}
     end

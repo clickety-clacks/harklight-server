@@ -20,6 +20,8 @@ defmodule AttentionServer.Repository.RecipientItems do
 
   def shared_revision(:postgres, scope, revision),
     do: AttentionServer.Repository.Postgres.SharedItems.revision(scope, revision)
+  def summary_facts(:postgres, person, item_id),
+    do: AttentionServer.Repository.Postgres.ItemSummaryFacts.read(person, item_id)
 
   def read_through(engine, {person, _, _} = key, entry_id) do
     with {:ok, seq} <- item_entry_seq(engine, person, key, entry_id) do

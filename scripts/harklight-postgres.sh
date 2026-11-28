@@ -30,6 +30,8 @@ usage: harklight-postgres COMMAND [options]
   apply-grants           give the runtime role its privileges on the migrated schema
   verify-roles           check the runtime role cannot own, alter or truncate anything
   status                 report the configured database, service and connection
+  migrate [--resume DIR] copy the stopped FORMAT32 store into the empty PostgreSQL database,
+                         validate it and stage identity material; never activates
   backup ARCHIVE         write one archive: database dump, state directory and checksums
   restore ARCHIVE        restore that archive (add --replace to overwrite existing data)
 
@@ -45,6 +47,8 @@ options:
                          (containers and tests; not supervised)
   --online               backup or restore while Harklight Server is running (not advised)
   --replace              restore over a database that already holds data
+  --resume DIR           with migrate: continue an interrupted migration in its work directory
+  --migration-bin PATH   with migrate: the importer executable (default: harklight-migration beside this command)
 EOF
   exit 2
 }
@@ -74,6 +78,8 @@ ca_file=""
 use_service=1
 online=0
 replace=0
+resume_dir=""
+migration_bin=""
 positional=()
 while (($#)); do
   case "$1" in
@@ -91,6 +97,8 @@ while (($#)); do
     --no-service) use_service=0; shift ;;
     --online) online=1; shift ;;
     --replace) replace=1; shift ;;
+    --resume) resume_dir=${2:?}; shift 2 ;;
+    --migration-bin) migration_bin=${2:?}; shift 2 ;;
     -h|--help) usage ;;
     --*) fail "unknown option $1" ;;
     *) positional+=("$1"); shift ;;
@@ -661,6 +669,316 @@ do_status() {
   note "free disk:               $(free_mb "$root") MB under $root"
 }
 
+# ----------------------------------------------------------- migrate
+
+json_field() {
+  python3 -I -c 'import json,sys
+d = json.loads(sys.argv[1]); v = d.get(sys.argv[2])
+print("" if v is None else v)' "$1" "$2"
+}
+
+migrate_failed() {
+  local step=$1 work_dir=$2
+  cat >&2 <<EOF
+harklight-postgres: migration step "$step" failed.
+Nothing was activated and no backend setting was changed. Keep the old Server stopped.
+Do not delete the destination, rerun bootstrap, or touch the backup in $work_dir/backup.
+Check progress: run the importer's status command with receipt $work_dir/receipt.json.
+Fix the reported problem and continue with: harklight-postgres migrate --resume $work_dir
+Or abandon this unpublished destination and restore the original backup; that rollback
+is only valid before PostgreSQL has accepted any new writes.
+EOF
+  exit 2
+}
+
+# Run one importer step. Exit 0 and a JSON object on stdout are required.
+migration_step() {
+  local step=$1; shift
+  local out
+  if ! out="$("$migration_bin" "$@" 2> "$work_dir/$step.err")"; then migrate_failed "$step" "$work_dir"; fi
+  case "$step" in
+    export|verify)   # their existing output shape is preserved by the contract
+      [[ "$(json_field "$out" result 2>/dev/null || true)" == verified_export ]] || migrate_failed "$step (unexpected output)" "$work_dir" ;;
+    *)
+      [[ "$(json_field "$out" contract_version 2>/dev/null || true)" == 1 ]] || migrate_failed "$step (unexpected output)" "$work_dir" ;;
+  esac
+  printf '%s\n' "$out" > "$work_dir/$step.json"
+  printf '%s' "$out"
+}
+
+# Verify the importer's staged identity material against its COMPLETE.json and
+# install only the listed files at their mapped locations. Fail closed.
+install_material() {
+  python3 -I - "$work_dir/validate.json" "$work_dir/material-map.json" "$work_dir" <<'PY' || return 1
+import hashlib, json, os, shutil, sys
+vpath, mpath, work = sys.argv[1:4]
+def die(msg):
+    sys.stderr.write("harklight-postgres: material check failed: " + msg + "\n"); sys.exit(1)
+def sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+v = json.load(open(vpath)); mapping = json.load(open(mpath))
+mat = v.get("material")
+if not isinstance(mat, dict) or not all(k in mat for k in ("root", "manifest_sha256", "files")):
+    die("validate output has no complete material section")
+root = os.path.realpath(mat["root"]); parent = os.path.dirname(root)
+if os.path.commonpath([os.path.realpath(work), root]) != os.path.realpath(work):
+    die("staging root is outside the migration work directory")
+def private(path, what):
+    if os.stat(path).st_mode & 0o077:
+        die(what + " is not private (mode " + oct(os.stat(path).st_mode & 0o777) + "): " + path)
+d = root
+while True:
+    private(d, "a staging directory")
+    if d == os.path.realpath(work):
+        break
+    d = os.path.dirname(d)
+for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: die("cannot read the staging tree: " + str(e))):
+    private(dirpath, "a staging directory")
+    for n in dirnames:
+        private(os.path.join(dirpath, n), "a staging directory")
+complete = os.path.join(parent, "COMPLETE.json")
+if os.path.isfile(complete):
+    private(complete, "COMPLETE.json")
+if not os.path.isfile(complete) or sha(complete) != mat["manifest_sha256"]:
+    die("COMPLETE.json is missing or does not match its recorded digest")
+c = json.load(open(complete))
+for k in ("import_id", "source_sha256", "schema_sha256"):
+    if c.get(k) != v.get(k):
+        die("COMPLETE.json identity differs from the validated import (" + k + ")")
+listed = {}
+for f in mat["files"]:
+    rel = f.get("path", "")
+    if not rel or rel.startswith("/") or "//" in rel or ".." in rel.split("/"):
+        die("unsafe staged path " + repr(rel))
+    src = os.path.realpath(os.path.join(root, rel))
+    if os.path.commonpath([root, src]) != root or not os.path.isfile(src):
+        die("staged file missing or outside the staging root: " + rel)
+    private(src, "a staged file")
+    if os.path.getsize(src) != f.get("size") or sha(src) != f.get("sha256"):
+        die("staged file length or hash differs: " + rel)
+    listed[rel] = src
+missing = sorted(set(mapping) - set(listed))
+if missing:
+    die("required material was not staged: " + ", ".join(missing))
+extra = sorted(set(listed) - set(mapping))
+if extra:
+    die("staged files outside the export map: " + ", ".join(extra))
+plan = []
+for rel, src in sorted(listed.items()):
+    dest = mapping[rel]
+    if os.path.exists(dest):
+        if sha(dest) != sha(src):
+            die("the existing file differs from the verified staged copy and was not overwritten: " + dest)
+        if os.stat(dest).st_mode & 0o077:
+            die("the existing identity file is identical but not private (mode " + oct(os.stat(dest).st_mode & 0o777) + "); fix its mode and resume: " + dest)
+        continue
+    plan.append((src, dest))
+for src, dest in plan:
+    os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+    tmp = dest + ".hk-install"
+    shutil.copyfile(src, tmp); os.chmod(tmp, 0o600); os.replace(tmp, dest)
+print("installed %d file(s); %d already identical" % (len(plan), len(listed) - len(plan)))
+PY
+}
+
+# Prove the old Server is stopped on every invocation, resume included:
+# the unit must be inactive or failed with no main process.
+require_stopped() {
+  command -v systemctl >/dev/null 2>&1 || fail "cannot prove Harklight Server is stopped (no systemctl); stop it by hand and use a systemd user session for the migration"
+  local active pid load
+  load="$(systemctl_user show --property=LoadState --value "$SERVER_UNIT" 2>/dev/null)" ||
+    fail "cannot read the load state of $SERVER_UNIT; refusing to migrate"
+  [[ "$load" == loaded ]] || fail "$SERVER_UNIT is not a loaded unit (load state: $load), so its stopped state proves nothing; refusing to migrate"
+  active="$(systemctl_user show --property=ActiveState --value "$SERVER_UNIT" 2>/dev/null)" ||
+    fail "cannot read the state of $SERVER_UNIT; refusing to migrate"
+  pid="$(systemctl_user show --property=MainPID --value "$SERVER_UNIT" 2>/dev/null)" ||
+    fail "cannot read the process of $SERVER_UNIT; refusing to migrate"
+  [[ "$pid" == 0 && ( "$active" == inactive || "$active" == failed ) ]] ||
+    fail "Harklight Server is not proven stopped ($SERVER_UNIT is $active, main process $pid); stop it and keep it stopped"
+}
+
+# The importer must declare itself ready through its read-only capabilities
+# command before any side effect. A status that merely answers for a missing
+# receipt does not authorize anything. Unknown or failing probes refuse.
+require_importer() {
+  [[ -x "$migration_bin" ]] || fail "the packaged importer ($migration_bin) is not available, so the store cannot be migrated. Nothing was changed."
+  local out
+  out="$("$migration_bin" capabilities 2>/dev/null)" || out=""
+  if ! python3 -I - "$out" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+    need = {"export", "verify", "import", "status", "validate"}
+    ok = (d.get("contract_version") == 1 and d.get("command") == "capabilities"
+          and d.get("migration_ready") is True and need <= set(d.get("commands", [])))
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+  then
+    fail "this release's importer does not report that the migration pipeline is ready (capabilities), so the store cannot be migrated. Nothing was changed."
+  fi
+}
+
+# Fingerprint of the stopped source: main file digest and size, WAL and SHM
+# presence, size and digest. Also refuses while any process has one of them open.
+source_fingerprint() {
+  python3 -I - "$state/relay.sqlite3" <<'PY'
+import hashlib, os, sys
+main = sys.argv[1]
+names = [main, main + "-wal", main + "-shm", main + "-journal"]
+real = {os.path.realpath(n) for n in names}
+me = os.getpid()
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    if int(pid) == me:
+        continue
+    try:
+        fds = os.listdir("/proc/%s/fd" % pid)
+    except OSError:
+        continue
+    for fd in fds:
+        try:
+            if os.path.realpath(os.readlink("/proc/%s/fd/%s" % (pid, fd))) in real:
+                sys.stderr.write("a running process (pid %s) has the source store open; refusing\n" % pid); sys.exit(3)
+        except OSError:
+            continue
+def digest(path):
+    if not os.path.exists(path):
+        return "absent"
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return "%s:%d" % (h.hexdigest(), os.path.getsize(path))
+for label, n in zip(("main", "wal", "shm", "journal"), names):
+    print("%s=%s" % (label, digest(n)))
+PY
+}
+
+# On every run, including a resume, the source must still be the stopped,
+# unopened store that was backed up and exported.
+confirm_source() {
+  local now
+  now="$(source_fingerprint)" || fail "the source store could not be confirmed unchanged and unopened"
+  if [[ -f "$work_dir/source.manifest" ]]; then
+    [[ "$now" == "$(< "$work_dir/source.manifest")" ]] ||
+      fail "the source store changed since this migration was backed up and exported (main, WAL or SHM differ); it must be unchanged. Restore the original or start a new migration from a fresh backup"
+  elif [[ -f "$work_dir/done.backup" ]]; then
+    fail "$work_dir has a backup but no source fingerprint; start a new migration"
+  fi
+  printf '%s' "$now"
+}
+
+migrate_setup() {
+  find_pg_bin
+  load_config
+  local self_dir
+  self_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+  migration_bin="${migration_bin:-$self_dir/harklight-migration}"
+  require_importer
+  [[ -f "$state/relay.sqlite3" ]] || fail "no FORMAT32 store at $state/relay.sqlite3"
+  require_stopped
+  export HARKLIGHT_MIGRATOR_URL="$mg_url" HARKLIGHT_MIGRATOR_PASSWORD_FILE="$mg_pwfile"
+  if [[ -n "${pg_ca:-}" ]]; then export HARKLIGHT_MIGRATOR_CA_FILE="$pg_ca"; fi
+}
+
+material_failed() {
+  cat >&2 <<EOF
+harklight-postgres: the importer's identity material could not be verified and installed.
+The destination has NOT been activated by this command. Do not start Harklight Server.
+Fix the cause and run: harklight-postgres migrate --resume $work_dir
+EOF
+  exit 2
+}
+
+do_migrate() {
+  migrate_setup
+  if [[ -s "$state/relay.sqlite3-wal" || -s "$state/relay.sqlite3-journal" ]]; then
+    fail "the stopped store is not checkpointed; start the current release once and stop it cleanly, then retry"
+  fi
+  if [[ -n "$resume_dir" ]]; then
+    work_dir="$resume_dir"
+    [[ -d "$work_dir/backup" ]] || fail "$work_dir is not a migration work directory"
+  else
+    [[ "$(user_table_count)" == 0 ]] || fail "the PostgreSQL database already holds objects; a migration needs an empty, unpublished destination"
+    mkdir -m 700 -p -- "$root/migration"
+    work_dir="$(mktemp -d "$root/migration/$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+    chmod 700 "$work_dir"
+  fi
+  note "migration work directory: $work_dir"
+  local bundle="$work_dir/bundle" receipt="$work_dir/receipt.json" out validation_sha externals
+
+  local fp
+  fp="$(confirm_source)"
+  if [[ ! -f "$work_dir/done.backup" ]]; then
+    mkdir -m 700 -p -- "$work_dir/backup"
+    tar --exclude=./releases --exclude=./backups --exclude=./postgres --exclude=./migration \
+      --exclude=./.release-install.lock -cf "$work_dir/backup/private-root.tar" -C "$root" . || migrate_failed backup "$work_dir"
+    chmod 600 "$work_dir/backup/private-root.tar"
+    sha "$work_dir/backup/private-root.tar" > "$work_dir/backup/SHA256"
+    [[ "$(source_fingerprint)" == "$fp" ]] || migrate_failed "backup (the source changed while it was being copied)" "$work_dir"
+    printf '%s' "$fp" > "$work_dir/source.manifest"; chmod 600 "$work_dir/source.manifest"
+    : > "$work_dir/done.backup"
+    note "immutable backup written: $work_dir/backup/private-root.tar"
+  fi
+
+  if [[ ! -f "$work_dir/done.export" ]]; then
+    externals="$(external_refs)" || migrate_failed "material map (an external path cannot be captured)" "$work_dir"
+    python3 -I - "$state" "$work_dir/material-map.json" "$externals" <<'PY' || migrate_failed "material map" "$work_dir"
+import json, os, sys
+state, out, externals = sys.argv[1:4]
+def walk_error(err):
+    raise err
+m = {}
+for name in ("server.env", "person-id"):
+    path = os.path.join(state, name)
+    if os.path.isfile(path):
+        m[name] = path
+for sub in ("tls", "owner"):
+    base = os.path.join(state, sub)
+    if not os.path.isdir(base):
+        continue
+    for dirpath, _, files in os.walk(base, onerror=walk_error):
+        for f in files:
+            p = os.path.join(dirpath, f)
+            if os.path.isfile(p):
+                m[os.path.relpath(p, state)] = p
+for line in externals.splitlines():
+    if "\t" in line:
+        _, p = line.split("\t", 1)
+        m["external" + p] = p
+with open(out, "w") as fh:
+    json.dump(m, fh, indent=1, sort_keys=True)
+os.chmod(out, 0o600)
+PY
+    rm -rf -- "$bundle"
+    migration_step export export --source "$state/relay.sqlite3" --output "$bundle" --unit "$SERVER_UNIT" --material-map "$work_dir/material-map.json" >/dev/null
+    migration_step verify verify "$bundle" >/dev/null
+    : > "$work_dir/done.export"
+    note "export and verify passed"
+  fi
+
+  if [[ ! -f "$work_dir/done.validate" ]]; then
+    migration_step import import --bundle "$bundle" --receipt "$receipt" >/dev/null
+    note "import completed"
+    out="$(migration_step validate validate --bundle "$bundle" --receipt "$receipt")"
+    validation_sha="$(json_field "$out" validation_sha256)"
+    [[ "$validation_sha" =~ ^[0-9a-f]{64}$ ]] || migrate_failed "validate (no validation digest)" "$work_dir"
+    : > "$work_dir/done.validate"
+    note "validation passed ($validation_sha)"
+  fi
+  "$0" apply-grants --root "$root" --state "$state" --pg-bin "$pg_bin" >/dev/null || migrate_failed "apply-grants" "$work_dir"
+  "$0" verify-roles --root "$root" --state "$state" --pg-bin "$pg_bin" >/dev/null || migrate_failed "verify-roles" "$work_dir"
+  if ! out="$(install_material)"; then material_failed; fi
+  note "identity material verified: $out"
+  note "The destination is imported and validated. It has NOT been activated; server.env was not changed and Harklight Server was not started."
+  note "Activation is not part of this command and is not available yet."
+}
+
 # ------------------------------------------------------- backup / restore
 
 guard_server_stopped() {
@@ -868,6 +1186,7 @@ case "$cmd" in
   status) do_status ;;
   apply-grants) do_apply_grants ;;
   verify-roles) do_verify_roles ;;
+  migrate) do_migrate ;;
   backup) do_backup ;;
   restore) do_restore ;;
   *) usage ;;

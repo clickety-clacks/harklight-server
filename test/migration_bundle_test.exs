@@ -6,6 +6,9 @@ defmodule AttentionServer.Migration.BundleTest do
   alias AttentionServer.Migration.{Bundle, CLI, Frames}
 
   test "command requires explicit source, supervision and material inventory" do
+    assert {:ok, %{"contract_version" => 1, "command" => "capabilities",
+      "commands" => ["export", "verify", "status"], "migration_ready" => false}} = CLI.run(["capabilities"])
+    assert {:error, :receipt_missing} = CLI.run(["status", "--receipt", "/synthetic/nonexistent-receipt"])
     assert {:error, :invalid_arguments} = CLI.run(["export"])
     assert {:error, :invalid_arguments} = CLI.run(["import", "anything"])
 
@@ -111,6 +114,21 @@ defmodule AttentionServer.Migration.BundleTest do
 
     identity = %{id: "synthetic-material-import", source: Base.decode16!(summary.sha256, case: :lower),
       schema: AttentionServer.Repository.Postgres.Schema.digest()}
+    receipt = Path.join(root, "resume-receipt.json")
+    assert {:ok, fresh} = AttentionServer.Migration.ImportReceipt.open(receipt, destination)
+    assert fresh.source == identity.source
+    assert AttentionServer.Message.uuid_v4?(fresh.id)
+    assert Bitwise.band(File.stat!(receipt).mode, 0o777) == 0o600
+    assert {:ok, ^fresh} = AttentionServer.Migration.ImportReceipt.open(receipt, destination)
+    pinned = %{fresh | schema: :crypto.hash(:sha256, File.read!("priv/postgres/001_initial.sql"))}
+    File.write!(receipt, JSON.encode!(AttentionServer.Migration.ImportReceipt.document(pinned)))
+    assert {:ok, ^pinned} = AttentionServer.Migration.ImportReceipt.open(receipt, destination)
+    File.rename!(receipt, receipt <> ".partial")
+    assert {:ok, ^pinned} = AttentionServer.Migration.ImportReceipt.open(receipt, destination)
+    File.write!(receipt, JSON.encode!(AttentionServer.Migration.ImportReceipt.document(%{pinned | source: :crypto.hash(:sha256, "wrong")})))
+    assert {:error, :import_source_mismatch} = AttentionServer.Migration.ImportReceipt.open(receipt, destination)
+    File.write!(receipt, "invalid receipt")
+    assert {:error, :invalid_import_receipt} = AttentionServer.Migration.ImportReceipt.load(receipt)
     staging = Path.join(root, "private-stage")
     assert {:ok, material} = AttentionServer.Migration.ImportMaterial.run(destination, identity, staging)
     assert material["root"] == Path.join(staging, "files")

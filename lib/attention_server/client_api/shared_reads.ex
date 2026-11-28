@@ -2,7 +2,7 @@ defmodule AttentionServer.ClientAPI.SharedReads do
   @moduledoc false
 
   alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, SharedMessages}
-  alias AttentionServer.ClientAPI.{Auth, Reads, SharedCapability}
+  alias AttentionServer.ClientAPI.{Auth, Errors, Reads, SharedCapability}
   alias AttentionServer.Repository.RecipientItems
   alias AttentionServer.Repository.Postgres.{Identities, Settings, SharedItems, Transaction}
 
@@ -52,7 +52,8 @@ defmodule AttentionServer.ClientAPI.SharedReads do
 
     case result do
       {:error, {token, field}} when is_binary(token) -> Reads.respond(conn, {:error, token, field})
-      result -> Reads.respond_streamed(conn, result)
+      {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &Reads.streamed_read_headers/2)
+      error -> Reads.respond(conn, error)
     end
   end
 

@@ -153,7 +153,10 @@ defmodule AttentionServer.ClientAPI.Reads do
         end
       end)
 
-    respond_streamed(conn, result)
+    case result do
+      {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
+      error -> respond(conn, error)
+    end
   end
 
   @doc false
@@ -244,17 +247,12 @@ defmodule AttentionServer.ClientAPI.Reads do
   # Only the parameters a read takes; anything else in the query is ignored.
   defp query(conn, names), do: Map.take(conn.query_params, names)
 
-  defp streamed_read_headers(conn, digest) do
+  @doc false
+  def streamed_read_headers(conn, digest) do
     tag = etag_digest(digest)
     conn = read_headers(conn, tag)
     if not_modified?(conn, tag), do: {:not_modified, conn}, else: {:send, conn}
   end
-
-  @doc false
-  def respond_streamed(conn, {:ok, body}),
-    do: Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
-
-  def respond_streamed(conn, error), do: respond(conn, error)
 
   def respond(conn, result, etag_of \\ &etag/1)
 
