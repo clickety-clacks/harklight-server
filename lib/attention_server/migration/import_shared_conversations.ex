@@ -52,10 +52,10 @@ defmodule AttentionServer.Migration.ImportSharedConversations do
        when is_integer(position) and position >= 0 do
     execute(db, """
       INSERT INTO harklight.read_positions(conversation_id,person_id,position)
-      SELECT c.id,$2,$3 FROM harklight.conversations c
+      SELECT c.id,$2,$3::bigint FROM harklight.conversations c
       JOIN harklight.messages m ON m.id=c.message_id AND m.kind='shared'
       JOIN harklight.message_recipients recipient ON recipient.message_id=m.id AND recipient.person_id=$2
-      WHERE m.id=$1 AND ($3=0 OR EXISTS
+      WHERE m.id=$1 AND ($3::bigint=0 OR EXISTS
         (SELECT 1 FROM harklight.conversation_entries e WHERE e.conversation_id=c.id AND e.position=$3))
       """, [id, person, position])
   end
