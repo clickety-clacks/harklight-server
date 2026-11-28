@@ -39,4 +39,23 @@ defmodule AttentionServer.Migration.SourceFormatTest do
 
     assert SourceFormat.upgrade_instruction() =~ "Never rerun bootstrap"
   end
+
+  test "approved family inventory covers the persisted Engine and excludes derived state" do
+    alias AttentionServer.{Engine, Migration.SourceSchema}
+
+    expected =
+      %Engine{}
+      |> Map.from_struct()
+      |> Map.drop([:origin_feeds, :advisory_feeds | RecordCodec.derived_fields()])
+      |> Map.keys()
+      |> Enum.sort()
+
+    actual = SourceSchema.record_families() |> Map.values() |> List.flatten() |> Enum.sort()
+    assert actual == expected
+
+    for kind <- [:field, :row, :member], field <- RecordCodec.derived_fields() do
+      address = if kind == :field, do: {kind, field}, else: {kind, field, "synthetic"}
+      refute SourceSchema.valid_record?(address, true)
+    end
+  end
 end

@@ -69,5 +69,37 @@ defmodule AttentionServer.Migration.SourceSchema do
     "sqlite_sequence" => ~w(name seq)
   }
 
+  # Explicit FORMAT32 record families, independently versioned from Engine so
+  # adding a new durable field cannot silently widen migration admission.
+  @scalars ~w(relay_instance_id agent_cursor_key browser_sign_in_clock_high_water pending_clock_high_water jev_endpoint jev_model)a
+  @members ~w(retired_owner_keys conversation_opened opened_revisions)a
+  @rows ~w(persons people_profiles owners pending_enrollments pending_history join_invitations browser_sign_ins
+    maintainer_grants devices agents sender_grants messages groups hosted_group_refs shared_messages
+    shared_recipients shared_entries shared_seen shared_answers events free_order_highs conversation_highs
+    conversation_events chat_read_positions reply_group_history conversation_cursors receipts origin_sessions
+    item_availability origin_receipts origin_actions uploads source_report_grants enrollment_read_grants
+    subscriptions cursors hosted_accounts hosted_organizations local_organizations delivery_states
+    algorithm_choices alert_choices push_bindings bounce_levels bounce_revisions bounce_waiting_routes)a
+
   def tables, do: @tables
+  def record_families, do: %{field: @scalars, member: @members, row: @rows}
+
+  def valid_record?({:field, field}, _), do: field in @scalars
+  def valid_record?({:row, field, _key}, _), do: field in @rows
+  def valid_record?({:member, field, _key}, true), do: field in @members
+
+  def valid_record?({:origin_feed, {person, origin}, part}, value)
+      when is_binary(person) and is_binary(origin), do: feed_part?(:origin_feed, part, value)
+
+  def valid_record?({:advisory, {person, origin, handle}, part}, value)
+      when is_binary(person) and is_binary(origin) and is_binary(handle),
+      do: feed_part?(:advisory, part, value)
+
+  def valid_record?(_, _), do: false
+
+  defp feed_part?(_, :high, high), do: is_integer(high) and high >= 0
+  defp feed_part?(_, {:entry, seq}, _), do: is_integer(seq) and seq > 0
+  defp feed_part?(:origin_feed, {:delivery_ack, seq}, _), do: is_integer(seq) and seq > 0
+  defp feed_part?(:advisory, {:receipt, id}, true), do: is_binary(id)
+  defp feed_part?(_, _, _), do: false
 end

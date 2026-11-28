@@ -1,3 +1,4 @@
+Code.require_file("../support/migration_fixtures.ex", __DIR__)
 Code.require_file("../scripts/compatibility/scenarios.exs", __DIR__)
 
 defmodule AttentionServer.Migration.HistoryInventoryTest do
@@ -20,7 +21,13 @@ defmodule AttentionServer.Migration.HistoryInventoryTest do
       end
 
     path = Path.join(root, "relay.sqlite3")
-    assert {:ok, inventory} = Format32.preflight(path, stopped: true, scratch_root: root)
+
+    assert {:ok, inventory} =
+             Format32.preflight(path,
+               provenance: AttentionServer.MigrationFixtures.provenance(path),
+               scratch_root: root
+             )
+
     assert inventory.tables["client_changes"].count > 0
     assert inventory.tables["agent_changes"].count > 0
     assert inventory.tables["client_idempotency"].count > 0

@@ -1,25 +1,30 @@
 defmodule AttentionServer.Migration.Format32 do
   @moduledoc """
-  Read-only inventory of a stopped FORMAT32 backup. The caller must first stop
-  every writer and keep the original backup offline. This does not fence a
-  running Server and is not an import or activation command.
+  Read-only inventory of a FORMAT32 copy carrying trusted stopped-source
+  export provenance. This consumer cannot prove a live source was stopped;
+  the source-facing exporter owns that evidence. Never use inventory success
+  as import or activation authorization.
   """
 
-  alias AttentionServer.Migration.{SourceFormat, SourceSchema}
+  alias AttentionServer.Migration.{Provenance, SourceFormat, SourceSchema}
   alias AttentionServer.Store.{RecordCodec, RecordTable, StoredTerms}
   alias Exqlite.Sqlite3
 
   @required ~w(relay_state relay_records relay_record_generation relay_index_state)
 
   def preflight(path, opts) do
-    if Keyword.get(opts, :stopped) == true and is_binary(Keyword.get(opts, :scratch_root)) do
-      inspect_copy(Path.expand(path), Keyword.fetch!(opts, :scratch_root))
+    if is_binary(Keyword.get(opts, :scratch_root)) do
+      inspect_copy(
+        Path.expand(path),
+        Keyword.fetch!(opts, :scratch_root),
+        Keyword.get(opts, :provenance)
+      )
     else
-      {:error, :stopped_backup_required}
+      {:error, :stopped_provenance_required}
     end
   end
 
-  defp inspect_copy(path, root) do
+  defp inspect_copy(path, root, provenance) do
     dir =
       Path.join(
         root,
@@ -33,6 +38,7 @@ defmodule AttentionServer.Migration.Format32 do
         with :ok <- File.chmod(dir, 0o700),
              :ok <- checkpointed(path),
              {:ok, digest, bytes} <- hash_file(path),
+             :ok <- Provenance.validate(provenance, digest, bytes),
              :ok <- File.cp(path, copy),
              :ok <- File.chmod(copy, 0o600),
              {:ok, ^digest, ^bytes} <- hash_file(copy),
@@ -142,8 +148,13 @@ defmodule AttentionServer.Migration.Format32 do
       try do
         digest_rows(db, stmt, :crypto.hash_init(:sha256), 0, fn [key, payload, checksum] ->
           case RecordCodec.decode_row({key, payload, checksum}) do
-            {:ok, address, value} -> {:ok, {address, value}}
-            _ -> {:error, :invalid_source_record}
+            {:ok, address, value} ->
+              if SourceSchema.valid_record?(address, value),
+                do: {:ok, {address, value}},
+                else: {:error, :unsupported_source_record_address}
+
+            _ ->
+              {:error, :invalid_source_record}
           end
         end)
       after

@@ -5,11 +5,24 @@ FORMAT32 remains the default backend. This first slice supplies an internal,
 read-only source inventory; it does not import, activate PostgreSQL, change
 configuration, or start a listener.
 
-`AttentionServer.Migration.Format32.preflight(path, stopped: true,
-scratch_root: root)` inspects a **stopped, checkpointed backup**. The caller
-must stop all Server writers, background work and provisioning before taking
-that backup. The `stopped` option acknowledges that prerequisite; it cannot
-stop another process or fence writers. Keep the original backup offline.
+`AttentionServer.Migration.Format32.preflight(path, provenance: receipt,
+scratch_root: root)` accepts only a **copy carrying a trusted stopped-source
+export receipt**. A bare `stopped: true` acknowledgement is refused. The
+source-facing exporter must collect supervisor and process-marker observations
+before and after copying, plus size, modification time and SHA-256 of the main
+file and WAL/SHM/journal files. The supervisor must report the same inactive
+unit with MainPID zero; the process marker must be absent or confirmed stale;
+the file observations must be unchanged and WAL/journal must be absent or
+empty. The consumer binds the receipt's main-file hash and size to this copy.
+Missing, incomplete, inconsistent or mismatched receipts are refused.
+
+The receipt is trusted output from the operator's export step, not an
+independent proof manufactured by this copy reader. This slice does not gather
+supervisor evidence. The source-facing export command follows separately and
+must not open, lock-probe or checkpoint the original through SQLite. The caller
+must stop all Server writers, background work and provisioning, and retain the
+original backup offline. Synthetic consumer tests use explicit producer
+fixtures; they are not evidence that a real service was inspected.
 
 The function creates a private disposable copy under the existing scratch
 root, opens only that copy with SQLite in read-only mode, and deletes the
@@ -61,3 +74,12 @@ Keep the full immutable pre-upgrade backup. Before accepting new writes,
 rollback can return to the original stopped stack. After new writes,
 restoring the old backup loses them and cannot undo external deliveries;
 a binary or symlink change is not a data downgrade.
+
+## Codec mismatch recovery
+
+`source_otp_mismatch` means the keyed source was written by another Erlang/OTP
+major version. Keep the backup unchanged and run the exporter from a verified
+package using the source codec's OTP major. If that package is unavailable,
+obtain a supported rekey/bridge procedure against a separate copy; do not edit
+the anchor or downgrade the running binary to force admission. No cross-OTP
+migration compatibility is claimed by this inventory.
