@@ -26,8 +26,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             )
         ]
 
-        {:ok, db} = Postgrex.start_link(config)
-        on_exit(fn -> if Process.alive?(db), do: GenServer.stop(db) end)
+        db = start_supervised!({Postgrex, config})
 
         root =
           Path.join(System.tmp_dir!(), "import-history-#{System.unique_integer([:positive])}")
@@ -100,6 +99,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             _ -> nil
           end
         end)
+        {:ok, _} = AttentionServer.Store.AuthSchema.initialize(sqlite)
         :ok = AttentionServer.BrowserAuth.add_session(sqlite,
           :crypto.hash(:sha256, "synthetic migration browser session"),
           session_person, session_owner.key, session_owner.revision, "fixture")
@@ -373,12 +373,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
       assert uri.host in ["localhost", "127.0.0.1"]
       [user, password] = String.split(uri.userinfo, ":", parts: 2)
-      {:ok, db} = Postgrex.start_link(
+      db = start_supervised!({Postgrex, [
         hostname: uri.host, port: uri.port,
         username: URI.decode(user), password: URI.decode(password),
         database: "migration_implicit_roster"
-      )
-      on_exit(fn -> if Process.alive?(db), do: GenServer.stop(db) end)
+      ]})
       root = Path.join(System.tmp_dir!(), "import-legacy-#{System.unique_integer([:positive])}")
       File.mkdir!(root)
       File.chmod!(root, 0o700)
