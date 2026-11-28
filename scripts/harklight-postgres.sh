@@ -530,7 +530,35 @@ EOF
   note "After the schema is migrated, run: harklight-postgres apply-grants && harklight-postgres verify-roles"
 }
 
+# The Server accepts only these runtime URL forms: a user, no password, a
+# database, and either no query, sslmode=verify-full, or sslmode=disable on a
+# loopback host. Anything else would be rejected at Server start.
+validate_runtime_url() {
+  python3 -I - "$1" <<'PY' || exit 1
+import sys
+from urllib.parse import urlsplit, parse_qsl, unquote
+u = urlsplit(sys.argv[1])
+def bad(msg):
+    sys.stderr.write("harklight-postgres: " + msg + "\n"); sys.exit(1)
+if not u.hostname or not u.username or u.password is not None or u.fragment:
+    bad("the runtime URL needs a host and a user, and no password")
+db = unquote(u.path.lstrip("/"))
+if not db or "/" in db or ":" in unquote(u.username):
+    bad("the runtime URL needs a plain database name and user")
+q = parse_qsl(u.query, keep_blank_values=True)
+loop = u.hostname in ("127.0.0.1", "localhost", "::1")
+if q == [] or q == [("sslmode", "verify-full")]:
+    pass
+elif q == [("sslmode", "disable")]:
+    if not loop:
+        bad("sslmode=disable is only accepted for a loopback host; use sslmode=verify-full")
+else:
+    bad("the runtime URL may carry only sslmode=verify-full (or sslmode=disable on loopback); the Server rejects other query parameters")
+PY
+}
+
 do_setup_remote() {
+  [[ "$password_file" = /* && "${migrator_password_file:-/}" = /* ]] || fail "password files must be absolute paths"
   [[ -n "$password_file" && -f "$password_file" ]] || fail "--password-file must name the runtime role's password file"
   [[ -n "$migrator_url" && -n "$migrator_password_file" && -f "$migrator_password_file" ]] ||
     fail "a remote database needs --migrator-url and --migrator-password-file for a separate owner role"
@@ -543,10 +571,13 @@ do_setup_remote() {
     [[ "$u" =~ ^postgres(ql)?:// ]] || fail "database URLs must be postgres:// URLs without a password"
     if [[ "$u" =~ ://[^/@]*:[^/@]*@ ]]; then fail "do not put a password in a URL; use password files"; fi
   done
+  [[ -z "$ca_file" || "$ca_file" = /* ]] || fail "--ca-file must be an absolute path"
+  [[ -z "$ca_file" || -f "$ca_file" ]] || fail "--ca-file does not exist"
+  validate_runtime_url "$remote_url"
   [[ "$remote_url" != "$migrator_url" ]] || fail "the runtime and migration roles must be different roles"
   pg_url=$remote_url pg_pwfile=$password_file pg_ca=$ca_file
   mg_url=$migrator_url mg_pwfile=$migrator_password_file
-  local num count major host
+  local num count major
   num="$(psql_mg -c 'show server_version_num')" || fail "cannot connect to the remote database as the migration role"
   psql_rt -c 'select 1' >/dev/null || fail "cannot connect to the remote database as the runtime role"
   [[ "$(psql_rt -c 'select current_user')" != "$(psql_mg -c 'select current_user')" ]] || fail "the runtime and migration roles must be different roles"
@@ -554,12 +585,6 @@ do_setup_remote() {
   ((major >= MIN_PG_MAJOR)) || fail "the remote PostgreSQL is version $major; $MIN_PG_MAJOR or newer is required"
   count="$(user_table_count)"
   [[ "$count" == 0 ]] || fail "the remote database already holds $count objects; Harklight never repurposes an existing database. Create an empty database with a dedicated owner and runtime role"
-  host="${remote_url#*@}"; host="${host%%[:/?]*}"
-  case "$host" in
-    127.0.0.1|localhost|::1|\[::1\]) ;;
-    *) [[ "$remote_url" == *sslmode=verify-full* && "$migrator_url" == *sslmode=verify-full* ]] ||
-         note "warning: $host is not loopback; use sslmode=verify-full in both URLs (and --ca-file when needed) so the connection is verified" ;;
-  esac
   detect_roles
   check_roles
   probe_boundary

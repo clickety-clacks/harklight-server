@@ -209,6 +209,12 @@ expect_fail "remote setup refuses a database that already holds data" "never rep
     --migrator-url "$murl" --migrator-password-file "$mpwfile"
 expect_fail "remote setup refuses a password in the URL" "do not put a password" \
   "$tool" setup "${r[@]}" --remote-url "postgres://rrun:x@$base" --password-file "$scratch/rrun.pw" --migrator-url "postgres://rmig@$base" --migrator-password-file "$scratch/rmig.pw"
+expect_fail "remote setup refuses query parameters the Server rejects" "may carry only sslmode" \
+  "$tool" setup "${r[@]}" --remote-url "postgres://rrun@$base?connect_timeout=5" --password-file "$scratch/rrun.pw" --migrator-url "postgres://rmig@$base" --migrator-password-file "$scratch/rmig.pw"
+expect_fail "remote setup refuses sslmode=disable for a non-loopback host" "only accepted for a loopback host" \
+  "$tool" setup "${r[@]}" --remote-url "postgres://rrun@db.invalid:5432/harklight?sslmode=disable" --password-file "$scratch/rrun.pw" --migrator-url "postgres://rmig@db.invalid/harklight" --migrator-password-file "$scratch/rmig.pw"
+expect_fail "remote setup requires absolute password files" "absolute paths" \
+  "$tool" setup "${r[@]}" --remote-url "postgres://rrun@$base" --password-file rrun.pw --migrator-url "postgres://rmig@$base" --migrator-password-file "$scratch/rmig.pw"
 expect_fail "remote setup requires a separate owner role" "separate owner role" \
   "$tool" setup "${r[@]}" --remote-url "postgres://rrun@$base" --password-file "$scratch/rrun.pw"
 expect_fail "remote setup refuses the same role for runtime and owner" "must be different roles" \
