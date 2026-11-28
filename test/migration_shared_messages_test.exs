@@ -293,6 +293,27 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           "SELECT upload_id,attributes FROM harklight.conversation_entry_uploads WHERE conversation_id=$1 AND entry_id=$2 AND ordinal=$3", [entry.shared_id, id, ordinal])
       end
       assert {:ok, %{rows: [[1]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.conversation_entry_uploads", [])
+      verifier = AttentionServer.Migration.VerifySharedEntryUploads
+      assert {:ok, %{shared_entry_links: 1} = counts} = verifier.run(db, identity, bundle)
+      for sql <- [
+        "UPDATE harklight.conversation_entry_uploads SET attributes='{}'::jsonb",
+        "UPDATE harklight.conversation_entry_uploads SET ordinal=ordinal+1",
+        "DELETE FROM harklight.conversation_entry_uploads"
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx, sql, [])
+          assert {:error, {:shared_entry_upload_mismatch, _, _}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, %{num_rows: 1}} = ImportSession.query(tx,
+          "INSERT INTO harklight.conversation_entry_uploads SELECT conversation_id,entry_id,ordinal+1,upload_id,attributes FROM harklight.conversation_entry_uploads", [])
+        assert {:error, :shared_entry_upload_count_mismatch} = verifier.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^counts} = verifier.run(db, identity, bundle)
     end
 
     defp verify_link_drift(db, identity, bundle) do
