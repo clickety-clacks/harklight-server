@@ -698,7 +698,7 @@ migration_step() {
   if ! out="$("$migration_bin" "$@" 2> "$work_dir/$step.err")"; then migrate_failed "$step" "$work_dir"; fi
   case "$step" in
     export|verify)   # their existing output shape is preserved by the contract
-      [[ "$(json_field "$out" result 2>/dev/null || true)" == ok ]] || migrate_failed "$step (unexpected output)" "$work_dir" ;;
+      [[ "$(json_field "$out" result 2>/dev/null || true)" == verified_export ]] || migrate_failed "$step (unexpected output)" "$work_dir" ;;
     *)
       [[ "$(json_field "$out" contract_version 2>/dev/null || true)" == 1 ]] || migrate_failed "$step (unexpected output)" "$work_dir" ;;
   esac
@@ -736,7 +736,13 @@ while True:
     if d == os.path.realpath(work):
         break
     d = os.path.dirname(d)
+for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: die("cannot read the staging tree: " + str(e))):
+    private(dirpath, "a staging directory")
+    for n in dirnames:
+        private(os.path.join(dirpath, n), "a staging directory")
 complete = os.path.join(parent, "COMPLETE.json")
+if os.path.isfile(complete):
+    private(complete, "COMPLETE.json")
 if not os.path.isfile(complete) or sha(complete) != mat["manifest_sha256"]:
     die("COMPLETE.json is missing or does not match its recorded digest")
 c = json.load(open(complete))
@@ -783,7 +789,10 @@ PY
 # the unit must be inactive or failed with no main process.
 require_stopped() {
   command -v systemctl >/dev/null 2>&1 || fail "cannot prove Harklight Server is stopped (no systemctl); stop it by hand and use a systemd user session for the migration"
-  local active pid
+  local active pid load
+  load="$(systemctl_user show --property=LoadState --value "$SERVER_UNIT" 2>/dev/null)" ||
+    fail "cannot read the load state of $SERVER_UNIT; refusing to migrate"
+  [[ "$load" == loaded ]] || fail "$SERVER_UNIT is not a loaded unit (load state: $load), so its stopped state proves nothing; refusing to migrate"
   active="$(systemctl_user show --property=ActiveState --value "$SERVER_UNIT" 2>/dev/null)" ||
     fail "cannot read the state of $SERVER_UNIT; refusing to migrate"
   pid="$(systemctl_user show --property=MainPID --value "$SERVER_UNIT" 2>/dev/null)" ||

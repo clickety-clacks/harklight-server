@@ -40,6 +40,7 @@ cat > "$scratch/shim/systemctl" <<'SH'
 read state pid < "$UNIT_STATE"
 case "$*" in
   *is-active*) [ "$state" = active ] ;;
+  *LoadState*) echo "${LOAD_STATE:-loaded}" ;;
   *ActiveState*) echo "$state" ;;
   *MainPID*) echo "$pid" ;;
   *) exit 0 ;;
@@ -68,6 +69,8 @@ for st in "active 123" "failed 123" "activating 0"; do
   expect_fail "migrate refuses a Server not proven stopped ($st)" "not proven stopped" "$tool" migrate "${args[@]}" --migration-bin "$fake"
 done
 echo "inactive 0" > "$UNIT_STATE"
+expect_fail "migrate refuses a Server unit that is not loaded, even though it looks inactive" "not a loaded unit" \
+  env LOAD_STATE=not-found "$tool" migrate "${args[@]}" --migration-bin "$fake"
 SAVE_PATH="$PATH"; export PATH="/usr/bin:/bin"; command -v systemctl >/dev/null && NOSYS=0 || NOSYS=1
 if [[ "$NOSYS" == 1 ]]; then
   expect_fail "migrate refuses when it cannot observe the Server at all" "cannot prove" "$tool" migrate "${args[@]}" --migration-bin "$fake"
@@ -124,6 +127,8 @@ echo "failed 123" > "$UNIT_STATE"; : > "$FAKE_DIR/calls.log"
 expect_fail "resume refuses a Server not proven stopped" "not proven stopped" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
 [[ "$(calls)" == "capabilities " ]] || bad "importer commands ran with the Server not proven stopped: $(calls)"
 echo "inactive 0" > "$UNIT_STATE"
+expect_fail "resume refuses a Server unit that is not loaded" "not a loaded unit" \
+  env LOAD_STATE=not-found "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
 
 # Material that fails verification blocks activation.
 staged="$wd/staging/root/server.env"
@@ -145,6 +150,13 @@ chmod 600 "$staged"
 chmod 755 "$wd/staging"
 expect_fail "material install refuses a staging directory that is not private" "is not private" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
 chmod 700 "$wd/staging"
+nested="$(dirname -- "$(find "$wd/staging/root" -type f | grep external | head -n 1)")"
+chmod 755 "$nested"
+expect_fail "material install refuses a nested staging directory that is not private" "is not private" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+chmod 700 "$nested"
+chmod 644 "$wd/staging/COMPLETE.json"
+expect_fail "material install refuses a COMPLETE.json that is not private" "is not private" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+chmod 600 "$wd/staging/COMPLETE.json"
 [[ "$(m -c 'select phase from harklight.import_state')" == validated ]] || bad "activated despite material problems"
 ok "material problems are refused and the destination stays validated"
 

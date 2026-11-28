@@ -10,7 +10,7 @@ fail() { printf '%s\n' "$1" >&2; exit 2; }
 if [[ "${FAKE_FAIL_AT:-}" == "$cmd" && ! -e "$FAKE_DIR/failed.$cmd" ]]; then : > "$FAKE_DIR/failed.$cmd"; fail "fake_injected_failure"; fi
 m() { PGPASSWORD="$(< "$HARKLIGHT_MIGRATOR_PASSWORD_FILE")" "$FAKE_PSQL" --no-psqlrc -qtA -v ON_ERROR_STOP=1 "$HARKLIGHT_MIGRATOR_URL" "$@"; }
 json() { printf '{"contract_version":1,"command":"%s","phase":"%s","import_id":"imp-1","source_sha256":"%s","schema_sha256":"%s","validation_sha256":%s}\n' "$cmd" "$1" "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" "$2"; }
-summary() { printf '{"result":"ok","bundle_version":1,"manifest_sha256":"%s","counts":{}}\n' "$(printf 'd%.0s' {1..64})"; }   # preserved export/verify shape
+summary() { printf '{"result":"verified_export","bundle_version":1,"manifest_sha256":"%s","record_count":0,"table_count":0,"file_count":0,"material_count":0}\n' "$(printf 'd%.0s' {1..64})"; }   # preserved export/verify shape
 vsha=$(printf 'c%.0s' {1..64})
 arg() { local k=$1; shift; while (($#)); do if [[ "$1" == "$k" ]]; then printf '%s' "$2"; return; fi; shift; done; }
 case "$cmd" in
