@@ -95,8 +95,16 @@ defmodule AttentionServer.Relay do
         :infinity
       )
 
+  def dashboard_levels(:postgres, person, owner_key),
+    do: CommittedRead.execute(:postgres, {:dashboard_levels, person, owner_key})
+
   def dashboard_levels(server, person, owner_key),
     do: GenServer.call(server, {:dashboard_levels, person, owner_key}, :infinity)
+
+  def save_dashboard_levels(:postgres, person, owner_key, levels) do
+    actor = %{kind: :owner, person: person, key: owner_key}
+    Command.execute(:postgres, actor, {:dashboard_levels, levels}, nil, System.system_time(:millisecond))
+  end
 
   def save_dashboard_levels(server, person, owner_key, levels),
     do: GenServer.call(server, {:save_dashboard_levels, person, owner_key, levels}, :infinity)
@@ -3313,8 +3321,8 @@ defmodule AttentionServer.Relay do
     if Keyword.get(opts, :deployment_mode) == :saas do
       with true <- JevClient.key_configured?(),
            {:ok, endpoint} when is_binary(endpoint) <-
-             normalize_endpoint(Keyword.get(opts, :jev_endpoint)),
-           {:ok, model} when is_binary(model) <- normalize_model(Keyword.get(opts, :jev_model)) do
+             JevClient.normalize_endpoint(Keyword.get(opts, :jev_endpoint)),
+           {:ok, model} when is_binary(model) <- JevClient.normalize_model(Keyword.get(opts, :jev_model)) do
         {endpoint, model}
       else
         _ -> {nil, nil}
@@ -4031,8 +4039,8 @@ defmodule AttentionServer.Relay do
         {:error, :forbidden}
 
       true ->
-        with {:ok, endpoint} <- normalize_endpoint(endpoint),
-             {:ok, model} <- normalize_model(model) do
+        with {:ok, endpoint} <- JevClient.normalize_endpoint(endpoint),
+             {:ok, model} <- JevClient.normalize_model(model) do
           save_priority_settings_authorized(state, person, key, algorithm, endpoint, model)
         else
           {:error, reason} -> {:error, reason}
@@ -4116,30 +4124,6 @@ defmodule AttentionServer.Relay do
         {:error, :algorithm_managed_by_server, state}
     end
   end
-
-  defp normalize_endpoint(value) when is_binary(value) do
-    value = String.trim(value)
-
-    cond do
-      value == "" -> {:ok, nil}
-      JevClient.valid_endpoint?(value) -> {:ok, value}
-      true -> {:error, :invalid_endpoint}
-    end
-  end
-
-  defp normalize_endpoint(_), do: {:error, :invalid_endpoint}
-
-  defp normalize_model(value) when is_binary(value) do
-    value = String.trim(value)
-
-    cond do
-      value == "" -> {:ok, nil}
-      JevClient.valid_model?(value) -> {:ok, value}
-      true -> {:error, :invalid_model}
-    end
-  end
-
-  defp normalize_model(_), do: {:error, :invalid_model}
 
   defp covered_handles(engine, person, origin) do
     handles =

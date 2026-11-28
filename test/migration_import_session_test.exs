@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.ImportSessionTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth, ImportStreams, ImportReceipts, ImportMessages}
     alias AttentionServer.Repository.Postgres.Attributes
 
     for epoch <- [1, 17] do
@@ -155,6 +155,41 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
               [{:blob, key}, {:blob, payload}, {:blob, hash}]
             )
         end
+
+        # A removed resource may have no surviving item, but its cursor event
+        # and canonical revision must survive. Independent highs may exceed it.
+        {:ok, [[stream_person, head]]} = AttentionServer.Store.RecordTable.select(sqlite,
+          "SELECT person_id,head FROM client_change_log_meta ORDER BY person_id LIMIT 1")
+        removed_id = AttentionServer.ChangeLog.item_resource({stream_person, "app:synthetic", "removed-migration"})
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "UPDATE client_change_log_meta SET head=? WHERE person_id=?", [head + 20, stream_person])
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "INSERT INTO client_changes VALUES (?,?,?,?,?)", [stream_person, head + 1, "item_removed", removed_id, 1_700_000_000_000])
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "INSERT INTO client_resource_revs VALUES (?,?,?)", [stream_person, removed_id, head + 1])
+        {:ok, scopes} = AttentionServer.Store.RecordTable.select(sqlite,
+          "SELECT person_id,agent_key,head FROM agent_change_log_meta LIMIT 1")
+        [[agent_person, agent_key, agent_head]] = scopes
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "UPDATE agent_change_log_meta SET head=? WHERE person_id=? AND agent_key=?", [agent_head + 20, agent_person, agent_key])
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "INSERT INTO agent_changes VALUES (?,?,?,?,?,NULL)", [agent_person, agent_key, "advisory:synthetic-expired", agent_head + 1, "synthetic-session"])
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "INSERT INTO agent_item_advisory_changes VALUES (?,?,?,?,?,?)", [agent_person, agent_key, "item-advisory:synthetic-current:" <> removed_id, agent_head + 2, "synthetic-session", 1_700_000_000_001])
+
+        # Same key in the two receipt namespaces remains two distinct rows.
+        receipt_digest = AttentionServer.ClientAPI.Idempotency.digest("POST", ["synthetic"], %{})
+        for {table, original} <- [{"client_idempotency", nil}, {"harklight_app_receipts", 1}] do
+          columns = if is_nil(original), do: "(person_id,idempotency_key,digest,status,body,at_ms)", else: "(person_id,idempotency_key,digest,status,body,at_ms,original_response)"
+          values = [session_person, "synthetic-same-key", receipt_digest, 201, JSON.encode!(%{"synthetic" => true}), 1_700_000_000_000]
+          values = if is_nil(original), do: values, else: values ++ [original]
+          placeholders = Enum.map_join(values, ",", fn _ -> "?" end)
+          :ok = AttentionServer.Store.RecordTable.run(sqlite,
+            "INSERT INTO " <> table <> columns <> " VALUES (" <> placeholders <> ")", values)
+        end
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "INSERT INTO client_idempotency VALUES (?,?,?,?,?,?)",
+          [AttentionServer.ClientAPI.Idempotency.agent_scope(agent_person, agent_key), "synthetic-agent-key", receipt_digest, 200, JSON.encode!(%{"synthetic" => "agent"}), 1_700_000_000_001])
 
         if epoch == 17 do
           :ok =
@@ -349,6 +384,19 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportAuth.run(db, identity, bundle)
         assert :ok = ImportAuth.run(db, identity, bundle)
         verify_auth(db, bundle, manifest)
+        assert :ok = ImportStreams.run(db, identity, bundle)
+        assert :ok = ImportStreams.run(db, identity, bundle)
+        verify_streams(db, bundle, manifest)
+        assert :ok = ImportReceipts.run(db, identity, bundle)
+        assert :ok = ImportReceipts.run(db, identity, bundle)
+        verify_receipts(db, bundle, manifest)
+        assert :ok = ImportMessages.run(db, identity, bundle)
+        assert :ok = ImportMessages.run(db, identity, bundle)
+        repo = AttentionServer.Repository.Postgres.Repo
+        start_supervised!({repo, config})
+        assert {:error, :postgres_not_active} = AttentionServer.Repository.Postgres.Transaction.verify_ready()
+        verify_messages(db, bundle, manifest)
+        stop_supervised!(repo)
 
         assert {:ok, :ok} =
                  Frames.fold(
@@ -442,6 +490,231 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "SELECT attributes::text FROM harklight.organizations WHERE id=$1", [expected.instance])
       assert_typed(text, nil)
       Agent.stop(fixture.clock)
+    end
+
+    for mode <- [:implicit, :reset], epoch <- [1, 17] do
+      @tag timeout: 120_000, mode: mode, epoch: epoch
+      test "source stream fallback #{mode} at epoch #{epoch}", %{mode: mode, epoch: epoch} do
+        alias AttentionServer.{ChangeLog, Store}
+        alias AttentionServer.Store.RecordTable
+        alias AttentionServer.Repository.Postgres.{Repo, Streams}
+        uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
+        assert uri.host in ["localhost", "127.0.0.1"]
+        [user, password] = String.split(uri.userinfo, ":", parts: 2)
+        config = [hostname: uri.host, port: uri.port, username: URI.decode(user),
+          password: URI.decode(password), database: "migration_#{mode}_#{epoch}"]
+        db = start_supervised!({Postgrex, config})
+        root = Path.join(System.tmp_dir!(), "stream-fallback-#{System.unique_integer([:positive])}")
+        File.mkdir!(root)
+        File.chmod!(root, 0o700)
+        on_exit(fn -> File.rm_rf!(root) end)
+        fixture = CompatibilityScenarios.fixture(Path.join(root, "history"))
+        {:ok, relay} = CompatibilityScenarios.start(fixture)
+        try do
+          CompatibilityScenarios.run(relay, fixture)
+        after
+          GenServer.stop(relay)
+        end
+        path = Path.join(fixture.root, "relay.sqlite3")
+        {:ok, store} = Store.open_relay(path)
+        {{person, _, _}, _} = Enum.at(store.engine.messages, 0)
+        assert ChangeLog.seeded?(store.engine, person)
+        :ok = RecordTable.run(store.db,
+          "INSERT INTO client_change_log_epoch VALUES(1,?) ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch", [epoch])
+
+        if mode == :implicit do
+          # Valid cut-over history: durable content exists before a person has
+          # any change-log rows. Do not derive a head from allocation counters.
+          for table <- ~w(client_change_log_meta client_changes client_resource_revs client_resource_created) do
+            :ok = RecordTable.run(store.db, "DELETE FROM " <> table <> " WHERE person_id=?", [person])
+          end
+        else
+          # Exercise the real reconciliation operation, which deliberately
+          # clears revision rows but retains resource creation timestamps.
+          {:ok, [[version]]} = RecordTable.select(store.db,
+            "SELECT store_version FROM client_change_log_state WHERE id=1")
+          :ok = ChangeLog.enable(store.db, version + 1)
+          assert {:ok, [[0]]} = RecordTable.select(store.db, "SELECT count(*) FROM client_resource_revs")
+        end
+
+        source = %{store | change_log: true}
+        assert {:ok, head} = ChangeLog.head(source, person)
+        if mode == :implicit, do: assert(head == epoch)
+        assert {:ok, [], false, ^head} = ChangeLog.read(source, person, head, 50)
+        assert {:error, :cursor_expired} = ChangeLog.read(source, person, head - 1, 50)
+        assert {:ok, created} = RecordTable.select(store.db,
+          "SELECT person_id,resource_id,created_at_ms FROM client_resource_created")
+        expected_created = Enum.map(created, fn [p, id, at] ->
+          assert {:ok, rev} = ChangeLog.rev(source, p, id)
+          {p, id, at, rev}
+        end)
+        if mode == :reset, do: assert(expected_created != [])
+        :ok = Store.close(store)
+        bundle = Path.join(root, "export")
+        assert {:ok, summary} = Bundle.export(path, bundle,
+          supervisor: {:operator, "synthetic fixture", "stopped fallback source"}, material: %{})
+        identity = %{id: "synthetic-fallback", source: Base.decode16!(summary.sha256, case: :lower),
+          schema: AttentionServer.Repository.Postgres.Schema.digest()}
+        assert :ok = ImportStreams.run(db, identity, bundle)
+        assert :ok = ImportStreams.run(db, identity, bundle)
+        start_supervised!({Repo, config})
+        assert {:ok, [], false, ^head} = Streams.person_page(person, head, 50)
+        assert {:error, :cursor_expired} = Streams.person_page(person, head - 1, 50)
+        stop_supervised!(Repo)
+        for {p, id, at, rev} <- expected_created do
+          {:ok, kind} = ImportStreams.person_kind(id)
+          assert {:ok, %{rows: [[^rev, ^at]]}} = ImportSession.query(db,
+            "SELECT revision,first_seen_at_ms FROM harklight.stream_resource_revisions WHERE person_id=$1 AND origin_key='' AND resource_kind=$2 AND resource_id=$3", [p, kind, id])
+        end
+        assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+        Agent.stop(fixture.clock)
+      end
+    end
+
+    defp verify_messages(db, bundle, manifest) do
+      alias AttentionServer.Repository.Postgres.Items
+      alias AttentionServer.ClientAPI.Resources
+      assert {:ok, {count, revisions}} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, {0, 0},
+        fn
+          {{:row, :messages, {person, sender, external_id} = key}, record}, {count, rev_count} ->
+            id = ImportMessages.id(key, record)
+            item = Resources.item_id(record)
+            current = Map.get(record, :revision, 1)
+            expected = Map.merge(record, %{revision: current, session_handle: Map.get(record, :session_handle), free_order: Map.get(record, :free_order)})
+            assert {:ok, ^key, ^expected} = Items.agent_item({person, record.origin}, item)
+            assert {:error, :not_found} = Items.agent_item({person, "synthetic-wrong-origin"}, item)
+            assert {:error, :not_found} = Items.recipient_item("synthetic-wrong-person", item)
+            if AttentionServer.BounceDecision.person_visible?(record) do
+              assert {:ok, ^key, ^expected} = Items.recipient_item(person, item)
+            else
+              assert {:error, :not_found} = Items.recipient_item(person, item)
+            end
+            assert {:ok, %{rows: [[^person, ^sender, ^external_id, ^current]]}} = ImportSession.query(db,
+              "SELECT person_id,sender_id,message_id,revision FROM harklight.messages WHERE id=$1", [id])
+            versions = Map.get(record, :revisions, %{1 => record.message})
+            for {rev, body} <- versions do
+              assert {:ok, %{rows: [[at, text]]}} = ImportSession.query(db,
+                "SELECT accepted_at_ms,body::text FROM harklight.message_revisions WHERE message_id=$1 AND revision=$2", [id, rev])
+              assert at == if(rev == 1, do: record.accepted_at, else: record.revision_accepted_at)
+              assert_typed(text, body)
+            end
+            assert {:ok, %{rows: [[^person, ^item]]}} = ImportSession.query(db,
+              "SELECT person_id,item_id FROM harklight.message_recipients WHERE message_id=$1", [id])
+            {:ok, {count + 1, rev_count + map_size(versions)}}
+          _, acc -> {:ok, acc}
+        end)
+      assert count > 0
+      assert {:ok, attached} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, 0,
+        fn
+          {{:row, :messages, _}, record}, n ->
+            files = record |> Map.get(:files_by_revision, %{}) |> Map.values() |> List.flatten()
+            {:ok, n + length(files)}
+          _, n -> {:ok, n}
+        end)
+      assert attached > 0
+      for {table, expected} <- [{"messages", count}, {"message_recipients", count}, {"message_revisions", revisions}] do
+        assert {:ok, %{rows: [[^expected]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight." <> table, [])
+      end
+    end
+
+    defp verify_receipts(db, bundle, manifest) do
+      expected_count = Enum.reduce(~w(client_idempotency harklight_app_receipts), 0, fn table, total ->
+        source = Map.fetch!(manifest.data.tables, table)
+        assert {:ok, :ok} = Frames.fold(Path.join(bundle, source.file), source.summary, :ok,
+          fn values, :ok ->
+            [scope, key, digest, status, body, at | flags] = values
+            {:ok, {person, origin}} = ImportReceipts.scope(scope)
+            assert {:ok, %{rows: [[hash, ^status, text, ^at, expires, original]]}} = ImportSession.query(db,
+              "SELECT digest,status,response::text,created_at_ms,expires_at_ms,original_response FROM harklight.operation_receipts WHERE person_id=$1 AND origin_key=$2 AND namespace=$3 AND operation_key=$4", [person, origin, table, key])
+            assert hash == Base.decode16!(digest, case: :lower)
+            {:ok, expected} = JSON.decode_line(body <> "\n")
+            assert_typed(text, expected)
+            if table == "client_idempotency" do
+              assert expires == at + 30 * 24 * 60 * 60 * 1000
+              refute original
+            else
+              assert expires == nil
+              assert original == (flags == [1])
+            end
+            {:ok, :ok}
+          end)
+        total + source.summary.count
+      end)
+      assert {:ok, %{rows: [[^expected_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts", [])
+      assert {:ok, %{rows: [[2]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-same-key'", [])
+      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-agent-key' AND origin_key<>''", [])
+    end
+
+    defp verify_streams(db, bundle, manifest) do
+      for table <- ~w(client_change_log_meta agent_change_log_meta client_resource_revs client_resource_created client_changes agent_changes agent_item_advisory_changes) do
+        source = Map.fetch!(manifest.data.tables, table)
+        assert {:ok, :ok} = Frames.fold(Path.join(bundle, source.file), source.summary, :ok,
+          fn row, :ok ->
+            verify_stream_row(db, table, row)
+            {:ok, :ok}
+          end)
+      end
+      count_rows = fn table -> Map.fetch!(manifest.data.tables, table).summary.count end
+      expected_heads = count_rows.("client_change_log_meta") + count_rows.("agent_change_log_meta")
+      expected_revisions = count_rows.("client_resource_revs") + count_rows.("agent_changes") + count_rows.("agent_item_advisory_changes")
+      expected_changes = Enum.reduce(~w(agent_changes agent_item_advisory_changes), count_rows.("client_changes"), fn table, count ->
+        source = Map.fetch!(manifest.data.tables, table)
+        {:ok, total} = Frames.fold(Path.join(bundle, source.file), source.summary, count,
+          fn [_, _, _, _, _, at], acc -> {:ok, acc + if(is_nil(at), do: 0, else: 1)} end)
+        total
+      end)
+      for {table, expected} <- [{"stream_heads", expected_heads}, {"stream_resource_revisions", expected_revisions}, {"stream_changes", expected_changes}] do
+        assert {:ok, %{rows: [[^expected]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight." <> table, [])
+      end
+      assert {:ok, %{rows: [[count]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.stream_changes WHERE resource_kind='item_removed'", [])
+      assert count > 0
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.stream_changes WHERE resource_id='advisory:synthetic-expired'", [])
+      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.stream_resource_revisions WHERE resource_id='advisory:synthetic-expired' AND resource_kind='advisory'", [])
+      assert {:ok, %{rows: [[markers]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.stream_resource_revisions WHERE resource_kind='availability_writer'", [])
+      assert markers > 0
+    end
+
+    defp verify_stream_row(db, "client_change_log_meta", [person, head, floor, seed]),
+      do: assert_stream_head(db, person, "", head, floor, seed)
+    defp verify_stream_row(db, "agent_change_log_meta", [person, agent, head, floor, seed]),
+      do: assert_stream_head(db, person, agent, head, floor, seed)
+    defp verify_stream_row(db, "client_resource_revs", [person, id, rev]) do
+      {:ok, kind} = ImportStreams.person_kind(id)
+      assert_stream_revision(db, person, "", kind, id, rev)
+    end
+    defp verify_stream_row(db, "client_resource_created", [person, id, at]) do
+      {:ok, kind} = ImportStreams.person_kind(id)
+      assert {:ok, %{rows: [[^at]]}} = ImportSession.query(db,
+        "SELECT first_seen_at_ms FROM harklight.stream_resource_revisions WHERE person_id=$1 AND origin_key='' AND resource_kind=$2 AND resource_id=$3", [person, kind, id])
+    end
+    defp verify_stream_row(db, "client_changes", [person, rev, kind, id, at]),
+      do: assert_stream_change(db, person, "", kind, id, rev, nil, at)
+    defp verify_stream_row(db, table, [person, agent, id, rev, session, at])
+         when table in ~w(agent_changes agent_item_advisory_changes) do
+      {:ok, kind} = ImportStreams.agent_kind(id)
+      assert_stream_revision(db, person, agent, kind, id, rev)
+      if is_nil(at) do
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+          "SELECT count(*) FROM harklight.stream_changes WHERE person_id=$1 AND origin_key=$2 AND revision=$3", [person, agent, rev])
+      else
+        assert_stream_change(db, person, agent, kind, id, rev, session, at)
+      end
+    end
+    defp assert_stream_head(db, person, origin, head, floor, seed) do
+      assert {:ok, %{rows: [[^head, ^floor, ^seed]]}} = ImportSession.query(db,
+        "SELECT head,floor,seed_revision FROM harklight.stream_heads WHERE person_id=$1 AND origin_key=$2", [person, origin])
+    end
+    defp assert_stream_revision(db, person, origin, kind, id, rev) do
+      assert {:ok, %{rows: [[^rev]]}} = ImportSession.query(db,
+        "SELECT revision FROM harklight.stream_resource_revisions WHERE person_id=$1 AND origin_key=$2 AND resource_kind=$3 AND resource_id=$4", [person, origin, kind, id])
+    end
+    defp assert_stream_change(db, person, origin, kind, id, rev, session, at) do
+      assert {:ok, %{rows: [[^kind, ^id, ^session, ^at]]}} = ImportSession.query(db,
+        "SELECT resource_kind,resource_id,session_handle,created_at_ms FROM harklight.stream_changes WHERE person_id=$1 AND origin_key=$2 AND revision=$3", [person, origin, rev])
     end
 
     defp verify_auth(db, bundle, manifest) do

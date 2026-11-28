@@ -256,3 +256,56 @@ or at a different revision; the runtime's existing predicates decide whether
 they authenticate. Sessions referring to a principal that no longer exists
 remain only in the exact SQL facts. Import does not invent a principal or grant
 authority. Both session stages have checkpoints and leave the database loading.
+
+`ImportStreams.run/3` copies explicit person/Agent heads, floors and seed
+revisions without allocating positions. Full resource IDs and feed revisions
+are preserved. Person feed kinds stay exactly as stored; revision-index kinds
+are canonical by resource identity, so an `item_removed` feed row has an `item`
+revision-index row. Availability-writer markers remain revision-only. Agent
+resource kinds follow the existing decoder, and both Agent SQL tables preserve
+their positions. Agent rows with null timestamps enter only the revision index.
+Original person resource creation timestamps are copied to that index. Unknown
+kinds, missing stream heads and revisions beyond a recorded head refuse the
+stage. Checkpointed batches remain in the unpublished loading phase.
+
+A person with no explicit change-log metadata retains FORMAT32's effective
+bounds: the current epoch when messages, conversation entries, bounce settings
+or alert settings exist, otherwise zero. Independent allocation counters do not
+substitute for those retained facts. Explicit metadata always wins. When source
+reconciliation has removed revision rows but kept creation timestamps, the
+projection retains each timestamp with the source stream's effective seed
+revision. It does not create a feed event or advance the head. Dedicated fixtures
+exercise implicit bounds at epochs 1 and 17 and the actual source reconciliation
+path, then compare saved-cursor reads with the PostgreSQL stream reader.
+
+`ImportReceipts.run/3` projects `client_idempotency` and
+`harklight_app_receipts` into distinct namespaces with their original operation
+keys. Person scopes use an empty origin; existing encoded Agent scopes decode
+to their original person and origin. Lowercase digest text becomes the same
+32 bytes, and JSON receipt bodies use the shared typed response codec. Recent
+receipts retain expiry at their original timestamp plus 30 days and have
+`original_response=false`; retained receipts have no expiry and preserve their
+source flag. Already-expired but still-stored rows are copied, leaving retention
+decisions to the reader. Full source bytes remain in SQL facts. Repeated import
+uses checkpoints and does not allocate new receipts or publish the target.
+
+`ImportMessages.run/3` projects ordinary, principal-backed message records and
+all retained revision bodies, followed by the original recipient item IDs.
+Internal message IDs combine the person and accepted item position; public item
+IDs, sender/message IDs, session, ordering, terminal state and supplemental
+attributes remain unchanged. The current PostgreSQL item reader is exercised
+against these rows while runtime admission still rejects the loading database.
+
+This intermediate stage refuses a historical revision whose timestamp is not
+retained by FORMAT32. FORMAT32 records the first and latest timestamps, but can
+omit intermediate ones; no timestamp is invented. A schema follow-up must allow
+that absence and represent historical/system origins without creating login
+authority. Shared messages, seen state and conversation/answer projections also
+remain later stages. This is not a full-history conversion or activation command.
+
+The ordinary-record stage checks both origin and recipient item readers,
+including wrong-origin and wrong-person rejection and exact attachment-bearing
+record attributes. It does not populate attachment chunks or attachment link
+rows, per-recipient seen state, conversations or answers. Those stages and their
+field-level reader comparisons are required before import validation and
+activation; this stage's success alone is not a complete history import.

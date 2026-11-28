@@ -291,6 +291,123 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                cookie |> alerts_request("all", "*", uuid, origin) |> Router.call(postgres)
     end
 
+    @tag :tmp_dir
+    test "owner level saves preserve generation boundaries and roll back with their audit", %{tmp_dir: dir} do
+      alias AttentionServer.{JSON, Relay}
+      alias AttentionServer.ClientAPI.{Reads, Writes}
+      alias AttentionServer.Repository.Postgres.Attributes
+
+      {relay, _browser, _backend, _cookie, owner} = browser_fixture(dir)
+      %{person: person, key: key} = owner
+      origin = "synthetic-level-origin"
+      reader = "synthetic-level-reader"
+      assert :ok = Relay.setup_device(relay, person, origin)
+      assert :ok = Relay.setup_device(relay, person, reader)
+      assert :ok = Relay.setup_sender(relay, origin, "app:fixture")
+      message = %{"title" => "Fixture settings history", "created_at" => 10, "sender_id" => "app:fixture", "message_id" => "levels"}
+      frame = %{
+        "v" => 1, "type" => "forward", "op_id" => "00000000-0000-4000-8000-000000000012",
+        "session_handle" => "10000000-0000-4000-8000-000000000001", "message" => message
+      }
+      assert {:ok, reply} = Relay.request_line(relay, origin, JSON.encode!(frame) <> "\n")
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+      assert {:ok, %{"items" => [%{"item_id" => item}]}} = Reads.inbox(relay, reader)
+      assert {:ok, 200, _, false} =
+               Writes.reply(relay, reader, item, "Fixture reply", [], "00000000-0000-4000-8000-000000000013")
+
+      engine = :sys.get_state(relay).store.engine
+      accepted = Map.fetch!(engine.persons, person)
+      conversations = Map.fetch!(engine.conversation_highs, person)
+      assert accepted > 0 and conversations > 0
+      assert {:ok, %{"rev" => head}} = Reads.settings(relay, owner)
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)",
+                 [person, head]
+               )
+      for {kind, high} <- [{"accepted", accepted}, {"conversation", conversations}] do
+        assert {:ok, _} =
+                 Transaction.query(
+                   "INSERT INTO harklight.allocation_highs VALUES ($1, '', '', $2, $3)",
+                   [person, kind, high]
+                 )
+      end
+
+      assert Relay.dashboard_levels(:postgres, person, key) == Relay.dashboard_levels(relay, person, key)
+
+      rows = [
+        %{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil},
+        %{"name" => "Follow up", "lower_bound" => 0.6, "bounce_after_days" => 1.5}
+      ]
+
+      for backend <- [relay, :postgres] do
+        assert {:error, :forbidden} = Relay.save_dashboard_levels(backend, "synthetic-other", key, rows)
+        assert {:error, :forbidden} = Relay.save_dashboard_levels(backend, person, reader, [])
+        assert {:error, :invalid_levels} = Relay.save_dashboard_levels(backend, person, key, [])
+      end
+
+      # The dashboard owner operation still works for a paused Hosted account.
+      assert {:ok, _} = Relay.hosted_delivery_state(relay, person, "STOPPED")
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.people SET delivery_state = 'STOPPED' WHERE id = $1", [person])
+
+      assert {:ok, %{"levels" => ^rows}} = Relay.save_dashboard_levels(relay, person, key, rows)
+      assert {:ok, %{"levels" => ^rows}} = Relay.save_dashboard_levels(:postgres, person, key, rows)
+      {configuration, revision} = owner_settings_snapshot(person)
+      assert revision == head + 1
+      assert %{after_delivery_seq: ^accepted, after_conversation_seq: ^conversations, configured_at_ms: first_time} =
+               configuration
+      original = :sys.get_state(relay).store.engine.bounce_levels[person]
+      assert Map.delete(configuration, :configured_at_ms) == Map.delete(original, :configured_at_ms)
+      assert {:ok, %{"levels" => ^rows}} = Relay.save_dashboard_levels(:postgres, person, key, rows)
+      assert {^configuration, ^revision} = owner_settings_snapshot(person)
+
+      audit = Attributes.key({person, revision})
+      assert {:ok, %{rows: [[encoded]]}} =
+               Transaction.query(
+                 "SELECT body FROM harklight.compatibility_facts WHERE family = 'runtime_audit' AND address = $1",
+                 [audit]
+               )
+      assert {:ok, %{actor_id: ^key, person_id: ^person, action: "dashboard_levels", at_ms: ^first_time}} =
+               Attributes.decode(encoded)
+
+      changed = put_in(rows, [Access.at(1), "name"], "Follow up soon")
+      conflict = Attributes.key({person, revision + 1})
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.compatibility_facts VALUES ('runtime_audit', $1, '{}')", [conflict])
+      assert {:error, :storage_unavailable} = Relay.save_dashboard_levels(:postgres, person, key, changed)
+      assert {^configuration, ^revision} = owner_settings_snapshot(person)
+      assert {:ok, _} =
+               Transaction.query("DELETE FROM harklight.compatibility_facts WHERE family = 'runtime_audit' AND address = $1", [conflict])
+
+      assert {:ok, %{"levels" => ^changed}} = Relay.save_dashboard_levels(relay, person, key, changed)
+      assert {:ok, %{"levels" => ^changed}} = Relay.save_dashboard_levels(:postgres, person, key, changed)
+      assert {%{configured_at_ms: ^first_time, after_delivery_seq: ^accepted, after_conversation_seq: ^conversations}, next} =
+               owner_settings_snapshot(person)
+      assert next == revision + 1
+
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [key])
+      assert {:error, :forbidden} = Relay.save_dashboard_levels(:postgres, person, key, changed)
+      assert {:error, :forbidden} = Relay.dashboard_levels(:postgres, person, key)
+    end
+
+    defp owner_settings_snapshot(person) do
+      alias AttentionServer.Repository.Postgres.Attributes
+
+      assert {:ok, %{rows: [[attributes, revision]]}} =
+               Transaction.query(
+                 """
+                 SELECT person.settings, stream.head
+                 FROM harklight.people AS person JOIN harklight.stream_heads AS stream ON person.id = stream.person_id
+                 WHERE person.id = $1 AND stream.origin_key = ''
+                 """,
+                 [person]
+               )
+      assert {:ok, %{bounce_levels: levels}} = Attributes.decode(attributes)
+      {levels, revision}
+    end
+
     defp alerts_request(cookie, value, if_match, key, origin) do
       conn =
         Plug.Test.conn(:put, "/v2/settings/alerts", AttentionServer.JSON.encode!(%{"alerts" => value}))
@@ -629,6 +746,101 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                  """,
                  [family, Attributes.key(key), Attributes.encode(row)]
                )
+    end
+
+    @tag :tmp_dir
+    test "instance prioritization preserves FORMAT32 settings and rolls back on audit failure", %{tmp_dir: dir} do
+      alias AttentionServer.{DeviceIdentity, Relay, TLSFixtures}
+      alias AttentionServer.Repository.Postgres.{Attributes, InstanceSettings}
+
+      certs = TLSFixtures.create!()
+      on_exit(fn -> File.rm_rf!(certs) end)
+      certificate = TLSFixtures.certificate_der!(certs, "a1")
+      assert {:ok, key} = DeviceIdentity.from_certificate(certificate)
+      opts = [store_path: Path.join(dir, "instance.sqlite3")]
+      relay = start_supervised!({Relay, opts})
+      assert {:ok, person} = Relay.operator_bootstrap(relay, certificate)
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.people (id, settings) VALUES ($1, $2)", [
+                 person, Attributes.encode(%{alert_choices: "all"})
+               ])
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'owner', 1)",
+                 [key, person]
+               )
+
+      authority = %{person: person, key: key, configured_owner_person: person, deployment_mode: :self_hosted}
+      other = %{authority | configured_owner_person: "another-person"}
+      compare = fn auth, {algorithm, endpoint, model} = values, expected ->
+        assert Relay.save_dashboard_prioritization(
+                 relay, auth.person, auth.key, auth.configured_owner_person, algorithm, endpoint, model
+               ) == expected
+        assert InstanceSettings.save(auth, values, 100) == expected
+      end
+
+      compare.(other, {"unknown", nil, nil}, {:error, :unknown_algorithm})
+      compare.(other, {"baseline", nil, nil}, {:error, :forbidden})
+      compare.(%{authority | key: "wrong-owner"}, {"baseline", "", ""}, {:error, :forbidden})
+      compare.(authority, {"baseline", "http://fixture.example.test", "fixture"}, {:error, :invalid_endpoint})
+      compare.(authority, {"baseline", "", nil}, {:error, :invalid_model})
+
+      endpoint = "https://fixture.example.test/compose"
+      model = "fixture-model"
+      assert {:ok, expected} =
+               Relay.save_dashboard_prioritization(relay, person, key, person, "jev-set", " " <> endpoint, model <> " ")
+      durable = Map.take(expected, [:person_id, :algorithm_id, :endpoint, :model])
+      assert durable == %{person_id: person, algorithm_id: "jev-set", endpoint: endpoint, model: model}
+      assert {:ok, ^durable} = InstanceSettings.save(authority, {"jev-set", " " <> endpoint, model <> " "}, 100)
+      {attrs, scalars, audits} = instance_settings_snapshot(person)
+      assert attrs == %{algorithm_choices: "jev-set", alert_choices: "all"}
+      assert scalars == %{"jev_endpoint" => endpoint, "jev_model" => model}
+      assert {:ok, ^durable} = InstanceSettings.save(authority, {"jev-set", endpoint, model}, 101)
+      assert {^attrs, ^scalars, ^audits} = instance_settings_snapshot(person)
+
+      assert {:ok, _} =
+               Transaction.query(
+                 "ALTER TABLE harklight.compatibility_facts ADD CONSTRAINT fixture_audit CHECK (family <> 'runtime_audit') NOT VALID",
+                 []
+               )
+      try do
+        assert {:error, :storage_unavailable} = InstanceSettings.save(authority, {"baseline", "", ""}, 102)
+        assert {^attrs, ^scalars, ^audits} = instance_settings_snapshot(person)
+      after
+        assert {:ok, _} =
+                 Transaction.query("ALTER TABLE harklight.compatibility_facts DROP CONSTRAINT fixture_audit", [])
+      end
+
+      assert {:ok, cleared} = Relay.save_dashboard_prioritization(relay, person, key, person, "baseline", "", "")
+      assert {:ok, persisted} = InstanceSettings.save(authority, {"baseline", "", ""}, 103)
+      assert persisted == Map.take(cleared, [:person_id, :algorithm_id, :endpoint, :model])
+      assert {%{algorithm_choices: "baseline", alert_choices: "all"}, %{"jev_endpoint" => nil, "jev_model" => nil}, count} =
+               instance_settings_snapshot(person)
+      assert count == audits + 1
+      assert {:ok, %{rows: []}} =
+               Transaction.query("SELECT head FROM harklight.stream_heads WHERE person_id = $1", [person])
+
+      stop_supervised!(Relay)
+      relay = start_supervised!({Relay, Keyword.put(opts, :deployment_mode, :saas)})
+      assert {:error, :forbidden} = Relay.save_dashboard_prioritization(relay, person, key, person, "baseline", "", "")
+      assert {:error, :forbidden} = InstanceSettings.save(%{authority | deployment_mode: :saas}, {"baseline", "", ""}, 104)
+    end
+
+    defp instance_settings_snapshot(person) do
+      alias AttentionServer.Repository.Postgres.Attributes
+
+      assert {:ok, %{rows: [[encoded]]}} =
+               Transaction.query("SELECT settings FROM harklight.people WHERE id = $1", [person])
+      assert {:ok, attrs} = Attributes.decode(encoded)
+      assert {:ok, %{rows: rows}} =
+               Transaction.query("SELECT family, body FROM harklight.compatibility_facts WHERE family IN ('jev_endpoint', 'jev_model')", [])
+      facts = Map.new(rows, fn [family, body] ->
+        assert {:ok, value} = Attributes.decode(body)
+        {family, value}
+      end)
+      assert {:ok, %{rows: [[count]]}} =
+               Transaction.query("SELECT count(*) FROM harklight.compatibility_facts WHERE family = 'runtime_audit'", [])
+      {attrs, facts, count}
     end
 
     test "unrelated streams commit independently and same-stream revisions follow commit order" do
