@@ -37,8 +37,9 @@ defmodule AttentionServer.Migration.BundleTest do
         GenServer.stop(relay)
       end
 
-    secret = Path.join(root, "synthetic-identity")
-    File.write!(secret, "synthetic identity bytes, not real credentials")
+    secret = Path.join(fixture.root, "certs/expired.key")
+    person_file = Path.join(root, "person-id")
+    File.write!(person_file, hd(history["people"]) <> "\n")
     path = Path.join(fixture.root, "relay.sqlite3")
     before = File.read!(path)
     destination = Path.join(root, "export")
@@ -46,7 +47,9 @@ defmodule AttentionServer.Migration.BundleTest do
     opts = [
       supervisor:
         {:operator, "synthetic test supervisor", "GenServer.stop returned; fixture stopped"},
-      material: %{"owner/identity" => secret}
+      material: %{"owner/identity.key" => secret,
+        "owner/identity.pem" => Path.join(fixture.root, "certs/expired.pem"),
+        "person-id" => person_file}
     ]
 
     assert {:ok, summary} = Bundle.export(path, destination, opts)
@@ -63,14 +66,14 @@ defmodule AttentionServer.Migration.BundleTest do
     assert {:ok, %{"contract_version" => 1, "command" => "verify", "result" => "verified_export"}} = CLI.run(["verify", destination])
     assert manifest.data.records.count == manifest.source.records.count
     assert map_size(manifest.data.files) > 0
-    assert File.read!(Path.join(destination, "material/owner/identity")) == File.read!(secret)
+    assert File.read!(Path.join(destination, "material/owner/identity.key")) == File.read!(secret)
 
     identity = %{id: "synthetic-material-import", source: Base.decode16!(summary.sha256, case: :lower),
       schema: AttentionServer.Repository.Postgres.Schema.digest()}
     staging = Path.join(root, "private-stage")
     assert {:ok, material} = AttentionServer.Migration.ImportMaterial.run(destination, identity, staging)
     assert material["root"] == Path.join(staging, "files")
-    staged = Path.join(material["root"], "owner/identity")
+    staged = Path.join(material["root"], "owner/identity.key")
     assert File.read!(staged) == File.read!(secret)
     assert Bitwise.band(File.stat!(staged).mode, 0o777) == 0o600
     assert Bitwise.band(File.stat!(Path.dirname(staged)).mode, 0o777) == 0o700
@@ -102,6 +105,22 @@ defmodule AttentionServer.Migration.BundleTest do
     refute File.exists?(staged <> ".partial")
     assert File.read!(secret) == original_material
     refute String.contains?(AttentionServer.JSON.encode!(material), original_material)
+
+    foreign_map = opts[:material]
+      |> Map.put("owner/identity.key", Path.join(fixture.root, "certs/b1.key"))
+      |> Map.put("owner/identity.pem", Path.join(fixture.root, "certs/b1.pem"))
+    foreign_bundle = Path.join(root, "foreign-owner-export")
+    assert {:ok, foreign_summary} = Bundle.export(path, foreign_bundle, Keyword.put(opts, :material, foreign_map))
+    foreign_identity = %{identity | source: Base.decode16!(foreign_summary.sha256, case: :lower)}
+    assert {:error, :material_identity_source_mismatch} = AttentionServer.Migration.ImportMaterial.run(
+      foreign_bundle, foreign_identity, Path.join(root, "foreign-stage"))
+    refute File.exists?(Path.join(root, "foreign-stage"))
+    mismatched_bundle = Path.join(root, "mismatched-owner-export")
+    mismatched = Map.put(opts[:material], "owner/identity.key", Path.join(fixture.root, "certs/b1.key"))
+    assert {:ok, mismatched_summary} = Bundle.export(path, mismatched_bundle, Keyword.put(opts, :material, mismatched))
+    mismatched_identity = %{identity | source: Base.decode16!(mismatched_summary.sha256, case: :lower)}
+    assert {:error, :material_identity_source_mismatch} = AttentionServer.Migration.ImportMaterial.run(
+      mismatched_bundle, mismatched_identity, Path.join(root, "mismatched-stage"))
 
     for {relative, expected} <- manifest.data.files do
       bytes = File.read!(Path.join(destination, relative))

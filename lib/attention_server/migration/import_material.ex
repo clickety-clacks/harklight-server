@@ -9,6 +9,7 @@ defmodule AttentionServer.Migration.ImportMaterial do
   def run(bundle, %{id: id, source: digest, schema: schema}, destination) do
     with {:ok, manifest, summary} <- Bundle.verify(bundle),
          true <- digest == Base.decode16!(summary.sha256, case: :lower),
+         :ok <- AttentionServer.Migration.MaterialIdentity.validate(bundle, manifest),
          files = Enum.map(Enum.sort(manifest.material), fn {"material/" <> path, info} ->
            %{"path" => path, "size" => info.size, "sha256" => info.sha256}
          end),
