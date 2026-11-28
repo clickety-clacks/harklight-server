@@ -544,3 +544,12 @@ extra path facts refuse verification even after publication. Reads remain
 bounded to one content chunk. This read-only check leaves import checkpoints
 and lifecycle state unchanged; normalized consumer and authorized wire parity
 remain separate gates.
+
+`ImportRevisionFiles.run/3` stages `ordinary_revision_files` for each retained
+ordinary revision, including explicit empty lists. It uses the same
+`Resources.revision_file_refs/4` helper as FORMAT32, reading only the referenced
+upload metadata. Original file ordering, historical inline IDs, upload IDs and
+content types are retained. Upload content/link admission and recipient
+visibility precede this phase. Fact writes and the source checkpoint commit
+together. This enables the bounded recipient revision reader; current Item file
+inheritance and shared revision files remain separate projections.

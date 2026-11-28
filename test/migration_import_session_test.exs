@@ -631,6 +631,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           "DELETE FROM harklight.upload_chunks WHERE upload_id=$1 AND chunk_number=$2", [upload_id, chunk_count])
         assert {:ok, ^uploads_verified} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
 
+        verify_revision_files(db, identity, bundle, manifest)
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
@@ -1471,6 +1472,60 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "SELECT count(*) FROM harklight.auth_sessions s JOIN harklight.principals p ON p.key=s.principal_key AND p.person_id=s.person_id WHERE s.kind='browser' AND p.kind='owner' AND NOT p.revoked AND p.revision=s.principal_revision", [])
       assert {:ok, %{rows: [[2]]}} = ImportSession.query(db,
         "SELECT count(*) FROM harklight.auth_sessions s JOIN harklight.principals p ON p.key=s.principal_key AND p.person_id=s.person_id WHERE s.kind='native' AND p.kind='device' AND NOT p.revoked", [])
+    end
+
+    defp verify_revision_files(db, identity, bundle, manifest) do
+      alias AttentionServer.{Engine, BounceDecision}
+      alias AttentionServer.ClientAPI.Resources
+      alias AttentionServer.Migration.ImportRevisionFiles
+      alias AttentionServer.Repository.Postgres.Items
+      assert {:ok, _} = ImportSession.query(db, """
+        CREATE FUNCTION harklight.fail_revision_files() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.family='ordinary_revision_files' THEN RAISE EXCEPTION 'synthetic interruption'; END IF;
+          RETURN NEW;
+        END $$
+        """, [])
+      assert {:ok, _} = ImportSession.query(db,
+        "CREATE TRIGGER fail_revision_files BEFORE INSERT ON harklight.compatibility_facts FOR EACH ROW EXECUTE FUNCTION harklight.fail_revision_files()", [])
+      assert {:error, _} = ImportRevisionFiles.run(db, identity, bundle)
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.compatibility_facts WHERE family='ordinary_revision_files'", [])
+      assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "messages/revision-files/v1")
+      assert {:ok, _} = ImportSession.query(db,
+        "DROP TRIGGER fail_revision_files ON harklight.compatibility_facts", [])
+      assert :ok = ImportRevisionFiles.run(db, identity, bundle)
+      assert :ok = ImportRevisionFiles.run(db, identity, bundle)
+      assert {:ok, uploads} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, %{}, fn
+        {{:row, :uploads, id}, source}, acc -> {:ok, Map.put(acc, id, source)}
+        _, acc -> {:ok, acc}
+      end)
+      assert {:ok, {count, empty, attached}} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, {0, 0, 0}, fn
+        {{:row, :messages, {person, _, _} = key}, record}, counts ->
+          engine = %Engine{messages: %{key => record}, uploads: uploads}
+          next = Enum.reduce(Map.keys(Map.get(record, :revisions, %{1 => record.message})), counts, fn revision, {n, e, a} ->
+            assert {:ok, expected} = Resources.revision(engine, key, revision)
+            item = Resources.item_id(record)
+            assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+              "SELECT body FROM harklight.compatibility_facts WHERE family='ordinary_revision_files' AND address=$1",
+              [Attributes.key({person, item, revision})])
+            assert {:ok, files} = Attributes.decode(body)
+            assert files == expected["files"]
+            if BounceDecision.person_visible?(record) do
+              assert {:ok, %{"revision" => ^expected}} = Items.recipient_revision(person, item, revision)
+            else
+              assert {:error, :not_found} = Items.recipient_revision(person, item, revision)
+            end
+            assert {:error, :not_found} = Items.recipient_revision("unrelated-person", item, revision)
+            {n + 1, e + if(files == [], do: 1, else: 0), a + if(files == [], do: 0, else: 1)}
+          end)
+          {:ok, next}
+        _, counts -> {:ok, counts}
+      end)
+      assert empty > 0
+      assert attached > 0
+      assert {:ok, %{rows: [[^count]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.compatibility_facts WHERE family='ordinary_revision_files'", [])
     end
 
     defp verify_tables(db, bundle, manifest) do
