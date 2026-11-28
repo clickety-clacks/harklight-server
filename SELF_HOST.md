@@ -703,7 +703,11 @@ database as the migration role, validate, apply and verify the runtime role's
 grants, and verify the importer's staged identity material against its recorded
 digests, installing only the listed files at their original locations (never
 overwriting a differing file, and refusing material that is not private).
-`migrate` never activates the destination, never edits `server.env` and never
+The optional applied-score record (`ATTENTION_SERVER_JEV_SCORE_RECORD_PATH`) is Server
+output, not migration material: `migrate` neither exports nor modifies it, and the
+single `backup`/`restore` command still preserves it. Run `migrate` as the
+operating-system user that will own the PostgreSQL-backed Server service, since
+the importer checks ownership against that identity. `migrate` never activates the destination, never edits `server.env` and never
 starts the Server; activation is not available in this release. If any step fails, keep the old Server stopped, fix the cause and run
 `migrate --resume WORKDIR` (it repeats every check), or abandon the unpublished destination and restore
 the original backup. Rolling back to the old stack is only valid before

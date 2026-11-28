@@ -928,6 +928,9 @@ do_migrate() {
 
   if [[ ! -f "$work_dir/done.export" ]]; then
     externals="$(external_refs)" || migrate_failed "material map (an external path cannot be captured)" "$work_dir"
+    # The applied-score record is Server output, not migration material: it is
+    # left untouched and stays covered by the single backup/restore command.
+    externals="$(printf '%s\n' "$externals" | grep -v '^ATTENTION_SERVER_JEV_SCORE_RECORD_PATH	' || true)"
     python3 -I - "$state" "$work_dir/material-map.json" "$externals" <<'PY' || migrate_failed "material map" "$work_dir"
 import json, os, sys
 state, out, externals = sys.argv[1:4]
