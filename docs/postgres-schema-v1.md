@@ -37,9 +37,13 @@ The authoritative columns and constraints live in
   only link complete files. Keep each attachment ordinal and its wire
   attributes from the selected message revision.
 - Claims are scoped to one job, with an attempt count, unique claim token
-  and expiry. A late worker must match its claim token to finish. Preserve
-  resumable work, receipt distinctions and attempt history in job attributes
-  where the backend relies on them.
+  and expiry. A worker may record success while its token still matches an
+  unfinished job, including after lease expiry. The fifth failed or expired
+  attempt ends the job. Exhaustion sets `jobs.completed_at_ms` and stores a
+  typed `compatibility_facts` row in the same transaction. The family is
+  `job_exhaustion`, the address is `Attributes.key({kind, id})`, and the
+  body records the attempt count, time and reason. The original job body
+  remains available.
 
 Importer order follows the foreign keys. Insert identity and people before
 principals and memberships, then origin sessions and messages, then message

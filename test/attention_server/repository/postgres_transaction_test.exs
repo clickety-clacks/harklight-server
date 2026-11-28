@@ -369,14 +369,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
     end
 
     test "a stopped provider leaves its job recoverable after the lease expires" do
-      assert {:ok, _} =
-               Transaction.query(
-                 """
-                 INSERT INTO harklight.jobs (kind, id, person_id, ready_at_ms, body)
-                 VALUES ('push', 'synthetic-push', 'receipt-person', 10, $1)
-                 """,
-                 [Attributes.encode(%{item_id: "synthetic-item"})]
-               )
+      insert_job("push", "synthetic-push", 10)
 
       assert {:ok, %{attempts: 1, body: %{item_id: "synthetic-item"}} = first} =
                Jobs.claim("push", 10, 20, "first-claim")
@@ -389,6 +382,76 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, %{attempts: 3} = final} = Jobs.claim("push", 25, 40, "final-claim")
       assert {:ok, :recorded} = Jobs.complete(final, 26)
       assert {:ok, nil} = Jobs.claim("push", 40, 50, "done")
+    end
+
+    test "a late provider success can complete the current claim before reclaim" do
+      insert_job("push", "late-success", 10)
+
+      assert {:ok, %{id: "late-success"} = claim} = Jobs.claim("push", 10, 20, "slow-provider")
+      assert {:ok, :recorded} = Jobs.complete(claim, 20)
+      assert {:ok, nil} = Jobs.claim("push", 20, 30, "no-redelivery")
+      assert {{20, 1}, nil} = job_outcome("push", "late-success")
+    end
+
+    test "an expired final attempt is terminal and the next eligible job progresses" do
+      insert_job("reminder", "expired-final", 10, 4)
+      insert_job("reminder", "next-reminder", 20)
+
+      assert {:ok, %{id: "expired-final", attempts: 5} = claim} =
+               Jobs.claim("reminder", 10, 20, "final-attempt")
+
+      assert {:ok, nil} = Jobs.claim("reminder", 19, 30, "before-expiry")
+
+      assert {:ok, %{id: "next-reminder", attempts: 1} = next} =
+               Jobs.claim("reminder", 20, 30, "other-job")
+
+      assert {:error, :claim_lost} = Jobs.complete(claim, 21)
+      assert {:ok, :recorded} = Jobs.complete(next, 21)
+      assert {:ok, nil} = Jobs.claim("reminder", 40, 50, "no-reclaim")
+
+      assert {{20, 5}, %{attempts: 5, at_ms: 20, reason: :lease_expired}} =
+               job_outcome("reminder", "expired-final")
+    end
+
+    test "retrying a failed final attempt records terminal exhaustion" do
+      insert_job("reminder", "failed-final", 10, 4)
+
+      assert {:ok, %{id: "failed-final", attempts: 5} = claim} =
+               Jobs.claim("reminder", 10, 20, "final-claim")
+
+      assert {:ok, :exhausted} = Jobs.retry_at(claim, 12, 15)
+      assert {:ok, nil} = Jobs.claim("reminder", 15, 20, "no-retry")
+
+      assert {{12, 5}, %{attempts: 5, at_ms: 12, reason: :retry_exhausted}} =
+               job_outcome("reminder", "failed-final")
+    end
+
+    defp insert_job(kind, id, ready_at_ms, attempts \\ 0) do
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.jobs (kind, id, person_id, ready_at_ms, attempts, body)
+                 VALUES ($1, $2, 'receipt-person', $3, $4, $5)
+                 """,
+                 [kind, id, ready_at_ms, attempts, Attributes.encode(%{item_id: "synthetic-item"})]
+               )
+    end
+
+    defp job_outcome(kind, id) do
+      assert {:ok, %{rows: [[completed_at_ms, attempts, encoded]]}} =
+               Transaction.query(
+                 """
+                 SELECT completed_at_ms, attempts, fact.body
+                 FROM harklight.jobs
+                 LEFT JOIN harklight.compatibility_facts AS fact
+                   ON fact.family = 'job_exhaustion' AND fact.address = $3
+                 WHERE kind = $1 AND id = $2 AND claim_token IS NULL AND claim_until_ms IS NULL
+                 """,
+                 [kind, id, Attributes.key({kind, id})]
+               )
+
+      {:ok, outcome} = if is_nil(encoded), do: {:ok, nil}, else: Attributes.decode(encoded)
+      {{completed_at_ms, attempts}, outcome}
     end
 
     defp change(id) do
