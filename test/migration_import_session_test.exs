@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.ImportSessionTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth, ImportStreams}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth, ImportStreams, ImportReceipts}
     alias AttentionServer.Repository.Postgres.Attributes
 
     for epoch <- [1, 17] do
@@ -176,6 +176,20 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           "INSERT INTO agent_changes VALUES (?,?,?,?,?,NULL)", [agent_person, agent_key, "advisory:synthetic-expired", agent_head + 1, "synthetic-session"])
         :ok = AttentionServer.Store.RecordTable.run(sqlite,
           "INSERT INTO agent_item_advisory_changes VALUES (?,?,?,?,?,?)", [agent_person, agent_key, "item-advisory:synthetic-current:" <> removed_id, agent_head + 2, "synthetic-session", 1_700_000_000_001])
+
+        # Same key in the two receipt namespaces remains two distinct rows.
+        receipt_digest = AttentionServer.ClientAPI.Idempotency.digest("POST", ["synthetic"], %{})
+        for {table, original} <- [{"client_idempotency", nil}, {"harklight_app_receipts", 1}] do
+          columns = if is_nil(original), do: "(person_id,idempotency_key,digest,status,body,at_ms)", else: "(person_id,idempotency_key,digest,status,body,at_ms,original_response)"
+          values = [session_person, "synthetic-same-key", receipt_digest, 201, JSON.encode!(%{"synthetic" => true}), 1_700_000_000_000]
+          values = if is_nil(original), do: values, else: values ++ [original]
+          placeholders = Enum.map_join(values, ",", fn _ -> "?" end)
+          :ok = AttentionServer.Store.RecordTable.run(sqlite,
+            "INSERT INTO " <> table <> columns <> " VALUES (" <> placeholders <> ")", values)
+        end
+        :ok = AttentionServer.Store.RecordTable.run(sqlite,
+          "INSERT INTO client_idempotency VALUES (?,?,?,?,?,?)",
+          [AttentionServer.ClientAPI.Idempotency.agent_scope(agent_person, agent_key), "synthetic-agent-key", receipt_digest, 200, JSON.encode!(%{"synthetic" => "agent"}), 1_700_000_000_001])
 
         if epoch == 17 do
           :ok =
@@ -373,6 +387,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert :ok = ImportStreams.run(db, identity, bundle)
         verify_streams(db, bundle, manifest)
+        assert :ok = ImportReceipts.run(db, identity, bundle)
+        assert :ok = ImportReceipts.run(db, identity, bundle)
+        verify_receipts(db, bundle, manifest)
 
         assert {:ok, :ok} =
                  Frames.fold(
@@ -545,6 +562,34 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
         Agent.stop(fixture.clock)
       end
+    end
+
+    defp verify_receipts(db, bundle, manifest) do
+      expected_count = Enum.reduce(~w(client_idempotency harklight_app_receipts), 0, fn table, total ->
+        source = Map.fetch!(manifest.data.tables, table)
+        assert {:ok, :ok} = Frames.fold(Path.join(bundle, source.file), source.summary, :ok,
+          fn values, :ok ->
+            [scope, key, digest, status, body, at | flags] = values
+            {:ok, {person, origin}} = ImportReceipts.scope(scope)
+            assert {:ok, %{rows: [[hash, ^status, text, ^at, expires, original]]}} = ImportSession.query(db,
+              "SELECT digest,status,response::text,created_at_ms,expires_at_ms,original_response FROM harklight.operation_receipts WHERE person_id=$1 AND origin_key=$2 AND namespace=$3 AND operation_key=$4", [person, origin, table, key])
+            assert hash == Base.decode16!(digest, case: :lower)
+            {:ok, expected} = JSON.decode_line(body <> "\n")
+            assert_typed(text, expected)
+            if table == "client_idempotency" do
+              assert expires == at + 30 * 24 * 60 * 60 * 1000
+              refute original
+            else
+              assert expires == nil
+              assert original == (flags == [1])
+            end
+            {:ok, :ok}
+          end)
+        total + source.summary.count
+      end)
+      assert {:ok, %{rows: [[^expected_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts", [])
+      assert {:ok, %{rows: [[2]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-same-key'", [])
+      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-agent-key' AND origin_key<>''", [])
     end
 
     defp verify_streams(db, bundle, manifest) do
