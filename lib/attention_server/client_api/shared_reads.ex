@@ -2,7 +2,9 @@ defmodule AttentionServer.ClientAPI.SharedReads do
   @moduledoc false
 
   alias AttentionServer.{AgentChangeLog, ChangeLog, Engine, SharedMessages}
-  alias AttentionServer.ClientAPI.{Reads, SharedCapability}
+  alias AttentionServer.ClientAPI.{Auth, Errors, Reads, SharedCapability}
+  alias AttentionServer.Repository.RecipientItems
+  alias AttentionServer.Repository.Postgres.{Identities, Settings, SharedAccess, Transaction}
 
   def respond(conn, ctx, direction, action, fallback) do
     case SharedCapability.parse(conn) do
@@ -26,6 +28,31 @@ defmodule AttentionServer.ClientAPI.SharedReads do
 
       {:error, token, field} ->
         AttentionServer.ClientAPI.Errors.send_error(conn, token, field: field)
+    end
+  end
+
+  @doc false
+  def get_postgres_revision(conn, %{params: %{item_id: id, n: raw_revision}}, features) do
+    result = Transaction.snapshot(fn ->
+      with {:ok, %{kind: :browser, person: person}} <- Auth.web(conn, Identities, :postgres),
+           :ok <- Settings.check_active(person),
+           {:ok, %{shared?: true} = capability} <- SharedCapability.parse(conn),
+           :ok <- SharedAccess.check(person, capability, features),
+           {:ok, scope} <- RecipientItems.shared_revision_scope(:postgres, person, id, capability.groups?),
+           {:ok, revision} <- Reads.revision_number(raw_revision) do
+        RecipientItems.shared_revision(:postgres, scope, revision)
+      else
+        {:ok, _native} -> {:error, :not_found}
+        {:error, :unavailable} -> {:error, :retry_later}
+        {:error, token, field} -> {:error, {token, field}}
+        {:error, _} = error -> error
+      end
+    end)
+
+    case result do
+      {:error, {token, field}} when is_binary(token) -> Reads.respond(conn, {:error, token, field})
+      {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &Reads.streamed_read_headers/2)
+      error -> Reads.respond(conn, error)
     end
   end
 

@@ -16,6 +16,11 @@ defmodule AttentionServer.Repository.RecipientItems do
   def revision(:postgres, person, item_id, revision),
     do: AttentionServer.Repository.Postgres.Items.recipient_revision(person, item_id, revision)
 
+  def shared_revision_scope(:postgres, person, item_id, groups?),
+    do: AttentionServer.Repository.Postgres.SharedItems.revision_scope(person, item_id, groups?)
+
+  def shared_revision(:postgres, scope, revision),
+    do: AttentionServer.Repository.Postgres.SharedItems.revision(scope, revision)
   def summary_facts(:postgres, person, item_id),
     do: AttentionServer.Repository.Postgres.ItemSummaryFacts.read(person, item_id)
 
