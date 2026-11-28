@@ -15,8 +15,8 @@ CLI setup.
 
 **Compatibility.** Protocol 0.2, FORMAT32 and auth generation 1. Bundled Web
 remains 0.2.7. Using Alarm controls requires a supporting App build or
-Harklight Agent 0.2.12. App support is currently limited to internal
-TestFlight build 369, and Agent 0.2.12 is pending.
+Harklight Agent 0.2.12, which is available. App support is currently
+limited to internal TestFlight build 369.
 
 # Harklight Server v0.2.35
 
