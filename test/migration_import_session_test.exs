@@ -440,6 +440,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportReceipts.run(db, identity, bundle)
         assert :ok = ImportReceipts.run(db, identity, bundle)
         verify_receipts(db, bundle, manifest)
+        verify_receipt_drift(db, identity, bundle)
         assert :ok = ImportFeeds.run(db, identity, bundle)
         assert :ok = ImportFeeds.run(db, identity, bundle)
         verify_feeds(db, bundle, manifest)
@@ -1407,6 +1408,62 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, %{rows: [[^expected_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts", [])
       assert {:ok, %{rows: [[2]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-same-key'", [])
       assert {:ok, %{rows: [[1]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-agent-key' AND origin_key<>''", [])
+    end
+
+    defp verify_receipt_drift(db, identity, bundle) do
+      verifier = AttentionServer.Migration.VerifyReceipts
+      assert {:ok, expected} = verifier.run(db, identity, bundle)
+      assert Enum.all?(expected.receipts, fn {_, n} -> n > 0 end)
+      for change <- [
+        "digest=decode(repeat('00',32),'hex')", "status=status+1",
+        "response='{}'::jsonb", "created_at_ms=created_at_ms+1",
+        "expires_at_ms=coalesce(expires_at_ms,0)+1", "original_response=NOT original_response",
+        "operation_key=operation_key || '-wrong'", "namespace=namespace || '-wrong'",
+        "origin_key=origin_key || '-wrong'"
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: n}} = ImportSession.query(tx,
+            "UPDATE harklight.operation_receipts SET " <> change, [])
+          assert n > 0
+          assert {:error, {:receipt_state_mismatch, _, _}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^expected} = verifier.run(db, identity, bundle)
+      end
+      for {sql, error} <- [
+        {"DELETE FROM harklight.operation_receipts WHERE operation_key='synthetic-agent-key'", :state},
+        {"UPDATE harklight.operation_receipts r SET person_id=(SELECT p.id FROM harklight.people p WHERE p.id<>r.person_id LIMIT 1) WHERE operation_key='synthetic-agent-key'", :state},
+        {"UPDATE harklight.compatibility_facts SET body='{}'::jsonb WHERE family='harklight_app_receipts'", :state},
+        {"INSERT INTO harklight.operation_receipts SELECT person_id,origin_key,namespace,operation_key || '-extra',digest,status,response,created_at_ms,expires_at_ms,original_response FROM harklight.operation_receipts LIMIT 1", :count}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: n}} = ImportSession.query(tx, sql, [])
+          assert n > 0
+          if error == :state do
+            assert {:error, {:receipt_state_mismatch, _, _}} = verifier.run(tx, identity, bundle)
+          else
+            assert {:error, {:receipt_count_mismatch, "operation_receipts"}} = verifier.run(tx, identity, bundle)
+          end
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^expected} = verifier.run(db, identity, bundle)
+      end
+      snapshot = "INSERT INTO harklight.baseline_snapshots SELECT 'synthetic-baseline',person_id,origin_key,1,1,'{}'::jsonb FROM harklight.stream_heads LIMIT 1"
+      for {table, statements} <- [
+        {"handoff_receipts", ["INSERT INTO harklight.handoff_receipts SELECT person_id,key,'synthetic-turn','synthetic-operation','{}'::jsonb FROM harklight.principals LIMIT 1"]},
+        {"jobs", ["INSERT INTO harklight.jobs(kind,id,person_id,ready_at_ms,body) SELECT 'push','synthetic-job',id,1,'{}'::jsonb FROM harklight.people LIMIT 1"]},
+        {"baseline_snapshots", [snapshot]},
+        {"baseline_snapshot_items", [snapshot, "INSERT INTO harklight.baseline_snapshot_items VALUES('synthetic-baseline',0,'item','synthetic-item',1,'{}'::jsonb)"]}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          for sql <- statements do
+            assert {:ok, %{num_rows: 1}} = ImportSession.query(tx, sql, [])
+          end
+          assert {:error, {:receipt_count_mismatch, ^table}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^expected} = verifier.run(db, identity, bundle)
+      end
     end
 
     defp verify_stream_head_drift(db, identity, bundle) do

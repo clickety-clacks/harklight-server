@@ -602,3 +602,13 @@ people, organization membership, sender history and recipient history. These
 facts retain access after group deletion without recreating a group or principal.
 A failed recipient batch rolls its facts and checkpoint back together. Actual
 bounded reader and HTTP parity remain required before activation.
+
+`Migration.VerifyReceipts.run/3` compares recent and retained operation receipts
+with the sealed source: namespace and person/origin/key correlation, digest,
+status, complete typed response, creation time, expiry and original-response flag.
+It also compares the exact raw receipt rows (including original JSON bytes) and
+counts, and refuses extra normalized receipts. This read-only check accepts only
+loading or validated imports. It requires empty handoff, job and baseline tables;
+historical ACKs, provider attempts and saved snapshots do not create synthetic
+handoffs, jobs or new baseline identities. Pending-work reconciliation and saved
+baseline continuation still require runtime proof before activation.
