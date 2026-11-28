@@ -7,6 +7,7 @@ set -euo pipefail
 cmd=${1:?}; shift
 echo "$cmd" >> "$FAKE_DIR/calls.log"
 fail() { printf '%s\n' "$1" >&2; exit 2; }
+if [[ "${FAKE_RETRY_AT:-}" == "$cmd" && ! -e "$FAKE_DIR/retried.$cmd" ]]; then : > "$FAKE_DIR/retried.$cmd"; echo "Migration retryable: validation_retry_required; retry the same command with the same bundle and receipt." >&2; exit 75; fi
 if [[ "${FAKE_FAIL_AT:-}" == "$cmd" && ! -e "$FAKE_DIR/failed.$cmd" ]]; then : > "$FAKE_DIR/failed.$cmd"; fail "fake_injected_failure"; fi
 m() { PGPASSWORD="$(< "$HARKLIGHT_MIGRATOR_PASSWORD_FILE")" "$FAKE_PSQL" --no-psqlrc -qtA -v ON_ERROR_STOP=1 "$HARKLIGHT_MIGRATOR_URL" "$@"; }
 json() { printf '{"contract_version":1,"command":"%s","phase":"%s","import_id":"imp-1","source_sha256":"%s","schema_sha256":"%s","validation_sha256":%s}\n' "$cmd" "$1" "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" "$2"; }

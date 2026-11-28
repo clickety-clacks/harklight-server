@@ -708,7 +708,10 @@ output, not migration material: `migrate` neither exports nor modifies it, and t
 single `backup`/`restore` command still preserves it. Run `migrate` as the
 operating-system user that will own the PostgreSQL-backed Server service, since
 the importer checks ownership against that identity. `migrate` never activates the destination, never edits `server.env` and never
-starts the Server; activation is not available in this release. If any step fails, keep the old Server stopped, fix the cause and run
+starts the Server; activation is not available in this release. If the importer asks for a retry (exit status 75, a concurrent-write conflict
+during validation) `migrate` stops without advancing, leaves every artifact in
+place and exits 75 with the same `migrate --resume` instruction. If any step
+fails, keep the old Server stopped, fix the cause and run
 `migrate --resume WORKDIR` (it repeats every check), or abandon the unpublished destination and restore
 the original backup. Rolling back to the old stack is only valid before
 PostgreSQL has accepted new writes. The orchestration is tested against a test
