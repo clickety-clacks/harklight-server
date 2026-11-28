@@ -75,6 +75,18 @@ defmodule AttentionServer.Migration.BundleTest do
     assert Bitwise.band(File.stat!(staged).mode, 0o777) == 0o600
     assert Bitwise.band(File.stat!(Path.dirname(staged)).mode, 0o777) == 0o700
     assert {:ok, ^material} = AttentionServer.Migration.ImportMaterial.run(destination, identity, staging)
+    for {path, private, drifted} <- [
+      {staging, 0o700, 0o755}, {material["root"], 0o700, 0o755},
+      {Path.dirname(staged), 0o700, 0o755}, {staged, 0o600, 0o644},
+      {Path.join(staging, "OWNER.json"), 0o600, 0o644},
+      {Path.join(staging, "COMPLETE.json"), 0o600, 0o644}
+    ] do
+      File.chmod!(path, drifted)
+      assert {:error, :material_permissions_mismatch} = AttentionServer.Migration.ImportMaterial.run(destination, identity, staging)
+      assert Bitwise.band(File.stat!(path).mode, 0o777) == drifted
+      File.chmod!(path, private)
+      assert {:ok, ^material} = AttentionServer.Migration.ImportMaterial.run(destination, identity, staging)
+    end
     assert {:error, :import_source_mismatch} = AttentionServer.Migration.ImportMaterial.run(destination,
       %{identity | source: :crypto.hash(:sha256, "other")}, staging)
     assert {:error, :material_identity_mismatch} = AttentionServer.Migration.ImportMaterial.run(destination,
