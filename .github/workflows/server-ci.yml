@@ -165,6 +165,7 @@ jobs:
 
       - name: Build and exercise the packaged staged importer
         env:
+          HARKLIGHT_REHEARSAL_PG_CONTAINER: ${{ job.services.postgres.id }}
           HARKLIGHT_MIGRATOR_URL: postgres://harklight_migrator@127.0.0.1:${{ job.services.postgres.ports[5432] }}/migration_package
           ATTENTION_SERVER_ENABLE: '0'
           ERL_FLAGS: '+S 2:2'
