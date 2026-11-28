@@ -1180,13 +1180,27 @@ defmodule AttentionServer.ClientAPIListenerTest do
              request(browser, "GET", item_path <> "/entries", browser_auth ++ capability)
     assert %{"entries" => [%{"files" => [^browser_file]}, %{"files" => [^app_file]}]} = json(entries)
 
-    for {file, bytes} <- [{browser_file, browser_bytes}, {app_file, device_bytes}] do
-      path = "/v2/files/" <> file["file_id"]
-      assert {:ok, _, %{status: 200, body: ^bytes}} = request(browser, "GET", path, browser_auth ++ capability)
-      assert {:ok, _, %{status: 200, body: ^bytes}} = request(device, "GET", path, capability)
-      assert {:ok, _, %{status: 200, body: ^bytes}} = request(sender_conn, "GET", path, capability)
-      assert {:ok, _, %{status: 404}} = request(browser, "GET", path, outsider_auth ++ capability)
-    end
+    {browser, _, _} =
+      Enum.reduce(
+        [{browser_file, browser_bytes}, {app_file, device_bytes}],
+        {browser, device, sender_conn},
+        fn {file, bytes}, {browser, device, sender_conn} ->
+          path = "/v2/files/" <> file["file_id"]
+
+          assert {:ok, browser, %{status: 200, body: ^bytes}} =
+                   request(browser, "GET", path, browser_auth ++ capability)
+
+          assert {:ok, device, %{status: 200, body: ^bytes}} = request(device, "GET", path, capability)
+
+          assert {:ok, sender_conn, %{status: 200, body: ^bytes}} =
+                   request(sender_conn, "GET", path, capability)
+
+          assert {:ok, browser, %{status: 404}} =
+                   request(browser, "GET", path, outsider_auth ++ capability)
+
+          {browser, device, sender_conn}
+        end
+      )
 
     ordinary_id = send_progress(ctx, progress_message())
     ordinary_bytes = "ordinary reply attachment"
