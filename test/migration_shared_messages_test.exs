@@ -164,6 +164,38 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       expected_read = source.shared_recipients[{@shared, @second}].read_position
       assert {:ok, %{rows: [[^expected_read]]}} = ImportSession.query(db,
         "SELECT position FROM harklight.read_positions WHERE conversation_id=$1 AND person_id=$2", [@shared, @second])
+      alias AttentionServer.Migration.VerifySharedConversations
+      assert {:ok, conversation_counts} = VerifySharedConversations.run(db, identity, bundle)
+      assert conversation_counts.entries == map_size(source.shared_entries)
+      assert conversation_counts.answers == map_size(source.shared_answers)
+      for {field, table, column, bad} <- [
+        {:conversations, "conversations", "attributes", "'{}'::jsonb"},
+        {:entries, "conversation_entries", "body", "'{}'::jsonb"},
+        {:entries, "conversation_entries", "position", "position+100"},
+        {:entries, "conversation_entries", "request_revision", "2"},
+        {:answers, "answers", "body", "'{}'::jsonb"},
+        {:read_positions, "read_positions", "position", "position+100"}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        scope = case field do
+          :conversations -> "id"
+          :answers -> "message_id"
+          _ -> "conversation_id"
+        end
+        assert {:ok, %{num_rows: changed}} = ImportSession.query(tx,
+          "UPDATE harklight." <> table <> " SET " <> column <> "=" <> bad <> " WHERE " <> scope <> "=$1", [@shared])
+        assert changed > 0
+        assert {:error, {:shared_conversation_mismatch, ^field, _}} = VerifySharedConversations.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^conversation_counts} = VerifySharedConversations.run(db, identity, bundle)
+      end
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.conversation_entries(id,conversation_id,position,request_revision,kind,body) SELECT 'extra-entry',conversation_id,position+100,request_revision,kind,body FROM harklight.conversation_entries WHERE conversation_id=$1 LIMIT 1", [@shared])
+      assert {:error, {:shared_conversation_count_mismatch, :entries}} = VerifySharedConversations.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "DELETE FROM harklight.conversation_entries WHERE conversation_id=$1 AND id='extra-entry'", [@shared])
+      assert {:ok, ^conversation_counts} = VerifySharedConversations.run(db, identity, bundle)
       # Both ordinary tuple consumers must still resolve the ordinary row.
       assert :ok = ImportConversations.run(db, identity, bundle)
       assert :ok = ImportEntries.run(db, identity, bundle)
