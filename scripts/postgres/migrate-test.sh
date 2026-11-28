@@ -52,9 +52,15 @@ calls() { tr '\n' ' ' < "$FAKE_DIR/calls.log"; }
 : > "$FAKE_DIR/calls.log"
 
 expect_fail "migrate refuses when the importer is missing" "is not available" "$tool" migrate "${args[@]}" --migration-bin "$scratch/missing"
-printf '#!/bin/sh\necho "Migration refused: invalid_arguments" >&2\nexit 2\n' > "$scratch/unimplemented"; chmod +x "$scratch/unimplemented"
-expect_fail "migrate refuses an importer that does not implement import yet, before any side effect" "does not implement import" \
-  "$tool" migrate "${args[@]}" --migration-bin "$scratch/unimplemented"
+# The shipped importer today: status answers a missing receipt but nothing is ready.
+printf '#!/bin/sh\ncase "$1" in status) echo "Migration refused: receipt_missing" >&2 ;; *) echo "Migration refused: invalid_arguments" >&2 ;; esac\nexit 2\n' > "$scratch/statusonly"; chmod +x "$scratch/statusonly"
+expect_fail "a status that answers for a missing receipt does not authorize migration" "does not report that the migration pipeline is ready" \
+  "$tool" migrate "${args[@]}" --migration-bin "$scratch/statusonly"
+expect_fail "migrate refuses an importer that reports migration_ready false" "does not report that the migration pipeline is ready" \
+  env FAKE_READY=false "$tool" migrate "${args[@]}" --migration-bin "$fake"
+printf '#!/bin/sh\necho "{\\"contract_version\\":1,\\"command\\":\\"capabilities\\",\\"commands\\":[\\"export\\",\\"verify\\",\\"status\\"],\\"migration_ready\\":true}"\n' > "$scratch/partial"; chmod +x "$scratch/partial"
+expect_fail "migrate refuses an importer missing a pipeline command" "does not report that the migration pipeline is ready" \
+  "$tool" migrate "${args[@]}" --migration-bin "$scratch/partial"
 [[ -z "$(workdirs)" ]] || bad "an unavailable importer left a work directory"
 
 for st in "active 123" "failed 123" "activating 0"; do
@@ -96,7 +102,7 @@ sums="$(sha256sum "$wd/backup/private-root.tar")"
 rm "$scratch/ext/server.key"   # the verified staged copy must put it back
 : > "$FAKE_DIR/calls.log"
 "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd" >"$scratch/resume.out"
-[[ "$(calls)" == "status import validate " ]] || bad "unexpected resume call order: $(calls)"
+[[ "$(calls)" == "capabilities import validate " ]] || bad "unexpected resume call order: $(calls)"
 [[ "$(m -c 'select phase from harklight.import_state')" == validated ]] || bad "migrate must leave the destination validated, not active"
 [[ ! -e "$wd/done.activate" && "$(sha256sum "$wd/backup/private-root.tar")" == "$sums" && "$(envsha)" == "$before_env" ]] || bad "backup or server.env changed"
 [[ "$(cat "$scratch/ext/server.key")" == "synthetic external key" && "$(stat -c %a "$scratch/ext/server.key")" == 600 ]] || bad "verified material was not installed"
@@ -116,7 +122,7 @@ ok "material map names server.env, person-id, tls and owner files and external k
 # Resume with the Server not proven stopped runs nothing.
 echo "failed 123" > "$UNIT_STATE"; : > "$FAKE_DIR/calls.log"
 expect_fail "resume refuses a Server not proven stopped" "not proven stopped" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
-[[ "$(calls)" == "status " ]] || bad "importer commands ran with the Server not proven stopped: $(calls)"
+[[ "$(calls)" == "capabilities " ]] || bad "importer commands ran with the Server not proven stopped: $(calls)"
 echo "inactive 0" > "$UNIT_STATE"
 
 # Material that fails verification blocks activation.

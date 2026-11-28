@@ -792,15 +792,26 @@ require_stopped() {
     fail "Harklight Server is not proven stopped ($SERVER_UNIT is $active, main process $pid); stop it and keep it stopped"
 }
 
-# The importer must really implement its read-only status command before any
-# side effect. An unimplemented command refuses with invalid_arguments; an
-# implemented one reports a different stable code for a missing receipt.
+# The importer must declare itself ready through its read-only capabilities
+# command before any side effect. A status that merely answers for a missing
+# receipt does not authorize anything. Unknown or failing probes refuse.
 require_importer() {
   [[ -x "$migration_bin" ]] || fail "the packaged importer ($migration_bin) is not available, so the store cannot be migrated. Nothing was changed."
-  local err
-  err="$("$migration_bin" status --receipt "$root/migration/no-such-receipt.json" 2>&1 >/dev/null || true)"
-  if [[ -z "$err" || "$err" == *invalid_arguments* ]]; then
-    fail "this release's importer does not implement import, validate and activate yet, so the store cannot be migrated. Nothing was changed."
+  local out
+  out="$("$migration_bin" capabilities 2>/dev/null)" || out=""
+  if ! python3 -I - "$out" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+    need = {"export", "verify", "import", "status", "validate"}
+    ok = (d.get("contract_version") == 1 and d.get("command") == "capabilities"
+          and d.get("migration_ready") is True and need <= set(d.get("commands", [])))
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+  then
+    fail "this release's importer does not report that the migration pipeline is ready (capabilities), so the store cannot be migrated. Nothing was changed."
   fi
 }
 

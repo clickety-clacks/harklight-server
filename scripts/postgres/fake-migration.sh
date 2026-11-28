@@ -14,6 +14,8 @@ summary() { printf '{"result":"ok","bundle_version":1,"manifest_sha256":"%s","co
 vsha=$(printf 'c%.0s' {1..64})
 arg() { local k=$1; shift; while (($#)); do if [[ "$1" == "$k" ]]; then printf '%s' "$2"; return; fi; shift; done; }
 case "$cmd" in
+  capabilities)
+    printf '{"contract_version":1,"command":"capabilities","commands":["export","verify","import","status","validate","activate"],"migration_ready":%s}\n' "${FAKE_READY:-true}" ;;
   export)
     out="$(arg --output "$@")"; [[ ! -e "$out" ]] || fail "output_exists"
     [[ -f "$(arg --source "$@")" && -f "$(arg --material-map "$@")" && -n "$(arg --unit "$@")" ]] || fail "bad_args"
