@@ -453,8 +453,9 @@ are implemented.
 `harklight-migration capabilities` is a read-only availability probe, with no
 receipt or database access. Contract version 1 returns `commands` and
 `migration_ready`; the latter is currently false. Installers must require true
-and all of export, verify, import, status, validate and activate before any
-migration side effect. A supported `status` alone is insufficient. Missing
+and all of export, verify, import, status and validate before any
+migration side effect. The installer stops at validated; activation is a
+separate operation and is not part of that capability probe. A supported `status` alone is insufficient. Missing
 receipts return the stable `receipt_missing` refusal (exit 2), not an availability
 signal. The readiness flag will change only with the implemented full pipeline.
 
