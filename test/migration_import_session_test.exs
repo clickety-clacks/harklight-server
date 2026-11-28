@@ -423,6 +423,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportOrganizations.run(db, identity, bundle)
         assert :ok = ImportOrganizations.run(db, identity, bundle)
         verify_organizations(db, expected_organizations)
+        verify_organization_drift(db, identity, bundle)
         assert :ok = ImportTables.run(db, identity, bundle)
         assert :ok = ImportTables.run(db, identity, bundle)
         verify_tables(db, bundle, manifest)
@@ -755,6 +756,15 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert :ok = ImportOrganizations.run(db, identity, bundle)
       assert :ok = ImportAuth.run(db, identity, bundle)
       assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.auth_sessions", [])
+      assert {:ok, legacy_counts} = AttentionServer.Migration.VerifyOrganizations.run(db, identity, bundle)
+      assert legacy_counts["organization_members"] == length(expected.members)
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, %{num_rows: 1}} = ImportSession.query(tx,
+          "INSERT INTO harklight.organization_members(organization_id,person_id) SELECT $1,person_id FROM harklight.hosted_accounts LIMIT 1", [expected.instance])
+        assert {:error, {:organization_count_mismatch, "organization_members"}} = AttentionServer.Migration.VerifyOrganizations.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^legacy_counts} = AttentionServer.Migration.VerifyOrganizations.run(db, identity, bundle)
       assert_members(db, expected.instance, expected.members)
       assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
         "SELECT count(*) FROM harklight.organization_members WHERE person_id=$1", [expected.hosted])
@@ -2038,6 +2048,44 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         organizations: engine.hosted_organizations,
         groups: engine.groups
       }
+    end
+
+    defp verify_organization_drift(db, identity, bundle) do
+      verifier = AttentionServer.Migration.VerifyOrganizations
+      assert {:ok, counts} = verifier.run(db, identity, bundle)
+      assert Enum.all?(counts, fn {_, n} -> n > 0 end)
+      for sql <- [
+        "UPDATE harklight.hosted_accounts SET attributes='{}'::jsonb",
+        "UPDATE harklight.organizations SET attributes='{}'::jsonb",
+        "UPDATE harklight.groups SET name=name || '-changed'",
+        "UPDATE harklight.groups SET manager_id=(SELECT id FROM harklight.people WHERE id<>groups.manager_id LIMIT 1) WHERE manager_id IS NOT NULL",
+        "UPDATE harklight.groups SET hosted_ref=hosted_ref || '-changed' WHERE hosted_ref IS NOT NULL",
+        "UPDATE harklight.group_members SET muted=NOT muted",
+        "UPDATE harklight.group_members SET attributes='{\"changed\":true}'::jsonb",
+        "UPDATE harklight.group_invitations SET state='accepted'",
+        "UPDATE harklight.group_invitations SET attributes='{\"changed\":true}'::jsonb",
+        "DELETE FROM harklight.organization_members"
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: n}} = ImportSession.query(tx, sql, [])
+          assert n > 0
+          assert {:error, {:organization_state_mismatch, _, _}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
+      for {table, sql} <- [
+        {"organizations", "INSERT INTO harklight.organizations(id) VALUES('synthetic-extra-organization')"},
+        {"group_members", "INSERT INTO harklight.group_members(group_id,person_id) SELECT g.id,p.id FROM harklight.groups g CROSS JOIN harklight.people p WHERE NOT EXISTS(SELECT 1 FROM harklight.group_members m WHERE m.group_id=g.id AND m.person_id=p.id) LIMIT 1"},
+        {"group_invitations", "INSERT INTO harklight.group_invitations SELECT id || '-extra',group_id,person_id,state,attributes FROM harklight.group_invitations LIMIT 1"}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx, sql, [])
+          assert {:error, {:organization_count_mismatch, ^table}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
     end
 
     defp verify_organizations(db, expected) do
