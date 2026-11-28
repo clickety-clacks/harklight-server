@@ -1,9 +1,9 @@
 defmodule AttentionServer.Store.RowRelayStartupTest do
   use ExUnit.Case, async: true
 
-  alias AttentionServer.{Engine, JSON, Relay, Store}
+  alias AttentionServer.{AgentChangeLog, Engine, JSON, Relay, Store}
   alias AttentionServer.AgentAPI.FeedActivity
-  alias AttentionServer.ClientAPI.Reads
+  alias AttentionServer.ClientAPI.{AgentWrites, Context, Idempotency, Principal, Reads}
   alias AttentionServer.Store.{DerivedIndex, KeyedMigration, RecordCodec, RecordTable}
   alias Exqlite.Sqlite3
 
@@ -328,6 +328,75 @@ defmodule AttentionServer.Store.RowRelayStartupTest do
     assert {:reply, {:error, _}} = :gen_server.receive_response(inbox, 5_000)
     assert {:error, :forbidden} = Relay.acknowledged_cursor(relay, "device")
     assert :ok = GenServer.stop(relay)
+  end
+
+  test "a shared send replays the exact committed receipt after losing its response", %{tmp_dir: dir} do
+    path = Path.join(dir, "relay.sqlite3")
+    opts = [store_path: path, shared_messages: true]
+    assert {:ok, relay} = Relay.start_link(opts)
+    Process.unlink(relay)
+    on_exit(fn -> if Process.alive?(relay), do: Process.exit(relay, :kill) end)
+    monitor = Process.monitor(relay)
+
+    assert {:ok, sender} = Relay.hosted_account_create(relay, "synthetic-sender")
+    assert {:ok, recipient} = Relay.hosted_account_create(relay, "synthetic-recipient")
+    assert :ok = Relay.setup_device(relay, sender, "origin")
+    assert :ok = Relay.setup_device(relay, recipient, "recipient")
+    assert :ok = Relay.setup_sender(relay, "origin", "app:test")
+    assert :ok = Relay.replace_hosted_organization(relay, "synthetic-org", [sender, recipient])
+
+    op = "00000000-0000-4000-8000-000000000040"
+    scope = {sender, "origin"}
+    request = %{
+      "sender" => "app:test",
+      "message" => %{"title" => "Shared recovery", "created_at" => 1},
+      "recipients" => %{"kind" => "people", "people" => [recipient]}
+    }
+
+    write = fn server ->
+      conn =
+        Plug.Test.conn(:post, "/v2/agent/messages", JSON.encode!(request))
+        |> Plug.Conn.put_req_header("idempotency-key", op)
+        |> Plug.Conn.put_req_header("harklight-features", "shared_messages")
+
+      principal = %Principal{person: sender, key: "origin", kind: :device}
+      AgentWrites.send_message(conn, %Context{relay: server, principal: principal, request_id: op})
+    end
+
+    handler = {__MODULE__, make_ref()}
+    event = [:harklight, :store, :commit, :committed]
+    observer = self()
+    assert :ok = :telemetry.attach(handler, event, &__MODULE__.pause_worker/4, {relay, observer})
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    spawn(fn ->
+      try do
+        send(observer, {:reply, write.(relay)})
+      catch
+        :exit, _ -> send(observer, :reply_lost)
+      end
+    end)
+
+    assert_receive {:committed, worker}, 5_000
+    Process.exit(worker, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^relay, :killed}, 2_000
+    assert_receive :reply_lost
+
+    assert {:ok, restarted} = Relay.start_link(opts)
+    store = :sys.get_state(restarted).store
+    assert {:ok, %{body: retained}} = Idempotency.lookup(store, Idempotency.agent_scope(sender, "origin"), op)
+    assert %{"rev" => head, "message" => %{"rev" => rev, "item_id" => item}} = retained
+
+    response = write.(restarted)
+    assert response.status == 200
+    assert Plug.Conn.get_resp_header(response, "idempotent-replayed") == ["true"]
+    assert {:ok, ^retained} = JSON.decode_line(response.resp_body <> "\n")
+    assert {:ok, ^head} = AgentChangeLog.head(store, scope)
+    assert {:ok, ^rev} = AgentChangeLog.rev(store, scope, {:shared_message, item})
+    assert {:ok, [%{resource: {:shared_message, ^item}, rev: ^rev}], false, ^head} =
+             AgentChangeLog.read(store, scope, 0, 10, nil, true)
+
+    assert :ok = GenServer.stop(restarted)
   end
 
   def pause_worker(_event, _measurement, _metadata, {relay, observer}) do
