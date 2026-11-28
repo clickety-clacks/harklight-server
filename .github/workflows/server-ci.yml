@@ -63,6 +63,9 @@ jobs:
       - name: Backup, restore and refusal self-test
         run: bash scripts/postgres/selftest.sh
 
+      - name: Migration orchestration test (contract test double)
+        run: bash scripts/postgres/migrate-test.sh
+
   postgres-schema:
     name: PostgreSQL schema
     runs-on: ubuntu-24.04
