@@ -34,7 +34,7 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
       %{origin: origin, session_handle: handle} = record when is_binary(handle) ->
         session = Map.get(engine.origin_sessions, {person, origin, handle})
         legacy = legacy_availability(engine, key, record)
-        {status, stamp} = published(engine, key, session, record, legacy)
+        {status, stamp} = committed_availability(record, session, Map.get(engine.item_availability, key), legacy)
         render_committed(status, stamp)
 
       _ ->
@@ -42,9 +42,9 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
     end
   end
 
-  defp published(engine, key, session, record, legacy) do
-    case Map.get(engine.item_availability, key) ||
-           get_in(session, ["client_availability", record.accepted_seq]) do
+  @doc false
+  def committed_availability(record, session, item, legacy) do
+    case item || get_in(session, ["client_availability", record.accepted_seq]) do
       {status, stamp} -> {status, stamp}
       nil -> {baseline_status(record, legacy), legacy["last_detached_at"]}
     end
@@ -268,7 +268,7 @@ defmodule AttentionServer.AgentAPI.FeedActivity do
          %{} = session <- Map.get(engine.origin_sessions, scope) do
       legacy = legacy_availability(engine, key, record)
       status = desired_status(engine, activity, scope, session, record, legacy)
-      {previous, stamp} = published(engine, key, session, record, legacy)
+      {previous, stamp} = committed_availability(record, session, Map.get(engine.item_availability, key), legacy)
       prior = render_committed(previous, stamp)
       legacy_state = render_committed(baseline_status(record, legacy), legacy["last_detached_at"])
       rollback_mismatch? = is_binary(legacy["availability"]) and prior != legacy_state

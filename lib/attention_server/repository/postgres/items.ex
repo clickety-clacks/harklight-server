@@ -44,7 +44,7 @@ defmodule AttentionServer.Repository.Postgres.Items do
       {:ok, %{rows: [[attributes, body, head]]}} ->
         with {:ok, _visibility} <- recipient_attributes(attributes),
              {:ok, message} when is_map(message) and not is_struct(message) <- Attributes.decode(body),
-             {:ok, files} <- revision_files(person, item, revision) do
+             {:ok, files} <- file_metadata("ordinary_revision_files", person, item, revision) do
           {:ok, %{"rev" => head, "revision" => %{
             "request_revision" => revision, "message" => message, "files" => files
           }}}
@@ -60,6 +60,48 @@ defmodule AttentionServer.Repository.Postgres.Items do
 
   def recipient_revision(_person, _item, _revision), do: {:error, :not_found}
 
+  # Read the current body and its exact display metadata only. The caller has
+  # already fixed the request revision in the authorized item snapshot.
+  def current_recipient(person, item, revision) do
+    case Transaction.query(
+           """
+           SELECT message.sender_id, message.message_id, message.origin_key,
+                  message.accepted_at_ms, message.accepted_position, message.free_order,
+                  message.terminal, revision.accepted_at_ms, revision.body, recipient.attributes
+           FROM harklight.message_recipients AS recipient
+           JOIN harklight.messages AS message
+             ON message.id = recipient.message_id AND message.person_id = recipient.person_id
+           JOIN harklight.message_revisions AS revision
+             ON revision.message_id = message.id AND revision.revision = message.revision
+           WHERE recipient.person_id = $1 AND recipient.item_id = $2 AND message.revision = $3
+             AND message.kind = 'ordinary'
+           """,
+           [person, item, revision]
+         ) do
+      {:ok, %{rows: [[sender, external_id, origin, accepted, position, order, terminal, edited, body, attrs]]}} ->
+        with {:ok, attributes} <- recipient_attributes(attrs),
+             {:ok, result} when is_map(result) or is_nil(result) <- Map.fetch(attributes, :origin_result),
+             {:ok, terminal} when is_map(terminal) or is_nil(terminal) <- decode_terminal(terminal),
+             {:ok, message} when is_map(message) and not is_struct(message) <- Attributes.decode(body),
+             true <- is_integer(edited),
+             {:ok, files} <- file_metadata("ordinary_item_files", person, item, revision) do
+          record = %{
+            origin: origin, message: message, terminal: terminal, origin_result: result,
+            accepted_at: accepted, revision_accepted_at: edited, accepted_seq: position,
+            free_order: order, revision: revision
+          }
+
+          {:ok, {person, sender, external_id}, record, files}
+        else
+          {:error, :not_found} = error -> error
+          _ -> {:error, :storage_unavailable}
+        end
+
+      {:ok, %{rows: []}} -> {:error, :storage_unavailable}
+      {:error, _} -> {:error, :storage_unavailable}
+    end
+  end
+
   def recipient_attributes(attributes) do
     case Attributes.decode(attributes) do
       {:ok, %{visible: true} = attributes} -> {:ok, attributes}
@@ -68,13 +110,13 @@ defmodule AttentionServer.Repository.Postgres.Items do
     end
   end
 
-  defp revision_files(person, item, revision) do
+  defp file_metadata(family, person, item, revision) do
     address = Attributes.key({person, item, revision})
 
     with {:ok, %{rows: [[stored]]}} <-
            Transaction.query(
-             "SELECT body FROM harklight.compatibility_facts WHERE family = 'ordinary_revision_files' AND address = $1",
-             [address]
+             "SELECT body FROM harklight.compatibility_facts WHERE family = $1 AND address = $2",
+             [family, address]
            ),
          {:ok, files} when is_list(files) <- Attributes.decode(stored) do
       {:ok, files}
