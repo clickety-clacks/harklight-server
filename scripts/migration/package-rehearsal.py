@@ -54,7 +54,13 @@ def size(path):
 
 source = root / 'source'
 compatibility = package / 'fixtures/compatibility/run.sh'
-assert command('seed', [compatibility, package, source, 'seed'])['result'] == 'pass'
+env['HARKLIGHT_FIXTURE_DIR'] = str(source)
+env['HARKLIGHT_FIXTURE_CODE'] = str(package / 'fixtures/compatibility')
+env['HARKLIGHT_REHEARSAL_SEED'] = str(Path(__file__).resolve().with_name('seed-history.exs'))
+env['HARKLIGHT_REHEARSAL_MESSAGES'] = '300'
+seed = command('seed', [package / 'bin/attention_server', 'eval',
+    'Code.require_file(System.fetch_env!("HARKLIGHT_REHEARSAL_SEED"))'])
+assert seed['result'] == 'pass' and seed['additional_messages'] == 300
 baseline = json.loads((source / 'manifest.json').read_text())
 assert baseline['schema'] == 2
 certs = source / 'certs'
@@ -164,12 +170,14 @@ assert 'source_status=\n' in build
 report = {'result': 'pass', 'scope': 'packaged-staged-import-and-format32-rollback',
           'source_commit': commit, 'manifest_schema': 2,
           'source_observations': len(baseline['observations']), 'phase': 'validated',
+          'workload': {'additional_messages': seed['additional_messages'],
+                       'text_bytes_per_message': seed['text_bytes_per_message']},
           'activation': False, 'timings_ms': timings,
           'interruption': {'signal': 'SIGKILL', 'committed_source_records': committed,
                            'uncommitted_people': 0, 'resumed': True},
           'file_bytes': {'source': size(source), 'backup': size(backup), 'bundle': size(bundle),
                          'material': size(Path(str(receipt) + '.material'))},
-          'limits': ['synthetic small-history measurement, not a capacity forecast',
+          'limits': ['synthetic 300-message measurement, not a capacity forecast',
                      'PostgreSQL client-history parity is a separate gate']}
 (root / 'safe-report.json').write_text(json.dumps(report, indent=2) + '\n')
 print(json.dumps(report))
