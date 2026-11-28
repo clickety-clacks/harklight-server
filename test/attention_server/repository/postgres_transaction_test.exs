@@ -55,6 +55,41 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       :ok
     end
 
+    test "committed pages preserve person and Agent position and retention contracts" do
+      alias AttentionServer.Repository.Postgres.Streams
+
+      person = "synthetic-page"
+      scope = {person, ""}
+      agent = {person, "synthetic-agent"}
+
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+
+      a = %{change("item-one") | session_handle: "session-one", created_at_ms: 10}
+      b = %{change("shared-message:two") | session_handle: "session-two", created_at_ms: 20}
+      c = %{change("item-three") | session_handle: "session-one", created_at_ms: 30}
+
+      assert {:ok, 3} =
+               Transaction.run([scope, agent], fn heads ->
+                 with {:ok, 2} <- Transaction.append(heads, scope, [a, c]) do
+                   Transaction.append(heads, agent, [a, b, c])
+                 end
+               end)
+
+      assert {:ok, [%{rev: 1}], true, 1} = Streams.person_page(person, 0, 1)
+      assert {:ok, [%{rev: 2}], false, 2} = Streams.person_page(person, 1, 10)
+      assert {:ok, [], false, 2} = Streams.person_page(person, 2, 10)
+      assert {:error, :cursor_expired} = Streams.person_page(person, 3, 10)
+      assert {:ok, [%{rev: 1}, %{rev: 3}], false, 3} = Streams.agent_page(agent, 0, 10, nil, false)
+      assert {:ok, [%{rev: 2}], false, 3} = Streams.agent_page(agent, 0, 10, "session-two", true)
+      assert {:ok, [], false, 3} = Streams.agent_page(agent, 0, 10, "absent", true)
+
+      assert {:ok, 1} = Streams.prune(scope, 20)
+      assert {:ok, 2} = Streams.prune(agent, 30)
+      assert {:error, :cursor_expired} = Streams.person_page(person, 0, 10)
+      assert {:error, :cursor_expired} = Streams.agent_page(agent, 1, 10, nil, true)
+      assert {:ok, [%{rev: 3}], false, 3} = Streams.agent_page(agent, 2, 10, nil, true)
+    end
+
     test "unrelated streams commit independently and same-stream revisions follow commit order" do
       observer = self()
       scope = {"synthetic-one", ""}
