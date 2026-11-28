@@ -20,6 +20,8 @@ mix release attention_server --path "$stage/$name" --overwrite
 install -m 755 scripts/harklight "$stage/$name/bin/harklight"
 install -m 755 scripts/bootstrap.sh "$stage/$name/bin/harklight-bootstrap"
 install -m 755 scripts/install-release.sh "$stage/$name/bin/harklight-release-install"
+install -m 755 scripts/migration-export.sh "$stage/$name/bin/harklight-migration"
+install -m 644 docs/postgres-migration-source.md "$stage/$name/MIGRATION.md"
 install -m 755 scripts/check-store-compatibility.py "$stage/$name/bin/harklight-check-store"
 install -m 755 scripts/start-server-checked.sh "$stage/$name/bin/harklight-start-server-checked"
 install -m 644 SELF_HOST.md "$stage/$name/SELF_HOST.md"
