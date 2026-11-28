@@ -63,6 +63,9 @@ jobs:
       - name: Backup, restore and refusal self-test
         run: bash scripts/postgres/selftest.sh
 
+      - name: Migration orchestration test (contract test double)
+        run: bash scripts/postgres/migrate-test.sh
+
   postgres-schema:
     name: PostgreSQL schema
     runs-on: ubuntu-24.04
@@ -87,7 +90,9 @@ jobs:
             test/attention_server/repository/postgres_message_history.sql \
             priv/postgres/003_large_text.sql \
             priv/postgres/004_conversation_read_positions.sql \
-            test/attention_server/repository/postgres_conversation_read_positions.sql |
+            test/attention_server/repository/postgres_conversation_read_positions.sql \
+            priv/postgres/005_shared_message_history.sql \
+            test/attention_server/repository/postgres_shared_message_history.sql |
             docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d fixture -f -
       - uses: erlef/setup-beam@v1
         with:
@@ -128,7 +133,8 @@ jobs:
         run: |
           apply_schema() {
             cat priv/postgres/001_initial.sql priv/postgres/002_message_history.sql \
-              priv/postgres/003_large_text.sql priv/postgres/004_conversation_read_positions.sql |
+              priv/postgres/003_large_text.sql priv/postgres/004_conversation_read_positions.sql \
+              priv/postgres/005_shared_message_history.sql |
               docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d "$1" -f -
           }
           apply_schema migration_fixture
@@ -136,13 +142,18 @@ jobs:
           apply_schema migration_explicit_epoch
           docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c 'CREATE DATABASE migration_implicit_roster'
           apply_schema migration_implicit_roster
-          for fixture_db in migration_implicit_1 migration_implicit_17 migration_reset_1 migration_reset_17; do
+          for fixture_db in migration_shared_history migration_large_text migration_upload_bytes migration_invalid_ack migration_implicit_1 migration_implicit_17 migration_reset_1 migration_reset_17; do
             docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c "CREATE DATABASE $fixture_db"
             apply_schema "$fixture_db"
           done
+          docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c "CREATE ROLE fixture_migrator LOGIN PASSWORD 'synthetic-migrator-password'; CREATE ROLE fixture_runtime LOGIN PASSWORD 'synthetic-runtime-password'"
+          for fixture_db in migration_schema_fresh migration_schema_partial migration_schema_foreign; do
+            docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c "CREATE DATABASE $fixture_db OWNER fixture_migrator"
+          done
+          cat priv/postgres/001_initial.sql | docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture_migrator -d migration_schema_partial -f -
       - name: Exercise stopped-history staging and interrupted transactions
         env:
           HARKLIGHT_MIGRATION_TEST_URL: postgres://fixture:fixture-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/migration_fixture
           ATTENTION_SERVER_ENABLE: '0'
           ERL_FLAGS: '+S 2:2'
-        run: mix test test/migration_import_session_test.exs
+        run: mix test test/migration_import_session_test.exs test/migration_bundle_test.exs test/migration_material_identity_test.exs test/migration_large_text_source_test.exs test/migration_large_text_import_test.exs test/migration_recipient_state_test.exs test/migration_subscription_test.exs test/migration_entry_test.exs test/migration_prepare_schema_test.exs test/migration_shared_messages_test.exs

@@ -1,14 +1,15 @@
 defmodule AttentionServer.Migration.ImportMessages do
   @moduledoc false
-  alias AttentionServer.Migration.{Bundle, ImportAccounts, ImportRows, ImportSession}
+  alias AttentionServer.Migration.{Bundle, ImportAccounts, ImportLargeText, ImportRows, ImportSession}
   alias AttentionServer.Repository.Postgres.Attributes
   alias AttentionServer.ClientAPI.Resources
   alias AttentionServer.JSON
 
-  # Ordinary messages only. Shared messages and historical actors have distinct
-  # mappings; all source facts remain intact and the target stays unpublished.
+  # Ordinary and Hosted notice records. Shared messages have a distinct mapping;
+  # all source facts remain intact and the target stays unpublished.
   def run(db, identity, root) do
     with :ok <- ImportAccounts.run(db, identity, root),
+         {:ok, _} <- ImportLargeText.run(db, identity, root),
          {:ok, manifest, _} <- Bundle.verify(root),
          {:ok, _} <-
            ImportRows.run(
@@ -19,7 +20,10 @@ defmodule AttentionServer.Migration.ImportMessages do
              manifest.data.records,
              &match?({{:row, :messages, _}, _}, &1),
              &write/2
-           ) do
+           ),
+         {:ok, _} <- ImportRows.run(db, identity, "messages/large-text/v1",
+           Path.join(root, "records.frames"), manifest.data.records,
+           &match?({{:row, :messages, _}, _}, &1), &project_large_text/2) do
       :ok
     end
   end
@@ -39,11 +43,7 @@ defmodule AttentionServer.Migration.ImportMessages do
     id = id(key, record)
     revision = Map.get(record, :revision, 1)
     revisions = Map.get(record, :revisions, %{1 => record.message})
-    attributes =
-      Map.drop(record, [
-        :message, :origin, :session_handle, :revision,
-        :accepted_seq, :free_order, :accepted_at, :terminal
-      ])
+    attributes = attributes(record)
     terminal = if is_nil(record.terminal), do: nil, else: encode(record.terminal)
 
     with :ok <- execute(db,
@@ -64,11 +64,48 @@ defmodule AttentionServer.Migration.ImportMessages do
     end
   end
 
+  # A separate phase also upgrades already-staged loading imports. Existing
+  # ordinary-record checkpoints are never reinterpreted or overwritten.
+  defp project_large_text(db, rows) do
+    Enum.reduce_while(rows, :ok, fn {{:row, :messages, key} = address, source}, :ok ->
+      with {:ok, projected} <- ImportLargeText.project(db, address, source),
+           :ok <- update_large_text(db, key, source, projected) do
+        {:cont, :ok}
+      else
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp update_large_text(_db, _key, source, projected) when source == projected, do: :ok
+  defp update_large_text(db, key, _source, projected) do
+    id = id(key, projected)
+    terminal = if is_nil(projected.terminal), do: nil, else: encode(projected.terminal)
+    revisions = Map.get(projected, :revisions, %{1 => projected.message})
+    result = Enum.reduce_while(revisions, :ok, fn {revision, body}, :ok ->
+      case execute(db,
+        "UPDATE harklight.message_revisions SET body=$3::text::jsonb WHERE message_id=$1 AND revision=$2",
+        [id, revision, encode(body)]) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+    with :ok <- result do
+      execute(db, "UPDATE harklight.messages SET terminal=$2::text::jsonb,attributes=$3::text::jsonb WHERE id=$1",
+        [id, terminal, encode(attributes(projected))])
+    end
+  end
+
+  defp attributes(record) do
+    Map.drop(record, [:message, :origin, :session_handle, :revision,
+      :accepted_seq, :free_order, :accepted_at, :terminal])
+  end
+
   defp revisions(db, id, record, revisions) do
     Enum.reduce_while(Enum.sort(revisions), :ok, fn {revision, body}, :ok ->
       # FORMAT32 retains the first and latest revision timestamps, but not
-      # intermediate timestamps. Refuse missing data until the schema supports
-      # unknown historical timestamps; do not invent one from another revision.
+      # intermediate timestamps. Schema 002 preserves these as NULL rather than
+      # inventing a timestamp from another revision.
       at =
         cond do
           revision == 1 -> record.accepted_at
@@ -76,7 +113,7 @@ defmodule AttentionServer.Migration.ImportMessages do
           true -> nil
         end
 
-      if is_integer(at) do
+      if is_nil(at) or is_integer(at) do
         case execute(db,
                "INSERT INTO harklight.message_revisions(message_id,revision,accepted_at_ms,body) VALUES ($1,$2,$3,$4::text::jsonb)",
                [id, revision, at, encode(body)]) do
@@ -84,7 +121,7 @@ defmodule AttentionServer.Migration.ImportMessages do
           error -> {:halt, error}
         end
       else
-        {:halt, {:error, :historical_revision_timestamp_unavailable}}
+        {:halt, {:error, :invalid_revision_timestamp}}
       end
     end)
   end

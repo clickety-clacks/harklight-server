@@ -74,6 +74,7 @@ defmodule AttentionServer.Repository.Postgres.Items do
            JOIN harklight.message_revisions AS revision
              ON revision.message_id = message.id AND revision.revision = message.revision
            WHERE recipient.person_id = $1 AND recipient.item_id = $2 AND message.revision = $3
+             AND message.kind = 'ordinary'
            """,
            [person, item, revision]
          ) do

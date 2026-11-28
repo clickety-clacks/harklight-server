@@ -34,6 +34,7 @@ defmodule AttentionServer.Repository.Postgres.ItemSummaryFacts do
            FROM harklight.message_recipients AS recipient
            JOIN harklight.messages AS message
              ON message.id = recipient.message_id AND message.person_id = recipient.person_id
+             AND message.kind = 'ordinary'
            CROSS JOIN harklight.server_identity AS identity
            LEFT JOIN harklight.stream_heads AS stream
              ON stream.person_id = recipient.person_id AND stream.origin_key = ''
@@ -80,8 +81,12 @@ defmodule AttentionServer.Repository.Postgres.ItemSummaryFacts do
                        WHERE family = 'client_rank_state' AND address = $3),
                     (SELECT body FROM harklight.compatibility_facts
                        WHERE family = 'client_ranks' AND address = $4),
-                    (SELECT body FROM harklight.compatibility_facts
-                       WHERE family = 'item_availability' AND address = $5)
+                    coalesce(
+                      (SELECT body FROM harklight.compatibility_facts
+                         WHERE family = 'ordinary_item_availability' AND address = $4),
+                      (SELECT body FROM harklight.compatibility_facts
+                         WHERE family = 'item_availability' AND address = $5)
+                    )
              """,
              addresses
            ),

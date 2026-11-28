@@ -42,8 +42,8 @@ defmodule AttentionServer.Repository.Postgres.Settings do
     Transaction.snapshot(fn ->
       with {:ok, %{person_id: person, device_id: device}} <- NativeSessions.resolve(bearer),
            {:ok, row} <- for_person(person),
-           {:ok, push} <- push_binding(person, device) do
-        {:ok, render(row, %{kind: :device, key: device}, push)}
+           {:ok, body} <- project(row, %{kind: :device, person: person, key: device}) do
+        {:ok, body}
       else
         {:error, :storage_unavailable} -> {:error, :retry_later}
         {:error, _} = error -> error
@@ -70,6 +70,13 @@ defmodule AttentionServer.Repository.Postgres.Settings do
     """
 
     lock_view(scope, [session, at, person, key, revision], false)
+  end
+
+  def lock_native(%{person: person} = principal, at) do
+    with {:ok, %{pending: pending?}} <- NativeSessions.lock(principal, at),
+         {:ok, view} <- lock_view(person_scope(), [person], false) do
+      if pending?, do: {:error, :forbidden}, else: {:ok, view}
+    end
   end
 
   def owner_view(person, key), do: read_view(@owner_scope, [person, key], true)
@@ -161,6 +168,14 @@ defmodule AttentionServer.Repository.Postgres.Settings do
   end
 
   def render(view), do: render(view, %{kind: :browser, key: nil}, %{})
+
+  def project(view, %{kind: :device, person: person, key: device} = principal) do
+    with {:ok, push} <- push_binding(person, device) do
+      {:ok, render(view, principal, push)}
+    end
+  end
+
+  def project(view, %{kind: :browser}), do: {:ok, render(view)}
 
   defp render(%{head: head, revision: revision, attributes: settings}, principal, push) do
     levels = BounceDecision.levels_from_configuration(Map.get(settings, :bounce_levels))

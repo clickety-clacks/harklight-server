@@ -106,6 +106,9 @@ defmodule AttentionServer.Repository.Postgres.Uploads do
                """
                SELECT upload.id FROM harklight.uploads AS upload
                WHERE upload.person_id = $1
+                 AND NOT EXISTS (
+                   SELECT 1 FROM harklight.import_state WHERE phase <> 'active'
+                 )
                  AND (upload.attributes->>'reservation_expires_at_ms')::bigint <= $2
                  AND NOT EXISTS (
                    SELECT 1 FROM harklight.message_uploads WHERE upload_id = upload.id

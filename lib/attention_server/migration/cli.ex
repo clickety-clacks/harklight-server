@@ -2,9 +2,24 @@ defmodule AttentionServer.Migration.CLI do
   @moduledoc false
   alias AttentionServer.Migration.Bundle
 
+  # Capability discovery is read-only and does not open a receipt or database.
+  # Status alone does not imply that the complete upgrade pipeline is available.
+  def run(["capabilities"]) do
+    {:ok, %{"contract_version" => 1, "command" => "capabilities",
+      "commands" => ["export", "verify", "status"], "migration_ready" => false}}
+  end
+
+  def run(["status", "--receipt", path]) do
+    with {:ok, identity} <- AttentionServer.Migration.ImportReceipt.load(path) do
+      AttentionServer.Migration.Connection.with_connection(System.get_env(), fn db ->
+        AttentionServer.Migration.ImportStatus.read(db, identity)
+      end)
+    end
+  end
+
   def run(["verify", directory]) do
     case Bundle.verify(directory) do
-      {:ok, manifest, summary} -> {:ok, public_summary(manifest, summary)}
+      {:ok, manifest, summary} -> {:ok, public_summary(manifest, summary, "verify")}
       error -> error
     end
   end
@@ -32,7 +47,7 @@ defmodule AttentionServer.Migration.CLI do
          options = [supervisor: supervisor, pidfile: opts[:pidfile], material: material],
          {:ok, _} <- Bundle.export(source, destination, options),
          {:ok, manifest, summary} <- Bundle.verify(destination) do
-      {:ok, public_summary(manifest, summary)}
+      {:ok, public_summary(manifest, summary, "export")}
     else
       {:error, _} = error -> error
       _ -> {:error, :invalid_arguments}
@@ -88,10 +103,12 @@ defmodule AttentionServer.Migration.CLI do
     end
   end
 
-  defp public_summary(manifest, summary) do
+  defp public_summary(manifest, summary, command) do
     %{
+      "contract_version" => 1,
+      "command" => command,
       "result" => "verified_export",
-      "bundle_version" => 1,
+      "bundle_version" => manifest.version,
       "manifest_sha256" => summary.sha256,
       "record_count" => manifest.source.records.count,
       "table_count" => map_size(manifest.source.tables),
