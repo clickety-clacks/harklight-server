@@ -502,3 +502,11 @@ remain in the full typed source event. Missing request revisions are accepted
 only for read-position events under schema 004. Verified LargeText paths are
 projected before writing. This loading-only phase does not activate conversation
 routes, synthesize answers, or claim shared-conversation parity.
+
+`ImportChatSummary.run/3` fills the ordinary conversation's typed
+`chat_started`, `latest_origin_reply_seq` and `unread_replies` fields after entry
+and read-position reconstruction. It reads at most 256 event rows at once and
+counts only origin replies strictly after the saved read position. Empty
+conversations have explicit false, nil and zero values. Each summary replaces
+these derived fields atomically with its checkpoint, so a retry cannot double
+count. Source history and read positions remain unchanged.

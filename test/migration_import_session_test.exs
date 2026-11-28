@@ -90,9 +90,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         source_path = Path.join(fixture.root, "relay.sqlite3")
         seed_advisory(source_path)
         seed_historical_messages(source_path)
+        seed_long_conversation(source_path)
         expected_organizations = seed_organizations(source_path, epoch)
         expected_recipients = source_recipient_expectations(source_path)
         expected_subscriptions = source_subscription_expectations(source_path)
+        expected_chats = source_chat_expectations(source_path)
         {:ok, sqlite} = Exqlite.Sqlite3.open(source_path)
 
         {:ok, rows} =
@@ -533,6 +535,14 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             {:ok, count + 1}
           _, count -> {:ok, count}
         end)
+        assert :ok = AttentionServer.Migration.ImportChatSummary.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportChatSummary.run(db, identity, bundle)
+        for {id, expected} <- expected_chats do
+          assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+            "SELECT attributes FROM harklight.conversations WHERE id=$1", [id])
+          assert {:ok, attributes} = Attributes.decode(body)
+          assert Map.take(attributes, [:chat_started, :latest_origin_reply_seq, :unread_replies]) == expected
+        end
         assert entry_count > 0
         assert {:ok, %{rows: [[^entry_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.conversation_entries", [])
 
@@ -980,6 +990,57 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert actual == File.read!(path)
       assert byte_size(actual) == size
       assert {:error, :not_found} = Uploads.read_chunk(person, id, count)
+    end
+
+    defp seed_long_conversation(path) do
+      alias AttentionServer.{Engine, Store}
+      {:ok, store} = Store.open_relay(path)
+      {key = {person, sender, external}, record} = Enum.find(store.engine.messages, fn {{_, _, id}, _} ->
+        id == "synthetic-three-revisions"
+      end)
+      {actor, _} = Enum.find(store.engine.devices, fn {device, principal} ->
+        principal.person == person and not principal.revoked and device != record.origin
+      end)
+      {engine, :ok, touched} = Engine.with_touches(store.engine, fn engine ->
+        discussion = %{"type" => "discussion", "sender_id" => sender, "message_id" => external,
+          "request_revision" => record.revision, "text" => "Synthetic multi-page conversation",
+          "op_id" => "96000000-0000-4000-8000-000000000001"}
+        {engine, {:ok, turn}} = Engine.request_command(engine, actor, discussion, record.accepted_at + 10)
+        in_reply_to = String.to_integer(turn["event_id"])
+        {engine, read_position, last_position} = Enum.reduce(1..260, {engine, nil, nil}, fn n, {current, read, _last} ->
+          reply = %{"type" => "conversation_reply", "sender_id" => sender, "message_id" => external,
+            "request_revision" => record.revision, "in_reply_to" => in_reply_to,
+            "text" => "Synthetic reply #{n}",
+            "op_id" => "96000000-0000-4000-8001-" <> String.pad_leading(Integer.to_string(n), 12, "0")}
+          {next, {:ok, fields}} = Engine.request_command(current, record.origin, reply, record.accepted_at + 10 + n)
+          {next, if(n == 128, do: fields["seq"], else: read), fields["seq"]}
+        end)
+        read = %{"type" => "conversation_read", "sender_id" => sender, "message_id" => external,
+          "read_through_conversation_seq" => read_position, "op_id" => "96000000-0000-4000-8000-000000000002"}
+        {engine, {:ok, _}} = Engine.request_command(engine, actor, read, record.accepted_at + 300)
+        chat = AttentionServer.ClientAPI.Resources.item(engine, key, %{"key" => "synthetic-rank"})["chat"]
+        assert chat["unread_replies"] == 132
+        assert chat["last_origin_reply"] == "e#{last_position}"
+        assert Enum.count(engine.conversation_events, fn {_, event} -> event.key == key end) > 256
+        {engine, :ok}
+      end)
+      {:ok, store} = Store.commit(store, {engine, touched}, %{person: person, actor: "fixture", action: "synthetic_long_chat"})
+      :ok = Store.close(store)
+    end
+
+    defp source_chat_expectations(path) do
+      {:ok, store} = AttentionServer.Store.open_relay(path)
+      expected = Enum.map(store.engine.messages, fn {key, record} ->
+        chat = AttentionServer.ClientAPI.Resources.item(store.engine, key, %{"key" => "synthetic-rank"})["chat"]
+        last = case chat["last_origin_reply"] do
+          nil -> nil
+          "e" <> position -> String.to_integer(position)
+        end
+        {ImportMessages.id(key, record), %{chat_started: chat["started"],
+          latest_origin_reply_seq: last, unread_replies: chat["unread_replies"]}}
+      end)
+      :ok = AttentionServer.Store.close(store)
+      expected
     end
 
     defp source_subscription_expectations(path) do
