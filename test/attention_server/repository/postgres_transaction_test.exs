@@ -218,7 +218,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
           end)
         end)
 
-      await_stream_lock_wait(100)
+      await_lock_wait("stream_heads", 100)
 
       # A caller using the original reverse order would already hold right.
       assert {:ok, :right_available} =
@@ -249,24 +249,24 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, :forward} = Task.await(forward)
     end
 
-    defp await_stream_lock_wait(0), do: flunk("request did not reach the held stream lock")
+    defp await_lock_wait(table, 0), do: flunk("request did not wait for a lock on #{table}")
 
-    defp await_stream_lock_wait(remaining) do
+    defp await_lock_wait(table, remaining) do
       assert {:ok, %{rows: [[waiting?]]}} =
                Transaction.query(
                  """
                  SELECT EXISTS (
                    SELECT 1 FROM pg_stat_activity
                    WHERE wait_event_type = 'Lock'
-                     AND query LIKE '%harklight.stream_heads%'
+                     AND query LIKE $1
                  )
                  """,
-                 []
+                 ["%harklight.#{table}%"]
                )
 
       unless waiting? do
         Process.sleep(10)
-        await_stream_lock_wait(remaining - 1)
+        await_lock_wait(table, remaining - 1)
       end
     end
 
@@ -366,6 +366,97 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                    flunk("conflicting operation ran")
                  end)
                end)
+    end
+
+    test "concurrent same-key requests replay the winner and a new key runs independently" do
+      key = {"receipt-person", "", "app", "concurrent-operation"}
+      observer = self()
+
+      first =
+        Task.async(fn ->
+          Transaction.run([], fn _ ->
+            Operations.execute(key, "same-digest", 1, nil, fn ->
+              send(observer, :operation_reserved)
+              receive do: (:finish_operation -> {:ok, 200, %{"result" => "first"}})
+            end)
+          end)
+        end)
+
+      assert_receive :operation_reserved, 2_000
+
+      other =
+        Task.async(fn ->
+          send(observer, :second_started)
+
+          Transaction.run([], fn _ ->
+            Operations.execute(key, "same-digest", 2, nil, fn ->
+              flunk("same key executed twice")
+            end)
+          end)
+        end)
+
+      assert_receive :second_started, 2_000
+      await_lock_wait("operation_receipts", 100)
+      send(first.pid, :finish_operation)
+      assert {:ok, {200, %{"result" => "first"}, false}} = Task.await(first)
+      assert {:ok, {200, %{"result" => "first"}, true}} = Task.await(other)
+
+      assert {:ok, {200, %{"result" => "new"}, false}} =
+               Transaction.run([], fn _ ->
+                 Operations.execute(put_elem(key, 3, "different-operation"), "same-digest", 3, nil, fn ->
+                   {:ok, 200, %{"result" => "new"}}
+                 end)
+               end)
+    end
+
+    test "a new database connection replays the exact result after the writer dies following COMMIT" do
+      observer = self()
+      key = {"lost-response-person", "", "app", "lost-response-operation"}
+      scope = {"lost-response-person", ""}
+      body = %{"entry" => %{"id" => "stable-entry", "rev" => 7}}
+
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [elem(scope, 0)])
+
+      {writer, monitor} =
+        spawn_monitor(fn ->
+          {:ok, {200, ^body, false}} =
+            Transaction.run([scope], fn heads ->
+              Operations.execute(key, "digest", 1, nil, fn ->
+                assert {:ok, _} = Transaction.append(heads, scope, [change("lost-response")])
+                {:ok, 200, body}
+              end)
+            end)
+
+          send(observer, {:committed, self()})
+          receive do: (:deliver_response -> send(observer, {:response, body}))
+        end)
+
+      assert_receive {:committed, ^writer}, 2_000
+      Process.exit(writer, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^writer, :killed}, 2_000
+      refute_received {:response, _}
+
+      config = [name: nil, pool_size: 1, url: System.fetch_env!("HARKLIGHT_POSTGRES_TEST_URL")]
+      fresh = start_supervised!({Repo, config}, id: :fresh_retry_pool)
+      previous = Repo.put_dynamic_repo(fresh)
+
+      try do
+        assert {:ok, {200, ^body, true}} =
+                 Transaction.run([scope], fn _ ->
+                   Operations.execute(key, "digest", 2, nil, fn ->
+                     flunk("lost response replay repeated the write")
+                   end)
+                 end)
+
+        assert {:ok, %{rows: [[1]]}} =
+                 Transaction.query(
+                   "SELECT count(*) FROM harklight.stream_changes WHERE person_id = $1 AND resource_id = $2",
+                   [elem(scope, 0), "lost-response"]
+                 )
+      after
+        Repo.put_dynamic_repo(previous)
+      end
     end
 
     defp change(id) do
