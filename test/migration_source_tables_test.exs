@@ -16,13 +16,13 @@ defmodule AttentionServer.Migration.SourceTablesTest do
 
   test "SQL identity and typed values survive without ordinal or text conversion" do
     hash = <<0, 255, 127, 0>>
-    assert {:ok, {"sqlite", "harklight_browser_sessions", [^hash]}, row} =
+    assert {:ok, ^hash, row} =
       SourceTables.fact("harklight_browser_sessions", [hash, "person", "owner", 7, "fixture"])
     assert row == %{"session_hash" => hash, "person_id" => "person", "owner_key" => "owner",
       "owner_revision" => 7, "issuer" => "fixture"}
     assert {:ok, _, nullable} = SourceTables.fact("agent_changes", ["person", "agent", "resource", 4, nil, nil])
     assert nullable["session"] == nil and nullable["at_ms"] == nil
-    assert {:ok, {"sqlite", "relay_inbox_snapshots", ["person", "device", "startup"]}, _} =
+    assert {:ok, {"person", "device", "startup"}, _} =
       SourceTables.fact("relay_inbox_snapshots",
         ["person", "device", "startup", "snapshot", 1, 9, "ready", 2, 3, 4, hash, 0, 0])
     assert {:error, :missing_source_table_key} =

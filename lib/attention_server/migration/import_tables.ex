@@ -37,11 +37,11 @@ defmodule AttentionServer.Migration.ImportTables do
 
   defp write(db, table, rows) do
     Enum.reduce_while(rows, :ok, fn values, :ok ->
-      with {:ok, address, row} <- SourceTables.fact(table, values),
+      with {:ok, address, _row} <- SourceTables.fact(table, values),
            {:ok, %{num_rows: 1}} <- ImportSession.query(
              db,
              "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES ($1,$2,$3::text::jsonb)",
-             ["sqlite/" <> table, Attributes.key(address), JSON.encode!(Attributes.encode(row))]
+             [table, Attributes.key(address), JSON.encode!(Attributes.encode(values))]
            ) do
         {:cont, :ok}
       else

@@ -224,9 +224,13 @@ version records and deletion tombstones remain in the lossless facts staging.
 Every organization/group phase has a checkpoint and remains unpublished.
 
 `ImportTables.run/3` stages durable SQL side rows as typed compatibility facts.
-Each family is `sqlite/<source table>`. Its address is the typed tuple
-`{"sqlite", table_name, primary_key_values}` in the source primary-key column
-order, and its body maps every original column name to its exact value. Binary
+Each family is the source table name. Its address is the single primary-key
+value, or a tuple of values in the declared primary-key column order for a
+composite key. Its body is the list of exact source values in the column order
+recorded by `SourceSchema`. The shared typed codec encodes both key and body.
+For example, `harklight_auth_schema` uses key `1` and body
+`[1, minimum_generation, device_certificates_disabled]`, matching the runtime
+certificate reader. Binary
 hashes, integers and nulls are not converted to strings. The explicit table
 catalog rejects unknown tables and separates durable rows from rebuildable
 SQL indexes and source format/generation witnesses. Audit ordinals and the

@@ -421,7 +421,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
 
     defp verify_tables(db, bundle, manifest) do
       for {table, source} <- manifest.data.tables do
-        family = "sqlite/" <> table
+        family = table
         assert {:ok, %{rows: [[count]]}} = ImportSession.query(db,
           "SELECT count(*) FROM harklight.compatibility_facts WHERE family=$1", [family])
         case SourceTables.disposition(table) do
@@ -429,18 +429,22 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             assert count == source.summary.count
             assert {:ok, :ok} = Frames.fold(Path.join(bundle, source.file), source.summary, :ok,
               fn values, :ok ->
-                {:ok, address, expected} = SourceTables.fact(table, values)
+                {:ok, address, _row} = SourceTables.fact(table, values)
                 assert {:ok, %{rows: [[text]]}} = ImportSession.query(db,
                   "SELECT body::text FROM harklight.compatibility_facts WHERE family=$1 AND address=$2",
                   [family, Attributes.key(address)])
-                assert_typed(text, expected)
+                assert_typed(text, values)
                 {:ok, :ok}
               end)
           excluded when excluded in [:derived, :source_only] -> assert count == 0
         end
       end
       assert {:ok, %{rows: [[1]]}} = ImportSession.query(db,
-        "SELECT count(*) FROM harklight.compatibility_facts WHERE family='sqlite/harklight_browser_sessions'", [])
+        "SELECT count(*) FROM harklight.compatibility_facts WHERE family='harklight_browser_sessions'", [])
+      assert {:ok, %{rows: [[text]]}} = ImportSession.query(db,
+        "SELECT body::text FROM harklight.compatibility_facts WHERE family='harklight_auth_schema' AND address=$1", [Attributes.key(1)])
+      {:ok, envelope} = JSON.decode_line(text <> "\n")
+      assert {:ok, [1, 1, 0]} = Attributes.decode(envelope)
     end
 
     defp seed_organizations(path, epoch) do

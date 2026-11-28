@@ -62,11 +62,14 @@ defmodule AttentionServer.Migration.SourceTables do
       key = Enum.map(keys, &Map.fetch!(row, &1))
       if Enum.any?(key, &is_nil/1),
         do: {:error, :missing_source_table_key},
-        else: {:ok, {"sqlite", table, key}, row}
+        else: {:ok, identity(key), row}
     else
       _ -> {:error, :unsupported_source_table_row}
     end
   end
+
+  defp identity([key]), do: key
+  defp identity(keys), do: List.to_tuple(keys)
 
   def fact(_, _), do: {:error, :unsupported_source_table_row}
 end
