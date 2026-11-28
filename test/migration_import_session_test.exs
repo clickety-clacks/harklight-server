@@ -651,6 +651,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         verify_message_drift(db, identity, bundle)
         verify_recipient_drift(db, identity, bundle)
         verify_authority_drift(db, identity, bundle)
+        verify_account_drift(db, identity, bundle)
         verify_conversation_drift(db, identity, bundle)
         verify_ordinary_entry_uploads(db, identity, bundle)
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
@@ -2015,6 +2016,37 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, %{rows: members}} =
         ImportSession.query(db, "SELECT person_id FROM harklight.organization_members WHERE organization_id=$1 ORDER BY person_id", [organization])
       assert List.flatten(members) == Enum.sort(expected)
+    end
+
+    defp verify_account_drift(db, identity, bundle) do
+      verifier = AttentionServer.Migration.VerifyAccounts
+      assert {:ok, counts} = verifier.run(db, identity, bundle)
+      assert counts.people >= 300 and counts.highs > counts.people
+      for sql <- [
+        "UPDATE harklight.people SET profile='{\"synthetic_drift\":true}'::jsonb",
+        "UPDATE harklight.people SET settings='{\"synthetic_drift\":true}'::jsonb",
+        "UPDATE harklight.people SET delivery_state='synthetic-changed'",
+        "UPDATE harklight.allocation_highs SET high=high+1"
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: n}} = ImportSession.query(tx, sql, [])
+          assert n > 0
+          assert {:error, {:account_state_mismatch, _, _}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
+      for {sql, table} <- [
+        {"INSERT INTO harklight.people(id) VALUES('synthetic-unexpected-person')", "people"},
+        {"INSERT INTO harklight.allocation_highs(person_id,origin_key,session_handle,kind,high) SELECT id,'synthetic-extra-origin','','origin_feed',999 FROM harklight.people LIMIT 1", "allocation_highs"}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, _} = ImportSession.query(tx, sql, [])
+          assert {:error, {:account_count_mismatch, ^table}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
     end
 
     defp verify_authority_drift(db, identity, bundle) do
