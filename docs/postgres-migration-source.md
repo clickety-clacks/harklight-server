@@ -457,3 +457,13 @@ and all of export, verify, import, status, validate and activate before any
 migration side effect. A supported `status` alone is insufficient. Missing
 receipts return the stable `receipt_missing` refusal (exit 2), not an availability
 signal. The readiness flag will change only with the implemented full pipeline.
+
+`ImportLargeText.run/3` binds the bundle to the loading import identity, verifies
+its exact large-data source paths, and commits each bounded chunk with its
+checkpoint. It verifies an already committed prefix on resume and rehashes the
+stored chunks before publishing a shared text manifest. A separate checkpoint
+records each exact source path and marker. `project/3` replaces only those paths
+with typed PostgreSQL references; marker-looking literal text is unchanged.
+Raw FORMAT32 facts are retained. This does not activate the target or yet wire
+all normalized history projections. Ordinary/shared authorized HTTP parity and
+complete migration validation remain required before activation.
