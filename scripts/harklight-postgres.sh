@@ -30,8 +30,10 @@ usage: harklight-postgres COMMAND [options]
   apply-grants           give the runtime role its privileges on the migrated schema
   verify-roles           check the runtime role cannot own, alter or truncate anything
   status                 report the configured database, service and connection
-  migrate [--resume DIR] copy the stopped FORMAT32 store into the empty PostgreSQL database and
-                         activate it (opt-in; refuses until the packaged importer ships)
+  migrate [--resume DIR] copy the stopped FORMAT32 store into the empty PostgreSQL database,
+                         validate it and stage identity material; never activates
+  migrate-activate --resume DIR
+                         activate a validated destination (a separate explicit step)
   backup ARCHIVE         write one archive: database dump, state directory and checksums
   restore ARCHIVE        restore that archive (add --replace to overwrite existing data)
 
@@ -696,7 +698,12 @@ migration_step() {
   local step=$1; shift
   local out
   if ! out="$("$migration_bin" "$@" 2> "$work_dir/$step.err")"; then migrate_failed "$step" "$work_dir"; fi
-  [[ "$(json_field "$out" contract_version 2>/dev/null || true)" == 1 ]] || migrate_failed "$step (unexpected output)" "$work_dir"
+  case "$step" in
+    export|verify)   # their existing output shape is preserved by the contract
+      [[ "$(json_field "$out" result 2>/dev/null || true)" == ok ]] || migrate_failed "$step (unexpected output)" "$work_dir" ;;
+    *)
+      [[ "$(json_field "$out" contract_version 2>/dev/null || true)" == 1 ]] || migrate_failed "$step (unexpected output)" "$work_dir" ;;
+  esac
   printf '%s\n' "$out" > "$work_dir/$step.json"
   printf '%s' "$out"
 }
@@ -722,6 +729,15 @@ if not isinstance(mat, dict) or not all(k in mat for k in ("root", "manifest_sha
 root = os.path.realpath(mat["root"]); parent = os.path.dirname(root)
 if os.path.commonpath([os.path.realpath(work), root]) != os.path.realpath(work):
     die("staging root is outside the migration work directory")
+def private(path, what):
+    if os.stat(path).st_mode & 0o077:
+        die(what + " is not private (mode " + oct(os.stat(path).st_mode & 0o777) + "): " + path)
+d = root
+while True:
+    private(d, "a staging directory")
+    if d == os.path.realpath(work):
+        break
+    d = os.path.dirname(d)
 complete = os.path.join(parent, "COMPLETE.json")
 if not os.path.isfile(complete) or sha(complete) != mat["manifest_sha256"]:
     die("COMPLETE.json is missing or does not match its recorded digest")
@@ -737,6 +753,7 @@ for f in mat["files"]:
     src = os.path.realpath(os.path.join(root, rel))
     if os.path.commonpath([root, src]) != root or not os.path.isfile(src):
         die("staged file missing or outside the staging root: " + rel)
+    private(src, "a staged file")
     if os.path.getsize(src) != f.get("size") or sha(src) != f.get("sha256"):
         die("staged file length or hash differs: " + rel)
     listed[rel] = src
@@ -752,6 +769,8 @@ for rel, src in sorted(listed.items()):
     if os.path.exists(dest):
         if sha(dest) != sha(src):
             die("the existing file differs from the verified staged copy and was not overwritten: " + dest)
+        if os.stat(dest).st_mode & 0o077:
+            die("the existing identity file is identical but not private (mode " + oct(os.stat(dest).st_mode & 0o777) + "); fix its mode and resume: " + dest)
         continue
     plan.append((src, dest))
 for src, dest in plan:
@@ -762,22 +781,61 @@ print("installed %d file(s); %d already identical" % (len(plan), len(listed) - l
 PY
 }
 
-do_migrate() {
+# Prove the old Server is stopped on every invocation, resume included:
+# the unit must be inactive or failed with no main process.
+require_stopped() {
+  command -v systemctl >/dev/null 2>&1 || fail "cannot prove Harklight Server is stopped (no systemctl); stop it by hand and use a systemd user session for the migration"
+  local active pid
+  active="$(systemctl_user show --property=ActiveState --value "$SERVER_UNIT" 2>/dev/null)" ||
+    fail "cannot read the state of $SERVER_UNIT; refusing to migrate"
+  pid="$(systemctl_user show --property=MainPID --value "$SERVER_UNIT" 2>/dev/null)" ||
+    fail "cannot read the process of $SERVER_UNIT; refusing to migrate"
+  [[ "$pid" == 0 && ( "$active" == inactive || "$active" == failed ) ]] ||
+    fail "Harklight Server is not proven stopped ($SERVER_UNIT is $active, main process $pid); stop it and keep it stopped"
+}
+
+# The importer must really implement its read-only status command before any
+# side effect. An unimplemented command refuses with invalid_arguments; an
+# implemented one reports a different stable code for a missing receipt.
+require_importer() {
+  [[ -x "$migration_bin" ]] || fail "the packaged importer ($migration_bin) is not available, so the store cannot be migrated. Nothing was changed."
+  local err
+  err="$("$migration_bin" status --receipt "$root/migration/no-such-receipt.json" 2>&1 >/dev/null || true)"
+  if [[ -z "$err" || "$err" == *invalid_arguments* ]]; then
+    fail "this release's importer does not implement import, validate and activate yet, so the store cannot be migrated. Nothing was changed."
+  fi
+}
+
+migrate_setup() {
   find_pg_bin
   load_config
   local self_dir
   self_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
   migration_bin="${migration_bin:-$self_dir/harklight-migration}"
-  [[ -x "$migration_bin" ]] || fail "the packaged importer ($migration_bin) is not available in this release, so the store cannot be migrated yet. Nothing was changed."
+  require_importer
   [[ -f "$state/relay.sqlite3" ]] || fail "no FORMAT32 store at $state/relay.sqlite3"
-  if server_running; then fail "Harklight Server is running; stop it and keep it stopped before migrating"; fi
+  require_stopped
+  export HARKLIGHT_MIGRATOR_URL="$mg_url" HARKLIGHT_MIGRATOR_PASSWORD_FILE="$mg_pwfile"
+  if [[ -n "${pg_ca:-}" ]]; then export HARKLIGHT_MIGRATOR_CA_FILE="$pg_ca"; fi
+}
+
+material_failed() {
+  cat >&2 <<EOF
+harklight-postgres: the importer's identity material could not be verified and installed.
+The destination has NOT been activated by this command. Do not start Harklight Server.
+Fix the cause and run: harklight-postgres migrate --resume $work_dir
+EOF
+  exit 2
+}
+
+do_migrate() {
+  migrate_setup
   if [[ -s "$state/relay.sqlite3-wal" || -s "$state/relay.sqlite3-journal" ]]; then
     fail "the stopped store is not checkpointed; start the current release once and stop it cleanly, then retry"
   fi
-
   if [[ -n "$resume_dir" ]]; then
     work_dir="$resume_dir"
-    [[ -d "$work_dir" && -f "$work_dir/receipt.json" || -d "$work_dir/backup" ]] || fail "$work_dir is not a migration work directory"
+    [[ -d "$work_dir/backup" ]] || fail "$work_dir is not a migration work directory"
   else
     [[ "$(user_table_count)" == 0 ]] || fail "the PostgreSQL database already holds objects; a migration needs an empty, unpublished destination"
     mkdir -m 700 -p -- "$root/migration"
@@ -785,12 +843,7 @@ do_migrate() {
     chmod 700 "$work_dir"
   fi
   note "migration work directory: $work_dir"
-
-  # Importer reads only these; the migrator credentials never reach server.env or a command line.
-  export HARKLIGHT_MIGRATOR_URL="$mg_url" HARKLIGHT_MIGRATOR_PASSWORD_FILE="$mg_pwfile"
-  if [[ -n "${pg_ca:-}" ]]; then export HARKLIGHT_MIGRATOR_CA_FILE="$pg_ca"; fi
-
-  local bundle="$work_dir/bundle" receipt="$work_dir/receipt.json" out validation_sha
+  local bundle="$work_dir/bundle" receipt="$work_dir/receipt.json" out validation_sha externals
 
   if [[ ! -f "$work_dir/done.backup" ]]; then
     mkdir -m 700 -p -- "$work_dir/backup"
@@ -803,9 +856,12 @@ do_migrate() {
   fi
 
   if [[ ! -f "$work_dir/done.export" ]]; then
-    python3 -I - "$state" "$work_dir/material-map.json" "$(external_refs)" <<'PY' || migrate_failed "material map" "$work_dir"
+    externals="$(external_refs)" || migrate_failed "material map (an external path cannot be captured)" "$work_dir"
+    python3 -I - "$state" "$work_dir/material-map.json" "$externals" <<'PY' || migrate_failed "material map" "$work_dir"
 import json, os, sys
 state, out, externals = sys.argv[1:4]
+def walk_error(err):
+    raise err
 m = {}
 for name in ("server.env", "person-id"):
     path = os.path.join(state, name)
@@ -813,7 +869,9 @@ for name in ("server.env", "person-id"):
         m[name] = path
 for sub in ("tls", "owner"):
     base = os.path.join(state, sub)
-    for dirpath, _, files in os.walk(base):
+    if not os.path.isdir(base):
+        continue
+    for dirpath, _, files in os.walk(base, onerror=walk_error):
         for f in files:
             p = os.path.join(dirpath, f)
             if os.path.isfile(p):
@@ -833,30 +891,50 @@ PY
     note "export and verify passed"
   fi
 
-  if [[ ! -f "$work_dir/done.activate" ]]; then
+  if [[ ! -f "$work_dir/done.validate" ]]; then
     migration_step import import --bundle "$bundle" --receipt "$receipt" >/dev/null
     note "import completed"
     out="$(migration_step validate validate --bundle "$bundle" --receipt "$receipt")"
     validation_sha="$(json_field "$out" validation_sha256)"
     [[ "$validation_sha" =~ ^[0-9a-f]{64}$ ]] || migrate_failed "validate (no validation digest)" "$work_dir"
+    : > "$work_dir/done.validate"
     note "validation passed ($validation_sha)"
-    "$0" apply-grants --root "$root" --state "$state" --pg-bin "$pg_bin" >/dev/null || migrate_failed "apply-grants" "$work_dir"
-    "$0" verify-roles --root "$root" --state "$state" --pg-bin "$pg_bin" >/dev/null || migrate_failed "verify-roles" "$work_dir"
-    migration_step activate activate --receipt "$receipt" --validation-sha256 "$validation_sha" >/dev/null
-    : > "$work_dir/done.activate"
   fi
-  out="$(migration_step status status --receipt "$receipt")"
-  [[ "$(json_field "$out" phase)" == active ]] || migrate_failed "status (database is not active)" "$work_dir"
-  if ! out="$(install_material)"; then
+  "$0" apply-grants --root "$root" --state "$state" --pg-bin "$pg_bin" >/dev/null || migrate_failed "apply-grants" "$work_dir"
+  "$0" verify-roles --root "$root" --state "$state" --pg-bin "$pg_bin" >/dev/null || migrate_failed "verify-roles" "$work_dir"
+  if ! out="$(install_material)"; then material_failed; fi
+  note "identity material verified: $out"
+  note "The destination is imported and validated. It has NOT been activated; server.env was not changed and Harklight Server was not started."
+  note "Activation is a separate explicit step: harklight-postgres migrate-activate --resume $work_dir"
+}
+
+do_migrate_activate() {
+  [[ -n "$resume_dir" ]] || fail "usage: harklight-postgres migrate-activate --resume WORKDIR"
+  migrate_setup
+  work_dir="$resume_dir"
+  [[ -f "$work_dir/done.validate" && -f "$work_dir/validate.json" ]] || fail "$work_dir has no completed validation; run migrate first"
+  local receipt="$work_dir/receipt.json" out validation_sha phase
+  validation_sha="$(json_field "$(< "$work_dir/validate.json")" validation_sha256)"
+  [[ "$validation_sha" =~ ^[0-9a-f]{64}$ ]] || fail "the recorded validation has no digest"
+  "$0" verify-roles --root "$root" --state "$state" --pg-bin "$pg_bin" >/dev/null || fail "the runtime role boundary does not verify; not activating"
+  if ! out="$(install_material)"; then material_failed; fi
+  if ! "$migration_bin" activate --receipt "$receipt" --validation-sha256 "$validation_sha" > "$work_dir/activate.json" 2> "$work_dir/activate.err"; then
+    phase="$("$migration_bin" status --receipt "$receipt" 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("phase",""))' 2>/dev/null || true)"
+    [[ -n "$phase" ]] || phase=unreadable
     cat >&2 <<EOF
-harklight-postgres: the destination is ACTIVE but the importer's identity material could not be verified and installed.
-Do not start Harklight Server. Nothing in server.env was changed. Fix the cause and run: harklight-postgres migrate --resume $work_dir
+harklight-postgres: activation reported a failure. The database lifecycle phase is: $phase.
+Read the importer status output before retrying; do not assume either outcome.
+Keep the old Server stopped, do not start any Server, and do not change server.env.
+Retry: harklight-postgres migrate-activate --resume $work_dir
 EOF
     exit 2
   fi
-  note "identity material verified: $out"
+  [[ "$(json_field "$(< "$work_dir/activate.json")" contract_version 2>/dev/null || true)" == 1 ]] || fail "activation output was not a contract-v1 result; read the importer's status before doing anything else"
+  out="$(migration_step status status --receipt "$receipt")"
+  [[ "$(json_field "$out" phase)" == active ]] || fail "activation reported success but the database is not active; read the importer's status"
+  : > "$work_dir/done.activate"
   note "PostgreSQL destination is active for this import. server.env was not changed and Harklight Server was not started."
-  note "Before starting a PostgreSQL-backed Server, add to $state/server.env:"
+  note "To use it, add to $state/server.env:"
   note "  export ATTENTION_SERVER_STORE_BACKEND=postgres"
   note "  source $env_file"
   note "Rollback to the old stack is valid only until PostgreSQL has accepted new writes; backup: $work_dir/backup"
@@ -1070,6 +1148,7 @@ case "$cmd" in
   apply-grants) do_apply_grants ;;
   verify-roles) do_verify_roles ;;
   migrate) do_migrate ;;
+  migrate-activate) do_migrate_activate ;;
   backup) do_backup ;;
   restore) do_restore ;;
   *) usage ;;

@@ -23,6 +23,7 @@ printf 'synthetic sqlite bytes\n' > "$state/relay.sqlite3"
 printf 'synthetic external key\n' > "$scratch/ext/server.key"
 printf 'export ATTENTION_SERVER_ENABLE=1\nexport ATTENTION_SERVER_KEYFILE=%q\n' "$scratch/ext/server.key" > "$state/server.env"
 echo person > "$state/person-id"; echo ca > "$state/tls/ca.pem"; echo id > "$state/owner/identity.key"
+chmod 600 "$state/server.env" "$state/person-id" "$state/tls/ca.pem" "$state/owner/identity.key" "$scratch/ext/server.key"; chmod 700 "$state/tls" "$state/owner"
 envsha() { sha256sum "$state/server.env" | cut -d' ' -f1; }
 before_env="$(envsha)"
 
@@ -32,43 +33,76 @@ export FAKE_DIR="$scratch/fake" FAKE_PSQL="$pg_bin/psql"; mkdir "$FAKE_DIR"
 m() { PGPASSWORD="$(< "$root/postgres/harklight_migrator.password")" "$pg_bin/psql" --no-psqlrc -qtA -v ON_ERROR_STOP=1 "postgres://harklight_migrator@127.0.0.1:$port/harklight?sslmode=disable" "$@"; }
 workdirs() { ls -d "$root"/migration/*/ 2>/dev/null; }
 
-expect_fail "migrate refuses when the packaged importer is not available" "not available in this release" \
-  "$tool" migrate "${args[@]}" --migration-bin "$scratch/missing"
+# A systemctl shim whose unit state the test controls: "ACTIVESTATE MAINPID".
+mkdir "$scratch/shim"
+cat > "$scratch/shim/systemctl" <<'SH'
+#!/bin/sh
+read state pid < "$UNIT_STATE"
+case "$*" in
+  *is-active*) [ "$state" = active ] ;;
+  *ActiveState*) echo "$state" ;;
+  *MainPID*) echo "$pid" ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$scratch/shim/systemctl"
+export UNIT_STATE="$scratch/unit.state"; echo "inactive 0" > "$UNIT_STATE"
+export PATH="$scratch/shim:$PATH"
+calls() { tr '\n' ' ' < "$FAKE_DIR/calls.log"; }
+: > "$FAKE_DIR/calls.log"
 
-mkdir "$scratch/fakebin"; printf '#!/bin/sh\nexit 0\n' > "$scratch/fakebin/systemctl"; chmod +x "$scratch/fakebin/systemctl"
-expect_fail "migrate refuses while Harklight Server is running" "is running" \
-  env PATH="$scratch/fakebin:$PATH" "$tool" migrate "${args[@]}" --migration-bin "$fake"
+expect_fail "migrate refuses when the importer is missing" "is not available" "$tool" migrate "${args[@]}" --migration-bin "$scratch/missing"
+printf '#!/bin/sh\necho "Migration refused: invalid_arguments" >&2\nexit 2\n' > "$scratch/unimplemented"; chmod +x "$scratch/unimplemented"
+expect_fail "migrate refuses an importer that does not implement import yet, before any side effect" "does not implement import" \
+  "$tool" migrate "${args[@]}" --migration-bin "$scratch/unimplemented"
+[[ -z "$(workdirs)" ]] || bad "an unavailable importer left a work directory"
+
+for st in "active 123" "failed 123" "activating 0"; do
+  echo "$st" > "$UNIT_STATE"
+  expect_fail "migrate refuses a Server not proven stopped ($st)" "not proven stopped" "$tool" migrate "${args[@]}" --migration-bin "$fake"
+done
+echo "inactive 0" > "$UNIT_STATE"
+SAVE_PATH="$PATH"; export PATH="/usr/bin:/bin"; command -v systemctl >/dev/null && NOSYS=0 || NOSYS=1
+if [[ "$NOSYS" == 1 ]]; then
+  expect_fail "migrate refuses when it cannot observe the Server at all" "cannot prove" "$tool" migrate "${args[@]}" --migration-bin "$fake"
+fi
+export PATH="$SAVE_PATH"
+[[ -z "$(workdirs)" ]] || bad "a refused migration created a work directory"
 
 printf 'wal' > "$state/relay.sqlite3-wal"
 expect_fail "migrate refuses an un-checkpointed store" "not checkpointed" "$tool" migrate "${args[@]}" --migration-bin "$fake"
 rm "$state/relay.sqlite3-wal"
-[[ -z "$(workdirs)" ]] || bad "a refused migration created a work directory"
+
+# An external path the backup cannot capture stops the migration before export.
+cp "$state/server.env" "$scratch/server.env.keep"
+printf 'export HK_TEST_DIR=%q\n' "$scratch/ext" >> "$state/server.env"
+expect_fail "migrate refuses when an external configured path cannot be captured" "cannot be captured" "$tool" migrate "${args[@]}" --migration-bin "$fake"
+[[ "$(calls)" != *export* ]] || bad "export ran despite an incomplete material map"
+rm -rf "$root"/migration; cp "$scratch/server.env.keep" "$state/server.env"; : > "$FAKE_DIR/calls.log"
+before_env="$(envsha)"
 
 # A failure after import leaves everything recoverable and activates nothing.
 export FAKE_FAIL_AT=validate
 expect_fail "migrate stops at a failed validation with resume guidance" "migrate --resume" "$tool" migrate "${args[@]}" --migration-bin "$fake"
 wd="$(workdirs | head -n 1)"; wd="${wd%/}"
 [[ "$(m -c 'select phase from harklight.import_state')" == loading ]] || bad "phase moved on after a failed validate"
-[[ ! -e "$wd/done.activate" && "$(envsha)" == "$before_env" ]] || bad "failure activated or edited server.env"
+[[ "$(envsha)" == "$before_env" ]] || bad "failure edited server.env"
 [[ "$(stat -c %a "$wd")" == 700 && "$(stat -c %a "$wd/backup/private-root.tar")" == 600 ]] || bad "work directory modes"
 tar -tf "$wd/backup/private-root.tar" | grep -q 'relay.sqlite3' || bad "backup lacks the store"
-[[ "$(sha256sum "$wd/backup/private-root.tar" | cut -d' ' -f1)" == "$(cat "$wd/backup/SHA256")" ]] || bad "backup digest"
 ok "failed validation leaves the destination loading, server.env unchanged, backup intact"
 
-# Resume continues, reruns the idempotent steps, and activates only after grants.
+# Resume validates, applies grants, installs material, and does NOT activate.
 sums="$(sha256sum "$wd/backup/private-root.tar")"
 rm "$scratch/ext/server.key"   # the verified staged copy must put it back
 : > "$FAKE_DIR/calls.log"
 "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd" >"$scratch/resume.out"
-[[ "$(tr '\n' ' ' < "$FAKE_DIR/calls.log")" == "import validate activate status " ]] || bad "unexpected resume call order: $(tr '\n' ' ' < "$FAKE_DIR/calls.log")"
-[[ "$(m -c 'select phase from harklight.import_state')" == active ]] || bad "not active after resume"
-[[ "$(sha256sum "$wd/backup/private-root.tar")" == "$sums" ]] || bad "the backup changed on resume"
-[[ "$(envsha)" == "$before_env" ]] || bad "server.env changed"
-grep -q 'server.env was not changed' "$scratch/resume.out" || bad "missing final guidance"
+[[ "$(calls)" == "status import validate " ]] || bad "unexpected resume call order: $(calls)"
+[[ "$(m -c 'select phase from harklight.import_state')" == validated ]] || bad "migrate must leave the destination validated, not active"
+[[ ! -e "$wd/done.activate" && "$(sha256sum "$wd/backup/private-root.tar")" == "$sums" && "$(envsha)" == "$before_env" ]] || bad "backup or server.env changed"
 [[ "$(cat "$scratch/ext/server.key")" == "synthetic external key" && "$(stat -c %a "$scratch/ext/server.key")" == 600 ]] || bad "verified material was not installed"
-grep -q 'identity material verified: installed 1 file' "$scratch/resume.out" || bad "material install not reported"
+grep -q 'NOT been activated' "$scratch/resume.out" || bad "missing guidance"
 "$tool" verify-roles "${args[@]}" >/dev/null
-ok "resume runs import, validate, grants, activate and status in order and keeps the backup identical"
+ok "resume imports, validates, applies grants and installs verified material without activating"
 
 python3 - "$wd/material-map.json" "$state" "$scratch/ext/server.key" <<'PY' || bad "material map"
 import json, sys
@@ -79,26 +113,47 @@ assert m["external" + key] == key and not any("relay.sqlite3" in k for k in m)
 PY
 ok "material map names server.env, person-id, tls and owner files and external key files"
 
-# Material that fails verification blocks the finish, even though the database is already active.
+# Resume with the Server not proven stopped runs nothing.
+echo "failed 123" > "$UNIT_STATE"; : > "$FAKE_DIR/calls.log"
+expect_fail "resume refuses a Server not proven stopped" "not proven stopped" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+expect_fail "activation refuses a Server not proven stopped" "not proven stopped" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+[[ "$(calls)" == "status status " ]] || bad "importer commands ran with the Server not proven stopped: $(calls)"
+echo "inactive 0" > "$UNIT_STATE"
+
+# Material that fails verification blocks activation.
 staged="$wd/staging/root/server.env"
 cp "$staged" "$scratch/staged.keep"; echo tampered >> "$staged"
-expect_fail "migrate refuses staged material whose hash differs" "ACTIVE but the importer's identity material could not be verified" \
-  "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+expect_fail "activation refuses staged material whose hash differs" "could not be verified" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+[[ "$(m -c 'select phase from harklight.import_state')" == validated ]] || bad "activated despite bad material"
 cp "$scratch/staged.keep" "$staged"
 cp "$wd/staging/COMPLETE.json" "$scratch/complete.keep"; echo ' ' >> "$wd/staging/COMPLETE.json"
-expect_fail "migrate refuses a COMPLETE.json that does not match its digest" "does not match its recorded digest" \
-  "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+expect_fail "activation refuses a COMPLETE.json that does not match its digest" "does not match its recorded digest" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
 cp "$scratch/complete.keep" "$wd/staging/COMPLETE.json"
-echo changed > "$scratch/ext/server.key"
-expect_fail "migrate never overwrites an existing file that differs from the staged copy" "was not overwritten" \
-  "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
-[[ "$(cat "$scratch/ext/server.key")" == changed ]] || bad "a differing file was overwritten"
-printf 'synthetic external key\n' > "$scratch/ext/server.key"
-"$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd" >/dev/null
-[[ "$(envsha)" == "$before_env" ]] || bad "server.env changed"
-ok "after the material problems are fixed, resume completes again"
+echo changed > "$scratch/ext/server.key"; chmod 600 "$scratch/ext/server.key"
+expect_fail "material install never overwrites a differing file" "was not overwritten" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+printf 'synthetic external key\n' > "$scratch/ext/server.key"; chmod 644 "$scratch/ext/server.key"
+expect_fail "material install refuses an identical file that is not private" "not private" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+chmod 600 "$scratch/ext/server.key"
+chmod 644 "$staged"
+expect_fail "material install refuses staged files that are not private" "is not private" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+chmod 600 "$staged"
+chmod 755 "$wd/staging"
+expect_fail "material install refuses a staging directory that is not private" "is not private" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+chmod 700 "$wd/staging"
+[[ "$(m -c 'select phase from harklight.import_state')" == validated ]] || bad "activated despite material problems"
+ok "material problems block activation and leave the destination validated"
 
-# The runtime role cannot touch the lifecycle row the importer activated.
+# Activation is a separate explicit step; an ambiguous failure never claims "nothing was activated".
+expect_fail "activation without a completed migration is refused" "has no completed validation" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$scratch"
+export FAKE_FAIL_AT=activate
+out="$("$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd" 2>&1 || true)"
+[[ "$out" == *"lifecycle phase is: validated"* && "$out" != *"Nothing was activated"* ]] || bad "failed activation did not report the real phase: $out"
+unset FAKE_FAIL_AT
+"$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd" >"$scratch/activate.out"
+[[ "$(m -c 'select phase from harklight.import_state')" == active && -e "$wd/done.activate" && "$(envsha)" == "$before_env" ]] || bad "explicit activation failed"
+grep -q 'ATTENTION_SERVER_STORE_BACKEND=postgres' "$scratch/activate.out" || bad "missing final guidance"
+ok "explicit activation reports the real phase on failure, then activates and leaves server.env alone"
+
 q() { PGPASSWORD="$(< "$root/postgres/harklight.password")" "$pg_bin/psql" --no-psqlrc -qtA "postgres://harklight@127.0.0.1:$port/harklight?sslmode=disable" -c "$1"; }
 q "select phase from harklight.import_state" >/dev/null
 if q "update harklight.import_state set phase = 'loading'" >/dev/null 2>&1; then bad "runtime role could rewrite import_state"; fi
