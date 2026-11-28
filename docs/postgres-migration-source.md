@@ -586,3 +586,10 @@ Message and recipient phases resume independently after interruption. The
 record-level frozen-view test reconstructs the same source projection from
 imported attributes; bounded shared reader facts, attachments, answers and actual
 import-to-HTTP parity remain required before activation.
+Schema preparation also requires the trusted installer role pair (by default
+`harklight_migrator` and `harklight`), never inferred from the supplied login.
+The connection must be the migration role and database/schema/table owner.
+Runtime role membership, elevated role powers, database CREATE or public/app
+schema CREATE privileges refuse preparation before any DDL, including when no
+schema update is needed. Isolated tests can supply an explicit trusted role pair
+through `PrepareSchema.run/3`; production wiring uses the installer contract.

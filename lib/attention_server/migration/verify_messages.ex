@@ -30,11 +30,12 @@ defmodule AttentionServer.Migration.VerifyMessages do
     attributes = record |> Map.drop([:message, :origin, :session_handle, :revision,
       :accepted_seq, :free_order, :accepted_at, :terminal]) |> Attributes.encode()
     expected = [person, record.origin, sender, external, Map.get(record, :session_handle),
-      current, record.accepted_at, record.accepted_seq, Map.get(record, :free_order), terminal, attributes]
+      current, record.accepted_at, record.accepted_seq, Map.get(record, :free_order), terminal, attributes,
+      nil, "ordinary", if(record.origin == "app:harklight/notices", do: nil, else: record.origin)]
     versions = Map.get(record, :revisions, %{1 => record.message})
     item = Resources.item_id(record)
     with {:ok, %{rows: [^expected]}} <- ImportSession.query(db,
-           "SELECT person_id,origin_key,sender_id,message_id,session_handle,revision,accepted_at_ms,accepted_position,free_order,terminal,attributes FROM harklight.messages WHERE id=$1", [id]),
+           "SELECT person_id,origin_key,sender_id,message_id,session_handle,revision,accepted_at_ms,accepted_position,free_order,terminal,attributes,group_id,coalesce(to_jsonb(m)->>'kind','ordinary'),principal_origin_key FROM harklight.messages m WHERE id=$1", [id]),
          {:ok, %{rows: [[^person, ^item]]}} <- ImportSession.query(db,
            "SELECT person_id,item_id FROM harklight.message_recipients WHERE message_id=$1", [id]),
          :ok <- revisions(db, id, current, record, versions) do

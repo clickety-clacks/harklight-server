@@ -129,6 +129,11 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     defp verify_published_text(db, identity, bundle, count, hex) do
       hash = Base.decode16!(hex, case: :lower)
       assert {:ok, %{references: ^count}} = VerifyLargeText.run(db, identity, bundle)
+      extra_hash = :crypto.hash(:sha256, "")
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.large_texts(sha256,size_bytes,verified) VALUES($1,0,true)", [extra_hash])
+      assert {:error, :large_text_hash_count_mismatch} = VerifyLargeText.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db, "DELETE FROM harklight.large_texts WHERE sha256=$1", [extra_hash])
       assert {:error, :import_source_mismatch} = VerifyLargeText.run(db,
         %{identity | source: :crypto.hash(:sha256, "foreign source")}, bundle)
       assert {:ok, %{rows: checkpoints}} = ImportSession.query(db,
