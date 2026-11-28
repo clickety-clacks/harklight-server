@@ -768,7 +768,8 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, changes} = RecordTable.select(failure_db, """
       SELECT rev, kind, resource_id FROM client_changes WHERE person_id = ? AND rev > ? ORDER BY rev
       """, [person, head])
-      assert [[_, "settings", "settings"], [_, "settings", "settings"]] = changes
+      # Two commits advance the head twice and coalesce the resource feed.
+      assert changes == [[head + 2, "settings", "settings"]]
       assert {:ok, %{rows: ^changes}} = Transaction.query("""
       SELECT revision, resource_kind, resource_id FROM harklight.stream_changes
       WHERE person_id = $1 AND origin_key = '' AND revision > $2 ORDER BY revision
