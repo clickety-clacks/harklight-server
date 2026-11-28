@@ -12,6 +12,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     @first "a1000000-0000-4000-8000-000000000002"
     @second "a1000000-0000-4000-8000-000000000003"
     @outside "a1000000-0000-4000-8000-000000000004"
+    @origin AttentionServer.BrowserRecipient.key(@sender, "synthetic-retained-session", "a6000000-0000-4000-8000-000000000001")
     @upload "a5000000-0000-4000-8000-000000000001"
     @group "a2000000-0000-4000-8000-000000000001"
     @shared "shared_synthetic-collision"
@@ -113,7 +114,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       expected = source.shared_messages[@shared]
       assert {:ok, ^expected} = Attributes.decode(attrs)
       assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
-        "SELECT count(*) FROM harklight.principals WHERE key='historical-unenrolled-origin'", [])
+        "SELECT count(*) FROM harklight.principals WHERE key=$1", [@origin])
       assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.groups WHERE id=$1", [@group])
       assert {:ok, %{rows: rows}} = ImportSession.query(db,
         "SELECT person_id,attributes FROM harklight.message_recipients WHERE message_id=$1 ORDER BY person_id", [@shared])
@@ -162,8 +163,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     defp seed(path) do
       {:ok, store} = Store.open_relay(path)
       bytes = "shared retained attachment"
-      metadata = %{id: @upload, person: @sender, uploader: "historical-unenrolled-origin",
-        uploader_kind: "agent", op_id: "a5000000-0000-4000-8000-000000000002",
+      metadata = %{id: @upload, person: @sender, uploader: @origin,
+        uploader_kind: "client", op_id: "a5000000-0000-4000-8000-000000000002",
         sender_id: "app:shared-fixture", message_id: @shared, revision: 1,
         name: "retained.txt", size: byte_size(bytes), sha256: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower),
         last_activity_ms: 100, content_type: "text/plain"}
@@ -178,7 +179,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         end)
         {:ok, engine} = Engine.replace_hosted_organization(engine, "shared-business", [@sender, @first, @second], "a3000000-0000-4000-8000-000000000001")
         {:ok, engine, _} = Groups.replace_hosted(engine, {"shared-business", "team"}, @group, "Retained group", [@sender, @first, @second], 1)
-        attrs = %{id: @shared, sender_person: @sender, sender_key: "historical-unenrolled-origin",
+        attrs = %{id: @shared, sender_person: @sender, sender_key: @origin,
           sender_id: "app:shared-fixture", message: %{"title" => "First shared revision"},
           answer_policy: nil, files: files, group_id: @group, group_name: "Retained group"} |> Map.put("created_at_ms", 100)
         {:ok, engine, record, _} = SharedMessages.create(engine, attrs, [@first, @second], nil)
