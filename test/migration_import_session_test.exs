@@ -1605,7 +1605,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert :ok = ImportItemFacts.run(db, identity, bundle)
       assert {:ok, records} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, [],
         fn entry, entries -> {:ok, [entry | entries]} end)
-      assert {:ok, source} = AttentionServer.Store.RecordCodec.decode(Enum.reverse(records))
+      assert {:ok, source} = AttentionServer.Store.RecordCodec.decode(Enum.map(Enum.reverse(records), fn {address, value} ->
+        AttentionServer.Store.RecordCodec.encode_row(address, value) end))
       source = Engine.rebuild_route_b_index(source)
       assert Enum.any?(source.messages, fn {_, record} -> is_binary(Map.get(record, :session_handle)) end)
       for {{person, _, _} = key, record} <- source.messages do
