@@ -26,10 +26,10 @@ brew install clickety-clacks/tap/harklight-agent
 
 Run `harklight-agent setup` with no arguments to check the current Server, account, sender grants and installed skill paths and refresh the skill. Agent 0.2.10 setup, sending, replying, reading and live follow have been exercised against an isolated Hosted-mode Server.
 
-- **Claude Code.** Setup instructions are available. End-to-end testing of skill discovery, delivery of Replies and Chat into the original session, and automatic continuation is pending.
-- **Codex CLI.** Setup instructions are available. End-to-end testing of skill discovery, delivery of Replies and Chat into the original session, and automatic continuation is pending.
+- **Claude Code.** Verified with Claude Code 2.1.291 on Linux against self-hosted Server 0.2.16 and Agent 0.2.6: setup, a fixed prompt, a post-turn answer, Chat in the originating session, and the opt-in Notification hook. Claude Code on macOS with Hosted was not run. Run `harklight-agent listen --next --session <session>` as a background Bash command in the originating Claude Code session so Claude can resume that session when the command completes, then rearm it if the returned event is something other than the answer.
+- **Codex CLI.** Verified with Codex 0.160.1 on Linux with Hosted (Server 0.2.36, Agent 0.2.10) and on macOS with self-hosted Server 0.2.16 and Agent 0.2.6: setup, a fixed prompt, delayed answers and Chat in the original thread through explicit CLI resume. No automatic wake or interactive TUI resume was established. If the turn ends before the answer arrives, use `codex exec resume <thread-id>` to reopen the original thread and ask it to read the Harklight answer for its existing Harklight session.
 
-Resume the original session manually to check for Replies or Chat. The CLI workflow below is available while client-level testing is pending.
+Hosted Web composer Chat passed on Linux. On self-hosted macOS, Chat passed through the signed-in browser API; the bundled Web composer timed out. Real-iPhone Hosted confirmation has not been run.
 
 ## Send a message and answer it
 

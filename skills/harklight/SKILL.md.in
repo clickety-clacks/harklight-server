@@ -23,5 +23,6 @@ Use a sender ID this computer is granted. The setup default grant `app:agent/`
 covers any ID that begins with it, such as `app:agent/claude-code` or
 `app:agent/codex`. `--display-name` sets the name the person sees.
 
-<!-- Claude Code waiting instructions: pending interactive testing of listen --next. -->
-<!-- Codex waiting instructions: pending interactive testing of how to read the answer. -->
+**Claude Code:** Run `harklight-agent listen --next --session <session>` as a background Bash command in the originating Claude Code session so Claude can resume that session when the command completes, then rearm it if the returned event is something other than the answer.
+
+**Codex:** If the turn ends before the answer arrives, use `codex exec resume <thread-id>` to reopen the original thread and ask it to read the Harklight answer for its existing Harklight session.
