@@ -21,7 +21,8 @@ port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); p
 mkdir -p "$state/tls" "$state/owner" "$scratch/ext"; chmod 700 "$root" "$state"
 printf 'synthetic sqlite bytes\n' > "$state/relay.sqlite3"
 printf 'synthetic external key\n' > "$scratch/ext/server.key"
-printf 'export ATTENTION_SERVER_ENABLE=1\nexport ATTENTION_SERVER_KEYFILE=%q\n' "$scratch/ext/server.key" > "$state/server.env"
+printf 'synthetic score record\n' > "$scratch/ext/scores.jsonl"; chmod 600 "$scratch/ext/scores.jsonl"
+printf 'export ATTENTION_SERVER_ENABLE=1\nexport ATTENTION_SERVER_KEYFILE=%q\nexport ATTENTION_SERVER_JEV_SCORE_RECORD_PATH=%q\n' "$scratch/ext/server.key" "$scratch/ext/scores.jsonl" > "$state/server.env"
 echo person > "$state/person-id"; echo ca > "$state/tls/ca.pem"; echo id > "$state/owner/identity.key"
 chmod 600 "$state/server.env" "$state/person-id" "$state/tls/ca.pem" "$state/owner/identity.key" "$scratch/ext/server.key"; chmod 700 "$state/tls" "$state/owner"
 envsha() { sha256sum "$state/server.env" | cut -d' ' -f1; }
@@ -133,7 +134,9 @@ m = json.load(open(sys.argv[1])); state, key = sys.argv[2:4]
 assert m["server.env"] == state + "/server.env" and m["person-id"] == state + "/person-id"
 assert m["tls/ca.pem"] == state + "/tls/ca.pem" and m["owner/identity.key"] == state + "/owner/identity.key"
 assert m["external" + key] == key and not any("relay.sqlite3" in k for k in m)
+assert not any("scores.jsonl" in k for k in m), "score record must not be migration material"
 PY
+[[ "$(cat "$scratch/ext/scores.jsonl")" == "synthetic score record" ]] || bad "the score record was touched"
 ok "material map names server.env, person-id, tls and owner files and external key files"
 
 # Resume with the Server not proven stopped runs nothing.
