@@ -1097,6 +1097,129 @@ defmodule AttentionServer.ClientAPIListenerTest do
     assert {:ok, _, %{status: 401}} = request(conn, "PUT", route, headers, report)
   end
 
+  test "browser shared replies retain a session-owned attachment with the same visibility as device replies", ctx do
+    ctx =
+      Map.merge(ctx, web_origin(ctx, [client_api_routes: [ClientAPI.Reads, ClientAPI.Writes]],
+        shared_messages: true))
+
+    listener =
+      start_supervised!(
+        {ClientAPI.Listener,
+         relay: ctx.relay,
+         certfile: Path.join(ctx.certs, "server.pem"),
+         keyfile: Path.join(ctx.certs, "server.key"),
+         cacertfile: Path.join(ctx.certs, "ca.pem")}
+      )
+
+    ctx = Map.put(ctx, :port, ClientAPI.Listener.port(listener))
+    relay = ctx.relay
+    person = ctx.person
+    assert {:ok, sender} = Relay.operator_bootstrap(relay, TLSFixtures.certificate_der!(ctx.certs, "expired"))
+    assert {:ok, sender_key} = Relay.setup_device_certificate(relay, sender, TLSFixtures.certificate_der!(ctx.certs, "b1"))
+    assert :ok = Relay.setup_sender(relay, sender_key, "app:test")
+    assert {:ok, device_key} = DeviceIdentity.from_certificate(TLSFixtures.certificate_der!(ctx.certs, "a2"))
+    assert :ok = Relay.setup_sender(relay, device_key, "app:test")
+
+    outsider_cert = TLSFixtures.certificate_der!(ctx.certs, "unknown")
+    assert {:ok, outsider} = Relay.operator_bootstrap(relay, outsider_cert)
+    assert {:ok, outsider_owner} = DeviceIdentity.from_certificate(outsider_cert)
+    assert {:ok, credential} = Relay.owner_browser_sign_in_create(relay, outsider, outsider_owner)
+    assert {:ok, outsider_cookie, _} = DashboardBrowserSession.redeem(ctx.sessions, credential["sign_in_token"])
+
+    assert {:ok, browser} = browser_connect(ctx, :http2)
+    assert {:ok, device} = device_connect(ctx, "a2", :http2)
+    assert {:ok, sender_conn} = device_connect(ctx, "b1", :http2)
+    capability = [{"harklight-features", "shared_messages"}]
+    browser_auth = [{"cookie", cookie(ctx.cookie)}]
+    outsider_auth = [{"cookie", cookie(outsider_cookie)}]
+    browser_write = [{"origin", ctx.origin} | browser_auth]
+
+    send_body = %{
+      "sender" => "app:test",
+      "message" => %{"title" => "Shared conversation", "created_at" => 1},
+      "recipients" => %{"kind" => "people", "people" => [person]}
+    }
+
+    assert {:ok, sender_conn, %{status: 200} = sent} =
+             attachment_write(sender_conn, "/v2/agent/messages", send_body, capability)
+    assert %{"message" => %{"item_id" => shared_id}} = json(sent)
+    store = :sys.get_state(relay).store
+    item = store.engine.shared_recipients[{shared_id, person}].item_id
+    item_path = "/v2/items/#{item}"
+
+    browser_bytes = "browser reply attachment"
+    {browser, file} = stage_reply_attachment(browser, browser_write, "browser.txt", browser_bytes)
+    reply_body = %{"text" => "From browser", "file_ids" => [file]}
+    reply_path = item_path <> "/replies"
+    reply_headers = browser_write ++ capability
+    reply_key = AttentionServer.ConversationFiles.new_upload_id()
+
+    assert {:ok, browser, %{status: 200} = replied} =
+             attachment_write(browser, reply_path, reply_body, reply_headers, reply_key)
+
+    assert {:ok, browser, %{status: 200} = replay} =
+             attachment_write(browser, reply_path, reply_body, reply_headers, reply_key)
+
+    assert replay.body == replied.body
+    assert header(replay, "idempotent-replayed") == ["true"]
+    assert %{"entry" => %{"shared_entry_id" => browser_entry, "files" => [browser_file]}} = json(replied)
+    assert %{"file_id" => "shared-file_" <> upload_id, "name" => "browser.txt"} = browser_file
+
+    assert {:ok, %{browser_session_id: session}} = DashboardBrowserSession.context(ctx.sessions, ctx.cookie)
+    actor = ClientAPI.Writes.browser_actor_key(person, session)
+    assert %{person: ^person, uploader: ^actor, shared_entry_id: ^browser_entry} =
+             :sys.get_state(relay).store.engine.uploads[upload_id]
+
+    device_bytes = "device reply attachment"
+    {device, file} = stage_reply_attachment(device, [], "device.txt", device_bytes)
+    assert {:ok, device, %{status: 200} = app_reply} =
+             attachment_write(device, item_path <> "/replies", %{"text" => "From device", "file_ids" => [file]}, capability)
+    assert %{"entry" => %{"files" => [app_file]}} = json(app_reply)
+
+    assert {:ok, browser, %{status: 200} = entries} =
+             request(browser, "GET", item_path <> "/entries", browser_auth ++ capability)
+    assert %{"entries" => [%{"files" => [^browser_file]}, %{"files" => [^app_file]}]} = json(entries)
+
+    for {file, bytes} <- [{browser_file, browser_bytes}, {app_file, device_bytes}] do
+      path = "/v2/files/" <> file["file_id"]
+      assert {:ok, _, %{status: 200, body: ^bytes}} = request(browser, "GET", path, browser_auth ++ capability)
+      assert {:ok, _, %{status: 200, body: ^bytes}} = request(device, "GET", path, capability)
+      assert {:ok, _, %{status: 200, body: ^bytes}} = request(sender_conn, "GET", path, capability)
+      assert {:ok, _, %{status: 404}} = request(browser, "GET", path, outsider_auth ++ capability)
+    end
+
+    ordinary_id = send_progress(ctx, progress_message())
+    ordinary_bytes = "ordinary reply attachment"
+    {browser, file} = stage_reply_attachment(browser, browser_write, "ordinary.txt", ordinary_bytes)
+    assert {:ok, browser, %{status: 200} = ordinary} =
+             attachment_write(browser, "/v2/items/#{ordinary_id}/replies",
+               %{"text" => "Ordinary browser reply", "file_ids" => [file]}, browser_write)
+    assert %{"entry" => %{"files" => [%{"file_id" => ordinary_file, "name" => "ordinary.txt"}]}} = json(ordinary)
+    assert {:ok, _, %{status: 200, body: ^ordinary_bytes}} =
+             request(browser, "GET", "/v2/files/" <> ordinary_file, browser_auth)
+  end
+
+  defp stage_reply_attachment(conn, headers, name, bytes) do
+    headers = [
+      {"idempotency-key", AttentionServer.ConversationFiles.new_upload_id()},
+      {"content-type", "text/plain"},
+      {"content-disposition", "attachment; filename*=UTF-8''" <> name}
+      | headers
+    ]
+    assert {:ok, conn, %{status: 201} = staged} = request(conn, "POST", "/v2/files", headers, bytes)
+    assert %{"file_id" => file} = json(staged)
+    {conn, file}
+  end
+
+  defp attachment_write(conn, path, body, headers, key \\ AttentionServer.ConversationFiles.new_upload_id()) do
+    headers = [
+      {"idempotency-key", key},
+      {"content-type", "application/json"}
+      | headers
+    ]
+    request(conn, "POST", path, headers, JSON.encode!(body))
+  end
+
   test "the web origin serves /v2 over HTTP/2 and HTTP/1.1 with no flag option", ctx do
     ctx = Map.merge(ctx, web_origin(ctx, []))
     headers = [{"cookie", cookie(ctx.cookie)}]
@@ -1629,7 +1752,7 @@ defmodule AttentionServer.ClientAPIListenerTest do
 
   # -- web origin fixture ---------------------------------------------------
 
-  defp web_origin(%{dir: dir, certs: certs}, extra) do
+  defp web_origin(%{dir: dir, certs: certs}, extra, relay_options \\ []) do
     skill_path = Path.join(dir, "skills/harklight-agent/SKILL.md")
     File.mkdir_p!(Path.dirname(skill_path))
     File.write!(skill_path, "---\nname: harklight-agent\nversion: \"0.1.0\"\n---\n\n# Agent")
@@ -1642,10 +1765,12 @@ defmodule AttentionServer.ClientAPIListenerTest do
     relay =
       start_supervised!(
         {Relay,
-         store_path: Path.join(dir, "web.sqlite3"),
-         join_configuration: join,
-         dashboard_origin: origin,
-         enrollment_fixture_mode: true},
+         [
+           store_path: Path.join(dir, "web.sqlite3"),
+           join_configuration: join,
+           dashboard_origin: origin,
+           enrollment_fixture_mode: true
+         ] ++ relay_options},
         restart: :temporary,
         id: :web_relay
       )
