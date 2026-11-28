@@ -317,3 +317,13 @@ receipts retain their IDs. Highs are copied before entries and receipts, using
 separate checkpoints. Entries beyond the recorded high, acknowledgements without
 an origin entry and receipts without an advisory entry refuse the stage. This
 preserves feed facts without dispatching deliveries or activating the target.
+
+`ImportBytes.run/5` copies an already-verified bundle file into a matching target
+upload manifest one 1 MiB chunk at a time. Each chunk and source-prefix checkpoint
+commit atomically. Restart rereads and verifies the committed prefix before
+continuing; a changed prefix refuses, and final byte length and SHA-256 must
+match. Empty files produce no chunks. Completed uploads can only be rechecked
+when their checkpoint already covers the file; this routine cannot append to a
+completed upload. It does not mark uploads complete, create attachment links or
+activate the database. The caller must finish those stages and validate target
+content and references before activation.

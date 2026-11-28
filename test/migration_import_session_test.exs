@@ -647,6 +647,78 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     end
 
     @tag timeout: 120_000
+    test "upload chunks resume from a committed prefix and retain exact reader bytes" do
+      alias AttentionServer.Migration.ImportBytes
+      alias AttentionServer.Repository.Postgres.{Repo, Uploads}
+      uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
+      assert uri.host in ["localhost", "127.0.0.1"]
+      [user, password] = String.split(uri.userinfo, ":", parts: 2)
+      config = [hostname: uri.host, port: uri.port, username: URI.decode(user),
+        password: URI.decode(password), database: "migration_upload_bytes"]
+      db = start_supervised!({Postgrex, config})
+      identity = %{id: "synthetic-chunks", source: :crypto.hash(:sha256, "synthetic chunk source"),
+        schema: AttentionServer.Repository.Postgres.Schema.digest()}
+      assert {:ok, :claimed} = ImportSession.claim(db, identity)
+      assert {:ok, _} = ImportSession.query(db, "INSERT INTO harklight.people(id) VALUES('synthetic-person')", [])
+      bytes = :binary.copy("a", Uploads.chunk_bytes()) <> :binary.copy("b", Uploads.chunk_bytes()) <>
+        :binary.copy("c", Uploads.chunk_bytes()) <> "last chunk"
+      hash = :crypto.hash(:sha256, bytes)
+      expected = %{size: byte_size(bytes), sha256: Base.encode16(hash, case: :lower)}
+      root = Path.join(System.tmp_dir!(), "import-chunks-#{System.unique_integer([:positive])}")
+      File.mkdir!(root)
+      File.chmod!(root, 0o700)
+      on_exit(fn -> File.rm_rf!(root) end)
+      path = Path.join(root, "synthetic-upload")
+      File.write!(path, bytes)
+      File.chmod!(path, 0o600)
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.uploads(id,person_id,size_bytes,sha256) VALUES('synthetic-upload','synthetic-person',$1,$2)", [expected.size, hash])
+      assert {:ok, _} = ImportSession.query(db, """
+        CREATE FUNCTION harklight.fail_chunk() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.chunk_number=1 THEN RAISE EXCEPTION 'synthetic interruption'; END IF; RETURN NEW; END $$
+        """, [])
+      assert {:ok, _} = ImportSession.query(db,
+        "CREATE TRIGGER fail_chunk BEFORE INSERT ON harklight.upload_chunks FOR EACH ROW EXECUTE FUNCTION harklight.fail_chunk()", [])
+      assert {:error, _} = ImportBytes.run(db, identity, "synthetic-upload", path, expected)
+      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.upload_chunks", [])
+      assert {:ok, %{ordinal: 1}} = ImportSession.checkpoint(db, identity, "upload-bytes/synthetic-upload/v1")
+      assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_chunk ON harklight.upload_chunks", [])
+      <<_, tail::binary>> = bytes
+      File.write!(path, <<?z, tail::binary>>)
+      assert {:error, :checkpoint_source_mismatch} = ImportBytes.run(db, identity, "synthetic-upload", path, expected)
+      assert {:ok, %{ordinal: 1}} = ImportSession.checkpoint(db, identity, "upload-bytes/synthetic-upload/v1")
+      File.write!(path, bytes)
+      assert {:ok, %{chunks: 4, bytes: size}} = ImportBytes.run(db, identity, "synthetic-upload", path, expected)
+      assert size == expected.size
+      assert {:ok, %{chunks: 4}} = ImportBytes.run(db, identity, "synthetic-upload", path, expected)
+      assert {:ok, %{rows: [[4, max_size]]}} = ImportSession.query(db,
+        "SELECT count(*),max(octet_length(bytes)) FROM harklight.upload_chunks", [])
+      assert max_size == Uploads.chunk_bytes()
+      start_supervised!({Repo, config})
+      assert {:error, :not_found} = Uploads.read_chunk("synthetic-person", "synthetic-upload", 0)
+      assert {:ok, "synthetic-upload"} = Uploads.complete({"synthetic-person", nil, "synthetic-upload"}, 123)
+      assert {:ok, %{chunks: 4}} = ImportBytes.run(db, identity, "synthetic-upload", path, expected)
+      readback = for ordinal <- 0..3, into: <<>> do
+        assert {:ok, chunk} = Uploads.read_chunk("synthetic-person", "synthetic-upload", ordinal)
+        chunk
+      end
+      assert readback == bytes
+      assert :crypto.hash(:sha256, readback) == hash
+      assert {:error, :not_found} = Uploads.read_chunk("wrong-person", "synthetic-upload", 0)
+      empty = Path.join(root, "empty")
+      File.write!(empty, "")
+      empty_hash = :crypto.hash(:sha256, "")
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.uploads(id,person_id,size_bytes,sha256) VALUES('empty','synthetic-person',0,$1)", [empty_hash])
+      assert {:ok, %{chunks: 0, bytes: 0}} = ImportBytes.run(db, identity, "empty", empty,
+        %{size: 0, sha256: Base.encode16(empty_hash, case: :lower)})
+      assert {:ok, "empty"} = Uploads.complete({"synthetic-person", nil, "empty"}, 124)
+      assert {:error, :not_found} = Uploads.read_chunk("synthetic-person", "empty", 0)
+      assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+      stop_supervised!(Repo)
+    end
+
+    @tag timeout: 120_000
     test "unknown delivery acknowledgement stage refuses the receipt checkpoint" do
       alias AttentionServer.Store.{RecordCodec, RecordTable}
       uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
