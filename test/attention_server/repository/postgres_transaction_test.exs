@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
 
     alias AttentionServer.Repository.Postgres.{Pool, Repo, Transaction}
 
-    setup do
+    setup_all do
       config = [url: System.fetch_env!("HARKLIGHT_POSTGRES_TEST_URL")]
       assert {:error, :postgres_disabled} = Pool.start_link(config)
       Application.put_env(:attention_server, :postgres_repository, true)
@@ -47,7 +47,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       start_supervised!({Pool, config})
       assert :ok = Transaction.verify_ready()
 
-      for person <- ["synthetic-one", "synthetic-two"] do
+      for person <- ["synthetic-one", "synthetic-two", "retry-person"] do
         assert {:ok, _} =
                  Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
       end
@@ -102,6 +102,49 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                  """,
                  [elem(scope, 0)]
                )
+    end
+
+    test "known transaction aborts retry without carrying previous writes forward" do
+      scope = {"retry-person", ""}
+      attempt = make_ref()
+
+      assert {:ok, 1} =
+               Transaction.run([scope], fn heads ->
+                 assert {:ok, 1} = Transaction.append(heads, scope, [change("stable-operation")])
+
+                 if Process.put(attempt, true) do
+                   {:ok, 1}
+                 else
+                   force_abort("40001")
+                 end
+               end)
+
+      assert {:error, %Postgrex.Error{postgres: %{code: :deadlock_detected}}} =
+               Transaction.run([scope], fn heads ->
+                 send(self(), :retry_attempt)
+                 assert {:ok, 2} = Transaction.append(heads, scope, [change("discard")])
+                 force_abort("40P01")
+               end)
+
+      for _ <- 1..3, do: assert_received(:retry_attempt)
+      refute_received :retry_attempt
+
+      assert {:ok, %{rows: [[1, "stable-operation"]]}} =
+               Transaction.query(
+                 """
+                 SELECT revision, resource_id FROM harklight.stream_changes
+                 WHERE person_id = $1 ORDER BY revision
+                 """,
+                 [elem(scope, 0)]
+               )
+    end
+
+    defp force_abort("40001") do
+      Transaction.query("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = '40001'; END $$", [])
+    end
+
+    defp force_abort("40P01") do
+      Transaction.query("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = '40P01'; END $$", [])
     end
 
     defp change(id) do

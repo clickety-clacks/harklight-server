@@ -4,6 +4,8 @@ defmodule AttentionServer.Repository.Postgres.Transaction do
   alias AttentionServer.Repository.Postgres.Repo
   alias Ecto.Adapters.SQL
 
+  @max_attempts 3
+  @rollback_codes [:deadlock_detected, :serialization_failure]
   @timeout 5_000
   @sql_opts [timeout: @timeout, log: false]
 
@@ -40,11 +42,34 @@ defmodule AttentionServer.Repository.Postgres.Transaction do
   # The caller provides exact heads after resolving the request's authority
   # and resources. All allocation and effects run on the checked-out primary.
   def run(streams, write) when is_function(write, 1) do
+    if Repo.in_transaction?() do
+      {:error, :nested_transaction}
+    else
+      run_attempts(Enum.sort(Enum.uniq(streams)), write, 1)
+    end
+  end
+
+  # Retry only errors where PostgreSQL guarantees rollback. A dropped
+  # connection during COMMIT is ambiguous and must reach the caller so it
+  # can replay the original operation identity through the receipt lookup.
+  defp run_attempts(streams, write, attempt) do
+    case run_once(streams, write) do
+      {:error, %Postgrex.Error{postgres: %{code: code}}}
+      when code in @rollback_codes and attempt < @max_attempts ->
+        Process.sleep(10 * attempt)
+        run_attempts(streams, write, attempt + 1)
+
+      result ->
+        result
+    end
+  end
+
+  defp run_once(streams, write) do
     Repo.transaction(
       fn ->
         with {:ok, _} <- query("SET LOCAL lock_timeout = '2s'", []),
              {:ok, _} <- query("SET LOCAL statement_timeout = '4s'", []),
-             {:ok, heads} <- lock_heads(Enum.sort(Enum.uniq(streams))),
+             {:ok, heads} <- lock_heads(streams),
              {:ok, result} <- write.(heads) do
           result
         else
@@ -53,6 +78,12 @@ defmodule AttentionServer.Repository.Postgres.Transaction do
       end,
       @sql_opts
     )
+  rescue
+    error in Postgrex.Error ->
+      case error.postgres do
+        %{code: code} when code in @rollback_codes -> {:error, error}
+        _ -> reraise error, __STACKTRACE__
+      end
   end
 
   defp lock_heads(streams) do
