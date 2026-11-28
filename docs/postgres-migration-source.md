@@ -763,3 +763,9 @@ future packaged command. It does not install material or activate PostgreSQL.
 The runtime still rejects the validated database, further import writes are
 closed, and migration readiness remains disabled pending command integration
 and the remaining rehearsals.
+
+A loader batch also versions its locked import-state row. If validation began
+before that batch committed, PostgreSQL refuses the older validation snapshot
+with a serialization failure. Retry `validate` with the same bundle and receipt;
+it recomputes every comparison from a fresh snapshot. No report from the failed
+attempt is published or reused.
