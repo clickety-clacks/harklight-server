@@ -40,12 +40,7 @@ defmodule AttentionServer.SkillsBuildTest do
 
       harklight = File.read!(Path.join(output, "harklight/SKILL.md"))
       server_version = Application.spec(:attention_server, :vsn)
-
-      assert String.starts_with?(
-               harklight,
-               "---\nname: harklight\nversion: \"#{server_version}\"\n"
-             )
-
+      assert String.starts_with?(harklight, "---\nname: harklight\nversion: \"#{server_version}\"\n")
       assert harklight =~ "description:"
       assert String.ends_with?(harklight, core)
       assert length(:binary.matches(harklight, core)) == 1
