@@ -13,9 +13,7 @@ defmodule AttentionServer.Migration.ImportMaterial do
          files = Enum.map(Enum.sort(manifest.material), fn {"material/" <> path, info} ->
            %{"path" => path, "size" => info.size, "sha256" => info.sha256}
          end),
-         inventory = %{"version" => 1, "import_id" => id,
-           "source_sha256" => summary.sha256,
-           "schema_sha256" => Base.encode16(schema, case: :lower), "files" => files},
+         inventory = inventory(id, summary.sha256, schema, files),
          bytes = JSON.encode!(inventory),
          :ok <- claim(destination, bytes),
          :ok <- private_parents(Path.join(destination, "files")),
@@ -32,6 +30,11 @@ defmodule AttentionServer.Migration.ImportMaterial do
   rescue
     File.Error -> {:error, :material_file_failure}
   end
+
+  @doc false
+  def inventory(id, source, schema, files), do: %{"version" => 1, "import_id" => id,
+    "source_sha256" => source,
+    "schema_sha256" => Base.encode16(schema, case: :lower), "files" => files}
 
   defp claim(root, bytes) do
     case File.mkdir(root) do

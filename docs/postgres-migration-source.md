@@ -658,8 +658,22 @@ destination membership and recipient rows are not the expected-value oracle.
 This checks reader facts only: upload content, scoped relational links, shared
 message history and HTTP visibility still require their separate validation.
 
+`VerifyMaterial.run/3` validates an already completed private material stage
+without repairing it. It binds both ownership and completion markers to the
+original import/source/schema identity, revalidates the source owner and TLS
+continuity, checks exact directory/file inventory, private modes and file
+checksums, and rechecks the bundle seal. Missing, partial, altered or extra
+material refuses; validation neither copies files nor changes permissions.
+Successful material validation alone does not authorize database activation.
+
 Bundle verification checks the copied source database together with its WAL and
 rollback journal before and after reading bundle contents. Sidecars must be
 absent or empty; a nonempty sidecar refuses even if the main database hash is
 unchanged. All verifiers share this check. It never opens, checkpoints, clears
 or otherwise modifies the copied source to make validation pass.
+
+Material validation must run as the intended Server service account. The staged
+root, every directory, both markers and every file must have that process's
+effective UID and GID, as well as private modes. A foreign owner refuses without
+repair: otherwise a correctly hashed 0600 key could be unreadable after cutover.
+Changing the runtime account is not part of migration validation.
