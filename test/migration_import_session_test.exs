@@ -582,6 +582,13 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             current = Map.get(record, :revision, 1)
             expected = Map.merge(record, %{revision: current, session_handle: Map.get(record, :session_handle), free_order: Map.get(record, :free_order)})
             assert {:ok, ^key, ^expected} = Items.agent_item({person, record.origin}, item)
+            assert {:error, :not_found} = Items.agent_item({person, "synthetic-wrong-origin"}, item)
+            assert {:error, :not_found} = Items.recipient_item("synthetic-wrong-person", item)
+            if AttentionServer.BounceDecision.person_visible?(record) do
+              assert {:ok, ^key, ^expected} = Items.recipient_item(person, item)
+            else
+              assert {:error, :not_found} = Items.recipient_item(person, item)
+            end
             assert {:ok, %{rows: [[^person, ^sender, ^external_id, ^current]]}} = ImportSession.query(db,
               "SELECT person_id,sender_id,message_id,revision FROM harklight.messages WHERE id=$1", [id])
             versions = Map.get(record, :revisions, %{1 => record.message})
@@ -597,6 +604,14 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           _, acc -> {:ok, acc}
         end)
       assert count > 0
+      assert {:ok, attached} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, 0,
+        fn
+          {{:row, :messages, _}, record}, n ->
+            files = record |> Map.get(:files_by_revision, %{}) |> Map.values() |> List.flatten()
+            {:ok, n + length(files)}
+          _, n -> {:ok, n}
+        end)
+      assert attached > 0
       for {table, expected} <- [{"messages", count}, {"message_recipients", count}, {"message_revisions", revisions}] do
         assert {:ok, %{rows: [[^expected]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight." <> table, [])
       end

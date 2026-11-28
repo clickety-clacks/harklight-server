@@ -302,3 +302,10 @@ omit intermediate ones; no timestamp is invented. A schema follow-up must allow
 that absence and represent historical/system origins without creating login
 authority. Shared messages, seen state and conversation/answer projections also
 remain later stages. This is not a full-history conversion or activation command.
+
+The ordinary-record stage checks both origin and recipient item readers,
+including wrong-origin and wrong-person rejection and exact attachment-bearing
+record attributes. It does not populate attachment chunks or attachment link
+rows, per-recipient seen state, conversations or answers. Those stages and their
+field-level reader comparisons are required before import validation and
+activation; this stage's success alone is not a complete history import.
