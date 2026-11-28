@@ -632,6 +632,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:ok, ^uploads_verified} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
 
         verify_revision_files(db, identity, bundle, manifest)
+        verify_item_facts(db, identity, bundle, manifest)
         verify_message_drift(db, identity, bundle)
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
         extra_hash = :crypto.hash(:sha256, "")
@@ -1523,6 +1524,49 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "DELETE FROM harklight.message_revisions WHERE message_id=$1 AND revision=999", [id])
       assert {:ok, ^verified} = VerifyMessages.run(db, identity, bundle)
       assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+    end
+
+    defp verify_item_facts(db, identity, bundle, manifest) do
+      alias AttentionServer.{Engine, AgentAPI.FeedActivity, ClientAPI.Resources}
+      alias AttentionServer.Migration.ImportItemFacts
+      assert {:ok, _} = ImportSession.query(db, """
+        CREATE FUNCTION harklight.fail_item_facts() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.family='ordinary_item_availability' THEN RAISE EXCEPTION 'synthetic interruption'; END IF; RETURN NEW; END $$
+        """, [])
+      assert {:ok, _} = ImportSession.query(db,
+        "CREATE TRIGGER fail_item_facts BEFORE INSERT ON harklight.compatibility_facts FOR EACH ROW EXECUTE FUNCTION harklight.fail_item_facts()", [])
+      assert {:error, _} = ImportItemFacts.run(db, identity, bundle)
+      assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "messages/item-facts/v1")
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.compatibility_facts WHERE family IN ('ordinary_item_files','ordinary_item_availability')", [])
+      assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_item_facts ON harklight.compatibility_facts", [])
+      assert :ok = ImportItemFacts.run(db, identity, bundle)
+      assert :ok = ImportItemFacts.run(db, identity, bundle)
+      assert {:ok, source} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, %Engine{}, fn
+        {{:field, field}, value}, engine -> {:ok, Map.put(engine, field, value)}
+        {{:row, field, key}, value}, engine -> {:ok, Map.update!(engine, field, &Map.put(&1, key, value))}
+      end)
+      source = Engine.rebuild_route_b_index(source)
+      assert Enum.any?(source.messages, fn {_, record} -> is_binary(Map.get(record, :session_handle)) end)
+      for {{person, _, _} = key, record} <- source.messages do
+        expected = Resources.item(source, key, %{"key" => "synthetic-rank"})
+        assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+          "SELECT body FROM harklight.compatibility_facts WHERE family='ordinary_item_files' AND address=$1",
+          [Attributes.key({person, Resources.item_id(record), record.revision})])
+        assert {:ok, files} = Attributes.decode(body)
+        assert files == expected["files"]
+        assert {:ok, %{rows: rows}} = ImportSession.query(db,
+          "SELECT body FROM harklight.compatibility_facts WHERE family='ordinary_item_availability' AND address=$1",
+          [Attributes.key({person, Resources.item_id(record)})])
+        if is_binary(Map.get(record, :session_handle)) do
+          assert [[body]] = rows
+          assert {:ok, {status, stamp}} = Attributes.decode(body)
+          assert FeedActivity.render_committed(status, stamp) == expected["availability"]
+        else
+          assert rows == []
+          refute Map.has_key?(expected, "availability")
+        end
+      end
     end
 
     defp verify_revision_files(db, identity, bundle, manifest) do
