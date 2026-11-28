@@ -67,6 +67,7 @@ defmodule AttentionServer.Migration.ImportSession do
            :ok <- owns_loading(rows, identity),
            {:ok, current} <- read_checkpoint(db, identity.id, family),
            true <- current == expected,
+           :ok <- touch_loading(db, identity),
            :ok <- write.(db, entries),
            next = advance(current, entries),
            {:ok, _} <-
@@ -90,6 +91,22 @@ defmodule AttentionServer.Migration.ImportSession do
   end
 
   def batch(_, _, _, _, _, _), do: {:error, :invalid_import_batch}
+
+  # FOR UPDATE alone does not invalidate a waiting repeatable-read snapshot.
+  # Give every committed batch a new row version without changing custody. A
+  # validator whose snapshot predates this commit must fail serialization and
+  # retry the complete validation, rather than publish a stale comparison.
+  defp touch_loading(db, %{id: id, source: source, schema: schema}) do
+    case query(db, """
+      UPDATE harklight.import_state SET phase=phase
+      WHERE singleton=true AND import_id=$1 AND source_sha256=$2 AND schema_sha256=$3
+        AND phase='loading'
+      """, [id, source, schema]) do
+      {:ok, %{num_rows: 1}} -> :ok
+      {:error, _} = error -> error
+      _ -> {:error, :import_identity_or_phase_mismatch}
+    end
+  end
 
   def advance(%{ordinal: ordinal, digest: digest}, entries) do
     Enum.reduce(entries, %{ordinal: ordinal, digest: digest}, fn entry, current ->
