@@ -1,8 +1,8 @@
 defmodule AttentionServer.Repository.Postgres.Schema do
   @moduledoc false
 
-  @migration_files ["001_initial.sql", "002_message_history.sql"]
-  @version 2
+  @migration_files ["001_initial.sql", "002_message_history.sql", "003_large_text.sql"]
+  @version 3
 
   def version, do: @version
 
