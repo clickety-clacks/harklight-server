@@ -142,11 +142,10 @@ defmodule AttentionServer.ClientAPI.Reads do
   @doc false
   def get_postgres_settings(conn, %Context{}) do
     result =
-      with [] <- get_req_header(conn, "authorization"),
-           cookie when is_binary(cookie) <- AttentionServer.ClientAPI.Auth.browser_cookie(conn) do
-        AttentionServer.Repository.Postgres.Settings.browser(cookie)
-      else
-        _ -> {:error, :unauthorized}
+      case AttentionServer.ClientAPI.Auth.web_credential(conn) do
+        {:browser, cookie} -> AttentionServer.Repository.Postgres.Settings.browser(cookie)
+        {:native, bearer} -> AttentionServer.Repository.Postgres.Settings.native(bearer)
+        :missing -> {:error, :unauthorized}
       end
 
     respond(conn, result, &etag(&1["settings"]))

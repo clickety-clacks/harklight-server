@@ -3,7 +3,7 @@ defmodule AttentionServer.Repository.Postgres.Settings do
 
   alias AttentionServer.{BounceDecision, BrowserAuth}
   alias AttentionServer.ClientAPI.Resources
-  alias AttentionServer.Repository.Postgres.{Attributes, Identities, Transaction}
+  alias AttentionServer.Repository.Postgres.{Attributes, Identities, NativeSessions, Transaction}
 
   @settings_sql """
     SELECT person.settings, person.delivery_state, stream.head, stream.seed_revision,
@@ -30,6 +30,19 @@ defmodule AttentionServer.Repository.Postgres.Settings do
     with {:ok, view} <- read_view(Identities.browser_scope_sql(), params) do
       {:ok, render(view)}
     end
+  end
+
+  def native(bearer) do
+    Transaction.snapshot(fn ->
+      with {:ok, %{person_id: person, device_id: device}} <- NativeSessions.resolve(bearer),
+           {:ok, row} <- for_person(person),
+           {:ok, push} <- push_binding(person, device) do
+        {:ok, render(row, %{kind: :device, key: device}, push)}
+      else
+        {:error, :storage_unavailable} -> {:error, :retry_later}
+        {:error, _} = error -> error
+      end
+    end)
   end
 
   def check_active(person) do
@@ -79,6 +92,26 @@ defmodule AttentionServer.Repository.Postgres.Settings do
     end
   end
 
+  defp push_binding(person, device) do
+    case Transaction.query(
+           "SELECT body FROM harklight.compatibility_facts WHERE family = 'push_bindings' AND address = $1",
+           [Attributes.key({:row, :push_bindings, {person, device}})]
+         ) do
+      {:ok, %{rows: [[attrs]]}} ->
+        with {:ok, binding} <- Attributes.decode(attrs) do
+          {:ok, %{device => Resources.push_status(binding)}}
+        else
+          _ -> {:error, :storage_unavailable}
+        end
+
+      {:ok, %{rows: []}} ->
+        {:ok, %{}}
+
+      {:error, _} ->
+        {:error, :storage_unavailable}
+    end
+  end
+
   defp view(attrs, head, seed, revision, epoch, history?) do
     with {:ok, settings} when is_map(settings) <- decode_settings(attrs) do
       # FORMAT32 can have an implicit epoch before its first logged change.
@@ -90,14 +123,16 @@ defmodule AttentionServer.Repository.Postgres.Settings do
     end
   end
 
-  def render(%{head: head, revision: revision, attributes: settings}) do
+  def render(view), do: render(view, %{kind: :browser, key: nil}, %{})
+
+  defp render(%{head: head, revision: revision, attributes: settings}, principal, push) do
     levels = BounceDecision.levels_from_configuration(Map.get(settings, :bounce_levels))
     alerts = Map.get(settings, :alert_choices, "important")
 
     payload =
-      Resources.settings_payload(levels, alerts, %{})
+      Resources.settings_payload(levels, alerts, push)
       |> Resources.stamp(revision)
-      |> then(&Resources.render(:settings, &1, %{kind: :browser, key: nil}))
+      |> then(&Resources.render(:settings, &1, principal))
 
     %{"rev" => head, "settings" => payload}
   end
