@@ -594,3 +594,11 @@ Runtime role membership, elevated role powers, database CREATE or public/app
 schema CREATE privileges refuse preparation before any DDL, including when no
 schema update is needed. Isolated tests can supply an explicit trusted role pair
 through `PrepareSchema.run/3`; production wiring uses the installer contract.
+
+The loading-only `ImportSharedReaderFacts.run/3` projection publishes explicit
+shared read-access booleans, per-recipient historical group capability and frozen
+revision, and ordered raw revision file descriptors. Separate checkpoints cover
+people, organization membership, sender history and recipient history. These
+facts retain access after group deletion without recreating a group or principal.
+A failed recipient batch rolls its facts and checkpoint back together. Actual
+bounded reader and HTTP parity remain required before activation.

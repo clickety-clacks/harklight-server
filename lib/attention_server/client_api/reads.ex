@@ -36,7 +36,7 @@ defmodule AttentionServer.ClientAPI.Reads do
   alias AttentionServer.ClientAPI.{Context, Errors, PeopleProfiles, Projection, Resources, Search, SharedAttachments, SharedCapability, SharedContinuation, SharedReads}
   alias AttentionServer.ClientAPI.Auth
   alias AttentionServer.Repository.RecipientItems
-  alias AttentionServer.Repository.Postgres.{Identities, Settings, Transaction}
+  alias AttentionServer.Repository.Postgres.{Identities, Settings, SharedAccess, Transaction}
 
   # The client features still behind an operator flag at 0.2 (contract §4).
   @client_features ~w(server_matched_push_routing priority_level_editing)
@@ -121,9 +121,9 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
-  def get_postgres_item(conn, %Context{params: %{item_id: item}}, auth \\ :web) do
+  def get_postgres_item(conn, %Context{params: %{item_id: item}} = ctx, auth \\ :web) do
     result =
-      postgres_item_read(conn, auth, fn principal ->
+      postgres_item_read(conn, ctx, auth, fn principal ->
         RecipientItems.item(:postgres, postgres_render_principal(principal), item)
       end)
 
@@ -149,9 +149,13 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
-  def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}}, auth \\ :web) do
+  def get_postgres_revision(conn, %Context{} = ctx),
+    do: get_postgres_revision(conn, ctx, :browser)
+
+  @doc false
+  def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}} = ctx, auth) do
     result =
-      postgres_item_read(conn, auth, fn %{person: person} ->
+      postgres_item_read(conn, ctx, auth, fn %{person: person} ->
         with {:ok, revision} <- revision_number(raw_revision) do
           RecipientItems.revision(:postgres, person, item, revision)
         end
@@ -160,18 +164,29 @@ defmodule AttentionServer.ClientAPI.Reads do
     respond_streamed(conn, result)
   end
 
-  defp postgres_item_read(conn, auth, read) do
+  defp postgres_item_read(conn, ctx, auth, read) do
     Transaction.snapshot(fn ->
       with {:ok, %{kind: kind, person: person} = principal} when kind in [:browser, :device] <-
              postgres_item_authority(conn, auth),
-           :ok <- Settings.check_active(person) do
+           :ok <- Settings.check_active(person),
+           {:ok, capability} <- SharedCapability.parse(conn),
+           :ok <- SharedAccess.check(person, capability, ctx.shared_features) do
         read.(principal)
       else
         {:ok, _agent} -> {:error, :not_found}
         {:error, :unavailable} -> {:error, :retry_later}
+        {:error, token, field} -> {:error, {token, field}}
         {:error, _} = error -> error
       end
     end)
+  end
+
+  defp postgres_item_authority(conn, :browser) do
+    case Auth.web(conn, Identities, :postgres) do
+      {:ok, %{kind: :browser}} = browser -> browser
+      {:ok, _native} -> {:error, :not_found}
+      error -> error
+    end
   end
 
   defp postgres_item_authority(conn, :web), do: Auth.web(conn, Identities, :postgres)
@@ -278,6 +293,9 @@ defmodule AttentionServer.ClientAPI.Reads do
 
   defp respond_streamed(conn, {:ok, body}),
     do: Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
+
+  defp respond_streamed(conn, {:error, {token, field}}) when is_binary(token),
+    do: respond(conn, {:error, token, field})
 
   defp respond_streamed(conn, error), do: respond(conn, error)
 
