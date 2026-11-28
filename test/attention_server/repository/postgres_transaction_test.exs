@@ -47,7 +47,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       start_supervised!({Pool, config})
       assert :ok = Transaction.verify_ready()
 
-      for person <- ["synthetic-one", "synthetic-two", "retry-person"] do
+      for person <- ["synthetic-one", "synthetic-two", "retry-person", "lock-a", "lock-b"] do
         assert {:ok, _} =
                  Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
       end
@@ -104,30 +104,126 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                )
     end
 
+    test "reversed multi-stream inputs wait on the same first lock" do
+      left = {"lock-a", ""}
+      right = {"lock-b", ""}
+      observer = self()
+
+      assert {:ok, _} = Transaction.run([left, right], fn heads -> {:ok, heads} end)
+
+      blocker =
+        Task.async(fn ->
+          Transaction.run([left], fn _heads ->
+            send(observer, :left_locked)
+            receive do: (:release_left -> {:ok, :released})
+          end)
+        end)
+
+      assert_receive :left_locked, 2_000
+
+      reversed =
+        Task.async(fn ->
+          Transaction.run([right, left], fn heads ->
+            assert Map.keys(heads) |> Enum.sort() == [left, right]
+            {:ok, :reversed}
+          end)
+        end)
+
+      await_stream_lock_wait(100)
+
+      # A caller using the original reverse order would already hold right.
+      assert {:ok, :right_available} =
+               Transaction.run([], fn _ ->
+                 assert {:ok, %{rows: [[0]]}} =
+                          Transaction.query(
+                            """
+                            SELECT head FROM harklight.stream_heads
+                            WHERE person_id = $1 AND origin_key = $2 FOR UPDATE NOWAIT
+                            """,
+                            Tuple.to_list(right)
+                          )
+
+                 {:ok, :right_available}
+               end)
+
+      forward =
+        Task.async(fn ->
+          Transaction.run([left, right], fn heads ->
+            assert Map.keys(heads) |> Enum.sort() == [left, right]
+            {:ok, :forward}
+          end)
+        end)
+
+      send(blocker.pid, :release_left)
+      assert {:ok, :released} = Task.await(blocker)
+      assert {:ok, :reversed} = Task.await(reversed)
+      assert {:ok, :forward} = Task.await(forward)
+    end
+
+    defp await_stream_lock_wait(0), do: flunk("request did not reach the held stream lock")
+
+    defp await_stream_lock_wait(remaining) do
+      assert {:ok, %{rows: [[waiting?]]}} =
+               Transaction.query(
+                 """
+                 SELECT EXISTS (
+                   SELECT 1 FROM pg_stat_activity
+                   WHERE wait_event_type = 'Lock'
+                     AND query LIKE '%harklight.stream_heads%'
+                 )
+                 """,
+                 []
+               )
+
+      unless waiting? do
+        Process.sleep(10)
+        await_stream_lock_wait(remaining - 1)
+      end
+    end
+
     test "known transaction aborts retry without carrying previous writes forward" do
       scope = {"retry-person", ""}
       attempt = make_ref()
 
-      assert {:ok, 1} =
+      operation = "stable-operation"
+
+      assert {:ok, {^operation, 1}} =
                Transaction.run([scope], fn heads ->
-                 assert {:ok, 1} = Transaction.append(heads, scope, [change("stable-operation")])
+                 assert {:ok, 1} = Transaction.append(heads, scope, [change(operation)])
 
                  if Process.put(attempt, true) do
-                   {:ok, 1}
+                   {:ok, {operation, 1}}
                  else
                    force_abort("40001")
                  end
                end)
 
-      assert {:error, %Postgrex.Error{postgres: %{code: :deadlock_detected}}} =
+      # Dispatch only after committed success. Both attempts return database
+      # work to this caller, and no callback invokes the dispatch.
+      dispatch = fn identity ->
+        assert {:ok, %{rows: [[1]]}} =
+                 Transaction.query(
+                   "SELECT head FROM harklight.stream_heads WHERE person_id = $1",
+                   [elem(scope, 0)]
+                 )
+
+        send(self(), {:dispatched, identity})
+      end
+
+      dispatch.(operation)
+      assert_receive {:dispatched, ^operation}
+      refute_received {:dispatched, _}
+
+      exhaustion = make_ref()
+      assert {:error, :storage_unavailable} =
                Transaction.run([scope], fn heads ->
-                 send(self(), :retry_attempt)
+                 Process.put(exhaustion, Process.get(exhaustion, 0) + 1)
                  assert {:ok, 2} = Transaction.append(heads, scope, [change("discard")])
                  force_abort("40P01")
                end)
 
-      for _ <- 1..3, do: assert_received(:retry_attempt)
-      refute_received :retry_attempt
+      assert Process.delete(exhaustion) == 3
+      refute_received {:dispatched, _}
 
       assert {:ok, %{rows: [[1, "stable-operation"]]}} =
                Transaction.query(

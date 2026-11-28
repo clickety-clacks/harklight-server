@@ -39,8 +39,15 @@ defmodule AttentionServer.Repository.Postgres.Transaction do
     end
   end
 
-  # The caller provides exact heads after resolving the request's authority
-  # and resources. All allocation and effects run on the checked-out primary.
+  @doc """
+  Runs replayable database work on the primary with the supplied stream locks.
+
+  Allocate operation identity and other request inputs before building the
+  callback. It may run more than once. It may read and change the checked-out
+  database, including writing durable job intents. Dispatch notifications,
+  providers, and other external effects only after this function returns a
+  committed success.
+  """
   def run(streams, write) when is_function(write, 1) do
     if Repo.in_transaction?() do
       {:error, :nested_transaction}
@@ -58,6 +65,9 @@ defmodule AttentionServer.Repository.Postgres.Transaction do
       when code in @rollback_codes and attempt < @max_attempts ->
         Process.sleep(10 * attempt)
         run_attempts(streams, write, attempt + 1)
+
+      {:error, %Postgrex.Error{postgres: %{code: code}}} when code in @rollback_codes ->
+        {:error, :storage_unavailable}
 
       result ->
         result
