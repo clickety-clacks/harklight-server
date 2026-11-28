@@ -114,8 +114,15 @@ def sql(statement):
 
 
 sql('''CREATE FUNCTION public.migration_rehearsal_pause() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN PERFORM pg_sleep(12); RETURN NEW; END $$;
-CREATE TRIGGER migration_rehearsal_pause BEFORE INSERT ON harklight.people
+BEGIN
+  IF (SELECT count(*) FROM harklight.people) <> 1 OR
+     NOT EXISTS (SELECT 1 FROM harklight.people WHERE id = NEW.id) THEN
+    RAISE EXCEPTION 'rehearsal expected one transaction-local inserted person';
+  END IF;
+  PERFORM pg_sleep(12);
+  RETURN NEW;
+END $$;
+CREATE TRIGGER migration_rehearsal_pause AFTER INSERT ON harklight.people
 FOR EACH ROW EXECUTE FUNCTION public.migration_rehearsal_pause();''')
 with (root / 'interrupted.stdout').open('wb') as out, (root / 'interrupted.stderr').open('wb') as err:
     process = subprocess.Popen([str(cli), 'import', *map(str, args)], env=env,
@@ -130,6 +137,9 @@ with (root / 'interrupted.stdout').open('wb') as out, (root / 'interrupted.stder
             if time.monotonic() >= deadline:
                 raise RuntimeError('import did not reach the bounded interruption point')
             time.sleep(0.1)
+        # PgSleep is reached only after the AFTER INSERT trigger has asserted
+        # the importing transaction sees its newly written row. Other sessions
+        # must still see zero, both here and after the killed batch rolls back.
         committed = int(sql("SELECT last_ordinal FROM harklight.import_checkpoints WHERE family='records'"))
         assert committed > 0
         assert sql('SELECT count(*) FROM harklight.people') == '0'
@@ -174,7 +184,7 @@ report = {'result': 'pass', 'scope': 'packaged-staged-import-and-format32-rollba
                        'text_bytes_per_message': seed['text_bytes_per_message']},
           'activation': False, 'timings_ms': timings,
           'interruption': {'signal': 'SIGKILL', 'committed_source_records': committed,
-                           'uncommitted_people': 0, 'resumed': True},
+                           'people_inside_transaction': 1, 'people_after_rollback': 0, 'resumed': True},
           'file_bytes': {'source': size(source), 'backup': size(backup), 'bundle': size(bundle),
                          'material': size(Path(str(receipt) + '.material'))},
           'limits': ['synthetic 300-message measurement, not a capacity forecast',
