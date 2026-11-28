@@ -570,6 +570,127 @@ agent directory before it is sent, it needs a deliberate ANSWER confirmation,
 and rerunning the same command replays a committed answer instead of writing a
 second one. It carries no source ruling authority.
 
+## Optional PostgreSQL storage (opt-in preparation)
+
+**Status: opt-in and off by default.** Harklight Server still stores everything
+in SQLite exactly as described elsewhere in this guide, and a Server started
+without `ATTENTION_SERVER_STORE_BACKEND=postgres` behaves as it did before. The
+`harklight-postgres` command described here prepares and protects a PostgreSQL
+database for the planned PostgreSQL storage backend. It does not migrate your
+existing SQLite data, and it changes nothing until you run it. Do not enable
+the backend on a Server that holds data you need until a release states that
+migration and adoption are available. Migration and adoption have not shipped.
+
+Tested platform: Linux x86_64 with PostgreSQL 16 from Ubuntu 24.04, run as the
+same unprivileged user as Harklight Server. The command requires PostgreSQL 16
+or newer (`postgresql` package, including the client programs) and refuses an
+older version. It was tested only with 16 and says so when it finds a newer one.
+
+### One local PostgreSQL for a one-machine install
+
+    "$PACKAGE/bin/harklight-postgres" preflight --root "$HOME/.local/share/harklight-server"
+    "$PACKAGE/bin/harklight-postgres" setup     --root "$HOME/.local/share/harklight-server"
+
+`preflight` checks, without changing anything: Linux x86_64, PostgreSQL
+version, that the PostgreSQL programs exist, that the state directory exists,
+that the data location is absent, that the loopback port is free, that the
+systemd user manager is available, and free disk space under the install root
+(at least 2 GiB, or 1 GiB plus three times the existing state, or the value of
+`--min-free-mb`). `setup` runs the same checks and then creates, in
+`ROOT/postgres/`, one dedicated cluster: its own data directory, `scram-sha-256`
+authentication, listening on `127.0.0.1` only (default port 15432, not the
+usual 5432, so it does not collide with a PostgreSQL you already run), a
+private password file per role, and a `harklight-postgres.service` user service
+with automatic restart. It orders `harklight-server.service` after it. It never
+reuses an existing data directory and never touches another PostgreSQL on the
+machine; if setup fails partway it removes only what that run created.
+
+**Two roles.** `harklight_migrator` owns the `harklight` database and schema and
+is the only role that runs migrations and import activation. `harklight` is the
+runtime login the Server uses: it owns nothing, and can only read and write
+application data (SELECT, INSERT, UPDATE, DELETE) and read the lifecycle tables
+`schema_migrations`, `import_state` and `server_identity`. It cannot TRUNCATE,
+ALTER, DROP, create objects or disable triggers, so it cannot bypass the import
+lifecycle guard. Setup proves this by really trying each of those actions as the
+runtime role in a throwaway schema, and refuses to finish if any succeeds.
+Migration-role credentials live in `ROOT/postgres/` with mode 0600, outside the
+state directory; never copy them into `server.env`. Setup writes only the
+runtime connection to `STATE/postgres.env` and prints it. It does not edit
+`server.env`. The public address, TLS and client enrollment flow are unchanged.
+
+After the migration creates the schema, run
+
+    "$PACKAGE/bin/harklight-postgres" apply-grants
+    "$PACKAGE/bin/harklight-postgres" verify-roles
+
+`apply-grants` gives the runtime role its privileges on the schema and
+re-restricts the lifecycle tables; run it after every migration that adds
+tables. `verify-roles` refuses (exit 1, naming each problem) if the runtime role
+is a superuser or has other privileged attributes, is a member of another role,
+owns or can act as owner of any table, can TRUNCATE or write lifecycle tables,
+or can create schemas or objects.
+
+### An operator-supplied PostgreSQL instead
+
+    "$PACKAGE/bin/harklight-postgres" setup \
+      --remote-url postgres://harklight@db.example.net:5432/harklight?sslmode=verify-full \
+      --password-file /path/to/runtime-password-file \
+      --migrator-url postgres://harklight_migrator@db.example.net:5432/harklight?sslmode=verify-full \
+      --migrator-password-file /path/to/migrator-password-file --ca-file /path/to/server-ca.pem
+
+Create an empty database, a separate owner role and a non-owner runtime role
+first. Setup connects as both, requires PostgreSQL 16 or newer, refuses a
+database that already holds any objects (it is never repurposed), refuses a
+runtime role that is the same as the owner or privileged, and runs the same
+privilege-boundary test as the local setup. Both URLs may carry no password and
+no query except `sslmode=verify-full` (or `sslmode=disable` on a loopback host);
+any other parameter is refused. Like the Server, the commands verify TLS for
+any non-loopback host, with or without `sslmode` in the URL, and never fall back
+to an unencrypted connection; give `--ca-file` when the certificate is not in
+the system trust store. Password and CA paths must be absolute.
+Availability, replication and the network path of that database are yours to
+operate.
+
+### Backup and restore: one command each
+
+    "$PACKAGE/bin/harklight-postgres" backup  /safe/place/harklight-2026-11-28.tar
+    "$PACKAGE/bin/harklight-postgres" restore /safe/place/harklight-2026-11-28.tar --replace
+
+Stop Harklight Server first; both commands refuse to run while
+`harklight-server.service` is active. `backup` writes one mode-0600 archive
+holding a PostgreSQL dump of the Harklight database, the whole state directory
+(configuration, TLS and owner keys, every other file Harklight keeps there,
+including any `*.password` file), copies of any regular files `server.env`
+points at outside the state directory (for example a certificate or key kept
+elsewhere), and SHA-256 checksums of all of it. If `server.env` points at
+something outside the state directory that cannot be captured (a directory, an
+unreadable file), `backup` refuses and names it rather than writing an
+incomplete backup. It checks free space first and never overwrites an existing
+file. The archive contains private keys: store it like the state directory
+itself. Only `postgres.env` and the cluster's own database passwords are left
+out, because they belong to the cluster, not the data; an operator-supplied
+database's password file is yours to keep.
+
+`restore` verifies the checksums and the archive's contents before changing
+anything. A database that already holds data is refused unless you pass
+`--replace`; files outside the state directory that already exist with different
+content are refused the same way, and with `--replace` they are kept beside as
+`NAME.pre-restore-TIMESTAMP`; with it, the local database is dropped and recreated so nothing
+from before survives. It then re-applies the runtime role's grants and checks
+the role boundary. The state directory is replaced only after the database
+restored cleanly, and the previous one is kept beside it as
+`state.pre-restore-TIMESTAMP`. To restore on a new machine, create an empty
+private state directory (`mkdir -m 700 "$STATE"`), run `preflight` and `setup`,
+then run `restore`; it replaces that empty directory with the archived state.
+Run `harklight-postgres status` afterwards.
+
+What this does not cover: the existing SQLite store, which still needs the
+stopped-state backup described under "Upgrade or rollback"; the installer's
+pre-upgrade backup deliberately excludes `ROOT/postgres` and does not back up
+or restore the database. Backup and restore round trips were exercised only with the
+schema v1 definition plus synthetic rows, never with real Harklight data or a
+running Server.
+
 ## Upgrade or rollback
 
 ### Releases that write FORMAT32
