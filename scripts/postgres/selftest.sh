@@ -107,7 +107,7 @@ fi
 ok "cluster refuses non-loopback connections"
 
 # Real schema migration as the owner role, then grants for the runtime role.
-m -f "$here/../../priv/postgres/001_initial.sql" >/dev/null
+for migration in "$here"/../../priv/postgres/*.sql; do m -f "$migration" >/dev/null; done   # ordered explicit migrations, as the migrator job applies them
 expect_fail "apply-grants refuses a missing schema" "does not exist yet" "$tool" apply-grants "${args[@]}" --schema nosuchschema
 "$tool" apply-grants "${args[@]}" >/dev/null
 q -c "select count(*) from harklight.import_state" >/dev/null
