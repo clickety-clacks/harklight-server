@@ -9,6 +9,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     alias AttentionServer.ClientAPI.{Idempotency, Writes}
 
     @receipt_at 1_700_000_000_000
+    @ordinary_entry_upload "97000000-0000-4000-8000-000000000001"
     @original_json ~s({ "synthetic" : true })
 
     for epoch <- [1, 17] do
@@ -651,6 +652,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         verify_recipient_drift(db, identity, bundle)
         verify_authority_drift(db, identity, bundle)
         verify_conversation_drift(db, identity, bundle)
+        verify_ordinary_entry_uploads(db, identity, bundle)
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
         extra_hash = :crypto.hash(:sha256, "")
         assert {:ok, _} = ImportSession.query(db,
@@ -1117,9 +1119,19 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       {actor, _} = Enum.find(store.engine.devices, fn {device, principal} ->
         principal.person == person and not principal.revoked and device != record.origin
       end)
+      bytes = "synthetic ordinary entry attachment"
+      metadata = %{id: @ordinary_entry_upload, person: person, uploader: actor,
+        op_id: "96000000-0000-4000-8000-000000000001", sender_id: sender,
+        message_id: external, revision: record.revision, name: "entry.txt",
+        size: byte_size(bytes), sha256: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower),
+        last_activity_ms: 1_700_000_000_000}
+      File.write!(Path.join(store.upload_dir, @ordinary_entry_upload), bytes)
       {engine, :ok, touched} = Engine.with_touches(store.engine, fn engine ->
+        engine = Engine.put_row(engine, :uploads, @ordinary_entry_upload, metadata)
         discussion = %{"type" => "discussion", "sender_id" => sender, "message_id" => external,
           "request_revision" => record.revision, "text" => "Synthetic multi-page conversation",
+          "files" => [%{"name" => "inline.txt", "data_base64" => Base.encode64("inline")},
+            %{"name" => metadata.name, "upload_id" => metadata.id, "size" => metadata.size, "sha256" => metadata.sha256}],
           "op_id" => "96000000-0000-4000-8000-000000000001"}
         {engine, {:ok, turn}} = Engine.request_command(engine, actor, discussion, record.accepted_at + 10)
         in_reply_to = String.to_integer(turn["event_id"])
@@ -1544,6 +1556,41 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     defp assert_stream_change(db, person, origin, kind, id, rev, session, at) do
       assert {:ok, %{rows: [[^kind, ^id, ^session, ^at]]}} = ImportSession.query(db,
         "SELECT resource_kind,resource_id,session_handle,created_at_ms FROM harklight.stream_changes WHERE person_id=$1 AND origin_key=$2 AND revision=$3", [person, origin, rev])
+    end
+
+    defp verify_ordinary_entry_uploads(db, identity, bundle) do
+      alias AttentionServer.Migration.ImportEntryUploads
+      assert {:ok, %{rows: [[owner, person, attrs, completed]]}} = ImportSession.query(db,
+        "SELECT owner_key,person_id,attributes,completed_at_ms FROM harklight.uploads WHERE id=$1", [@ordinary_entry_upload])
+      assert {:ok, %{rows: [[other_person]]}} = ImportSession.query(db,
+        "SELECT id FROM harklight.people WHERE id<>$1 LIMIT 1", [person])
+      assert {:error, :synthetic_missing_upload} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, _} = ImportSession.query(tx, "DELETE FROM harklight.uploads WHERE id=$1", [@ordinary_entry_upload])
+        assert {:error, :ordinary_entry_upload_scope_mismatch} = ImportEntryUploads.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_missing_upload)
+      end)
+      for {column, bad, good} <- [
+        {"person_id", other_person, person},
+        {"owner_key", "synthetic-wrong-owner", owner},
+        {"attributes", %{}, attrs},
+        {"completed_at_ms", nil, completed}
+      ] do
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.uploads SET " <> column <> "=$2 WHERE id=$1", [@ordinary_entry_upload, bad])
+        assert {:error, :ordinary_entry_upload_scope_mismatch} = ImportEntryUploads.run(db, identity, bundle)
+        assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "ordinary/entry-uploads/v1")
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.conversation_entry_uploads", [])
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.uploads SET " <> column <> "=$2 WHERE id=$1", [@ordinary_entry_upload, good])
+      end
+      assert :ok = ImportEntryUploads.run(db, identity, bundle)
+      assert :ok = ImportEntryUploads.run(db, identity, bundle)
+      assert {:ok, %{rows: [[1, file, ^person, body]]}} = ImportSession.query(db,
+        "SELECT u.ordinal,u.attributes,m.person_id,e.body FROM harklight.conversation_entry_uploads u JOIN harklight.conversation_entries e ON e.conversation_id=u.conversation_id AND e.id=u.entry_id JOIN harklight.conversations c ON c.id=e.conversation_id JOIN harklight.messages m ON m.id=c.message_id WHERE u.upload_id=$1", [@ordinary_entry_upload])
+      assert {:ok, event} = Attributes.decode(body)
+      assert {:ok, descriptor} = Attributes.decode(file)
+      assert descriptor == Enum.at(event.payload["files"], 1)
+      assert hd(event.payload["files"])["tier"] == "inline"
     end
 
     defp verify_auth_drift(db, identity, bundle) do
