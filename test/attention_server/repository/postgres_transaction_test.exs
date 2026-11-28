@@ -1995,7 +1995,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, _} =
                Transaction.query("INSERT INTO harklight.conversations VALUES ('complete-item', 'complete-item', $1)", [Attributes.encode(chat)])
       availability = item["availability"]
-      put_summary_fact("item_availability", {:row, :item_availability, key}, {
+      put_summary_fact("ordinary_item_availability", {person, "i1"}, {
         availability["state"], availability["last_detached_at_ms"]
       })
       assert %{status: 503} = Reads.get_postgres_item(conn, ctx)

@@ -81,8 +81,12 @@ defmodule AttentionServer.Repository.Postgres.ItemSummaryFacts do
                        WHERE family = 'client_rank_state' AND address = $3),
                     (SELECT body FROM harklight.compatibility_facts
                        WHERE family = 'client_ranks' AND address = $4),
-                    (SELECT body FROM harklight.compatibility_facts
-                       WHERE family = 'item_availability' AND address = $5)
+                    coalesce(
+                      (SELECT body FROM harklight.compatibility_facts
+                         WHERE family = 'ordinary_item_availability' AND address = $4),
+                      (SELECT body FROM harklight.compatibility_facts
+                         WHERE family = 'item_availability' AND address = $5)
+                    )
              """,
              addresses
            ),
