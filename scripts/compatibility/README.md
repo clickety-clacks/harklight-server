@@ -22,7 +22,10 @@ Relay. No arguments, return values, messages, dictionaries or stored payloads
 are collected. No diagnostics are automatically enabled on startup.
 
 The report contains coverage counts, aggregate Relay/linked-process MFA stacks,
-Relay queue samples and per-function runtime counters. Missing function matches
+Relay queue samples and Relay-only per-function runtime counters. Each target
+function retains at most one VM timing row, regardless of persistence-worker
+churn. Workers are sampled for stacks, never given inherited timing hooks; worker
+SQL runtimes therefore are not included in the counters. Missing function matches
 are missing coverage, not zero cost. Runtime counters are not wall latency;
 traced callees have separate attribution. Linked stacks include the supervisor,
 so separate that denominator from the Relay and persistence-worker samples.
@@ -45,8 +48,7 @@ reject an incomplete capture. Delete the fixture directory after retaining the
 report. This is a small matched overhead smoke, not a multi-organization stream
 capacity benchmark or release-history gate. It starts no listener or provider.
 
-One isolated 2 CPU / 4 GiB run on OTP 28.5 / Elixir 1.19.5 measured 4.4%,
-30.9% and 37.6% longer send bands with capture enabled (three paired 100-send
-bands, after equal warm-up). These short runs are noisy and are not a capacity
-prediction. Capture is an intrusive measurement: keep it opt-in and compare a
-matched disabled run for every workload. The disabled path installs no hooks.
+Capture changes scheduling and its overhead depends on the workload and runtime.
+The package fixture records paired timings instead of assuming a universal
+percentage. Short bands can be noisy; retain all pairs and use the same budget
+for each. Disabled capture installs no hooks.
