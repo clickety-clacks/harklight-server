@@ -2232,16 +2232,23 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       on_exit(fn -> File.rm_rf!(certs) end)
       der = TLSFixtures.certificate_der!(certs, "a1")
       assert {:ok, certificate} = DeviceIdentity.from_certificate(der)
+      outsider_der = TLSFixtures.certificate_der!(certs, "b1")
+      assert {:ok, outsider_certificate} = DeviceIdentity.from_certificate(outsider_der)
 
       assert :ok = Relay.setup_person(relay, other_person)
       assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [other_person])
-      for {p, device} <- [{person, native}, {person, certificate}, {other_person, other_device}] do
+      for {p, device} <- [
+            {person, native}, {person, certificate}, {other_person, other_device},
+            {other_person, outsider_certificate}
+          ] do
         assert :ok = Relay.setup_device(relay, p, device)
         assert {:ok, _} =
                  Transaction.query("INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 1)", [device, p])
       end
-      assert :ok = Relay.setup_sender(relay, certificate, "app:fixture")
-      assert {:ok, _} = Transaction.query("INSERT INTO harklight.sender_grants VALUES ($1, 'app:fixture')", [certificate])
+      for key <- [certificate, outsider_certificate] do
+        assert :ok = Relay.setup_sender(relay, key, "app:fixture")
+        assert {:ok, _} = Transaction.query("INSERT INTO harklight.sender_grants VALUES ($1, 'app:fixture')", [key])
+      end
       subscribe = %{
         "v" => 1, "type" => "subscribe_remote", "op_id" => "00000000-0000-4000-8000-000000000066",
         "revision" => 1, "sender_ids" => ["app:fixture"]
@@ -2273,26 +2280,27 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       with_pg_auth_generation(AuthSchema.supported_generation(), fn ->
         legacy_web = Router.init(relay: relay, auth: {:browser, nil, nil})
         legacy_cert = Router.init(relay: relay, auth: :device)
+        postgres_cert = Router.init(relay: nil, repository: :postgres, auth: :device,
+          deployment_mode: :saas, shared_messages: true, groups: true)
         make_bearer = fn path, device ->
           Plug.Test.conn(:get, path)
           |> Plug.Conn.put_req_header("authorization", "Bearer " <> Map.fetch!(tokens, device))
         end
-        make_certificate = fn path ->
+        make_certificate = fn path, certificate_der ->
           Plug.Test.conn(:get, path)
-          |> Plug.Test.put_peer_data(%{address: {127, 0, 0, 1}, port: 1, ssl_cert: der})
+          |> Plug.Test.put_peer_data(%{address: {127, 0, 0, 1}, port: 1, ssl_cert: certificate_der})
         end
 
         native_item = make_bearer.("/v2/items/i1", native)
         native_rev = make_bearer.("/v2/items/i1/revisions/2", native)
         rev_ctx = %{ctx | params: %{item_id: "i1", n: "2"}}
-        certificate_item = make_certificate.("/v2/items/i1")
-        certificate_rev = make_certificate.("/v2/items/i1/revisions/2")
-        cert_mode = {:certificate, :saas}
+        certificate_item = make_certificate.("/v2/items/i1", der)
+        certificate_rev = make_certificate.("/v2/items/i1/revisions/2", der)
         requests = [
           {native_item, legacy_web, &Reads.get_postgres_item(&1, ctx)},
           {native_rev, legacy_web, &Reads.get_postgres_revision(&1, rev_ctx, :web)},
-          {certificate_item, legacy_cert, &Reads.get_postgres_item(&1, ctx, cert_mode)},
-          {certificate_rev, legacy_cert, &Reads.get_postgres_revision(&1, rev_ctx, cert_mode)}
+          {certificate_item, legacy_cert, &Router.call(&1, postgres_cert)},
+          {certificate_rev, legacy_cert, &Router.call(&1, postgres_cert)}
         ]
 
         put_certificate_fact("shared_read_access", person, false)
@@ -2338,9 +2346,25 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
         assert {:ok, %{"item" => own_item}} = JSON.decode_line(response.resp_body <> "\n")
         refute Map.has_key?(own_item, "as")
 
-        response = Reads.get_postgres_item(certificate_item, ctx, cert_mode)
+        response = Router.call(certificate_item, postgres_cert)
         assert_item_response_parity(Router.call(certificate_item, legacy_cert), response)
         assert {:ok, %{"item" => %{"as" => "knock"}}} = JSON.decode_line(response.resp_body <> "\n")
+        assert_item_response_parity(Router.call(certificate_rev, legacy_cert), Router.call(certificate_rev, postgres_cert))
+
+        for path <- ["/v2/items/i1", "/v2/items/i1/revisions/2"] do
+          outsider = make_certificate.(path, outsider_der)
+          assert %{status: 404} = Router.call(outsider, legacy_cert)
+          assert %{status: 404} = Router.call(outsider, postgres_cert)
+        end
+
+        for path <- ["/v2/items/shared_unknown", "/v2/items/shared_unknown/revisions/1", "/v2/items/i1/entries"] do
+          assert %{status: 404} = Router.call(make_certificate.(path, der), postgres_cert)
+        end
+
+        assert %{status: 401} = denied = Router.call(Plug.Test.conn(:get, "/v2/items/i1"), postgres_cert)
+        assert Plug.Conn.get_resp_header(denied, "connection") == ["close"]
+        assert %{status: 404} =
+                 Router.call(certificate_item, Router.init(relay: nil, repository: :postgres, auth: :device))
         for {request, legacy, read} <- requests, features <- ["shared_messages", "shared_messages,groups"] do
           conn = Plug.Conn.put_req_header(request, "harklight-features", features)
           source = Router.call(conn, legacy)
@@ -2369,7 +2393,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
         assert %{status: 401} = Router.call(native_item, legacy_web)
         assert %{status: 401} = Reads.get_postgres_item(native_item, ctx)
         assert %{status: 401} = Router.call(certificate_rev, legacy_cert)
-        assert %{status: 401} = Reads.get_postgres_revision(certificate_rev, rev_ctx, cert_mode)
+        assert %{status: 401} = Router.call(certificate_rev, postgres_cert)
       end)
     end
 

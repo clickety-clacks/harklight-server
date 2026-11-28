@@ -78,6 +78,7 @@ defmodule AttentionServer.ClientAPI.Router do
 
   - `relay` (required)
   - `auth`: `:device`, or `{:browser, backend, expected_origin}`
+  - `deployment_mode`: `:self_hosted` or `:saas` for explicit PostgreSQL device reads
   - `routes`: route modules, replacing `@route_modules` (tests)
   - `max_in_flight`: concurrent non-stream requests before `503 retry_later`
   """
@@ -114,6 +115,10 @@ defmodule AttentionServer.ClientAPI.Router do
     put_alerts: :put_postgres_alerts,
     put_priority_levels: :put_postgres_priority_levels
   }
+  @postgres_device_reads %{
+    get_item: :get_postgres_item,
+    get_revision: :get_postgres_revision
+  }
 
   @doc false
   # Matches the device listener's HTTP/2 writer wait default.
@@ -128,6 +133,7 @@ defmodule AttentionServer.ClientAPI.Router do
       relay: Keyword.fetch!(opts, :relay),
       repository: Keyword.get(opts, :repository, :format32),
       auth: auth_option(Keyword.get(opts, :auth, :device)),
+      deployment_mode: Keyword.get(opts, :deployment_mode),
       shared_features: %{
         shared_messages: Keyword.get(opts, :shared_messages) == true,
         groups: Keyword.get(opts, :groups) == true
@@ -195,6 +201,31 @@ defmodule AttentionServer.ClientAPI.Router do
       principal: nil, relay: nil, request_id: request_id, params: params, shared_features: opts.shared_features
     }
     run(conn, Reads, :get_postgres_revision, ctx, opts)
+  end
+
+  defp authenticated(
+         %{method: "GET"} = conn,
+         %{repository: :postgres, auth: :device, deployment_mode: mode} = opts,
+         ["items", "i" <> _ | _],
+         {:ok, Reads, handler, params, _},
+         request_id
+       )
+       when mode in [:self_hosted, :saas] and is_map_key(@postgres_device_reads, handler) do
+    ctx = %Context{
+      principal: nil,
+      relay: nil,
+      request_id: request_id,
+      params: params,
+      shared_features: opts.shared_features
+    }
+
+    conn =
+      register_before_send(conn, fn
+        %{status: 401} = conn -> close_after_device_refusal(conn, :device)
+        conn -> conn
+      end)
+
+    run(conn, Reads, Map.fetch!(@postgres_device_reads, handler), ctx, opts, [{:certificate, mode}])
   end
 
   defp authenticated(
@@ -358,8 +389,8 @@ defmodule AttentionServer.ClientAPI.Router do
     end
   end
 
-  defp run(conn, module, handler, ctx, opts) do
-    case apply(module, handler, [conn, ctx]) do
+  defp run(conn, module, handler, ctx, opts, args \\ []) do
+    case apply(module, handler, [conn, ctx | args]) do
       %Plug.Conn{state: state} = sent when state in [:sent, :chunked, :file] ->
         sent
 
