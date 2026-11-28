@@ -538,6 +538,37 @@ defmodule AttentionServer.ClientAPIResourcesTest do
   end
 
   describe "inbox order against today's" do
+    test "Alarm outranks scores while retained keys preserve each partition's order", %{path: path} do
+      relay = scripted_relay(path)
+      forward(relay, "alarm-low", 90, %{"alarm" => true, "urgency" => "low"})
+      forward(relay, "ordinary-high", 91, %{"urgency" => "now"})
+      forward(relay, "alarm-mid", 92, %{"alarm" => true})
+      {engine, view} = snapshot(relay)
+      baseline = Resources.ranks(engine, "A", view)
+      items = Placement.ranking_items(engine, "A")
+
+      entries =
+        Placement.place("jev-set", items, [], {:scored, %{
+          {"app:test", "ordinary-high"} => 1.0,
+          {"app:test", "alarm-mid"} => 0.2,
+          {"app:test", "alarm-low"} => 0.1
+        }})
+
+      list = Placement.list_items(engine, "A", entries, %{}, "jev-set")
+      scored = %{entries: entries, list_items: list}
+      ranks = Resources.ranks(engine, "A", scored, Resources.rank_unit_keys(baseline))
+
+      assert ranks == Resources.ranks(engine, "A", scored, Resources.rank_unit_keys(ranks))
+
+      keys =
+        for id <- ~w(alarm-mid alarm-low ordinary-high) do
+          assert {:ok, item_id} = Resources.item_id(engine, key(id))
+          ranks[item_id]["key"]
+        end
+
+      assert keys == Enum.sort(keys)
+    end
+
     test "rank order equals today's inbox order in free order, with threads and history",
          %{path: path} do
       relay = scripted_relay(path)

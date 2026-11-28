@@ -597,7 +597,17 @@ defmodule AttentionServer.ClientAPI.Resources do
         unlisted_units(engine, person, listed_items)
       end
 
-    units = listed ++ unlisted
+    {alarms, ordinary} =
+      Enum.split_with(listed ++ unlisted, fn
+        {:item, _, key, "current", _} ->
+          record = Map.fetch!(engine.messages, key)
+          BounceDecision.inbox_open?(record) and Message.alarm?(record.message)
+
+        _ ->
+          false
+      end)
+
+    units = alarms ++ ordinary
     keys = rank_keys(previous, Enum.map(units, &unit_id/1))
 
     Enum.reduce(units, %{}, fn

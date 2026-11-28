@@ -471,6 +471,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
     assert body["account"] == %{"state" => "active"}
 
     assert body["features"] == %{
+             "alarm" => true,
              "handoff_captions" => true,
              "server_matched_push_routing" => false,
              "priority_level_editing" => false
@@ -493,6 +494,7 @@ defmodule AttentionServer.ClientAPIReadRoutesTest do
 
     assert %{"features" => features} = body(Reads.get_me(get("/v2/me"), ctx(ctx)))
     assert features == %{
+             "alarm" => true,
              "handoff_captions" => true,
              "server_matched_push_routing" => false,
              "priority_level_editing" => true

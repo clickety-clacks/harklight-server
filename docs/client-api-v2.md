@@ -1224,7 +1224,19 @@ agents with existing data. Clients apply newer versions of each resource.
   a session-scoped opaque `device_id`, and the browser's reported name.
   The browser ID cannot be used as a Show target.
 
+An authenticated device `GET /v2/me` advertises Alarm support with
+`features.alarm: true`. Agents verify this capability before writing an
+explicit Alarm marker. An absent capability means Alarm is unsupported.
+
 ### 9.2 Writes
+
+On normal message sends, optional `message.alarm: true` selects the Alarm
+inbox partition. Omission defaults to ordinary order. On revision, omission
+preserves the marker and `false` clears it. Message reads carry `alarm: true`
+when marked. Current Alarms sort before ordinary rows by existing `rank.key`.
+Urgency, scores, sender authorization, notifications and bounce rules retain
+their usual meaning. An explicit marker in a shared or group write receives
+HTTP 400 `unsupported`.
 
 | Request | Body | Success body |
 |---|---|---|
@@ -1266,6 +1278,7 @@ send replay. It leaves the acceptance of the write and the Agent reply
         "title": { "type": "string", "minLength": 1 },
         "created_at": { "type": "integer" },
         "body": { "type": "string" },
+        "alarm": { "type": "boolean" },
         "message_type": { "enum": ["fyi", "request"] },
         "answer_ui": { "type": "object" },
         "callback": { "type": "object" },

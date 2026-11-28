@@ -1117,6 +1117,65 @@ defmodule AttentionServer.ClientAPIAgentReadsTest do
                message["item_id"]
     end
 
+    test "Alarm is additive, survives a revision omission and replay, and can be cleared", ctx do
+      path = "/v2/agent/messages"
+      discovery = get(ctx, "a1", "/v2/me")
+      assert %{"features" => %{"alarm" => true}} = decode_response(discovery)
+
+      original = %{"title" => "Alarm", "created_at" => 1, "urgency" => "low", "alarm" => true}
+      body = %{"sender" => "app:test", "session" => @first_session, "message" => original}
+      invalid = put_in(body["message"]["alarm"], "true")
+      assert_error(request(ctx, "a1", "POST", path, invalid, 1), 400, "invalid_field")
+
+      for kind <- ["people", "group"] do
+        shared = Map.put(body, "recipients", %{"kind" => kind})
+        assert_error(request(ctx, "a1", "POST", path, shared, 1), 400, "unsupported")
+      end
+
+      sent = request(ctx, "a1", "POST", path, body, 1)
+      assert sent.status == 200, sent.body
+      assert %{"message" => %{"item_id" => id, "message" => %{"alarm" => true}}} =
+               decode_response(sent)
+      assert request(ctx, "a1", "POST", path, body, 1).body == sent.body
+
+      for n <- [4, 5] do
+        ordinary = put_in(body["message"], %{"title" => "Ordinary #{n}", "created_at" => n})
+        assert request(ctx, "a1", "POST", path, ordinary, n).status == 200
+      end
+
+      first = decode_response(get(ctx, "a2", "/v2/inbox?limit=2"))
+      assert %{
+               "items" => [%{"message" => %{"alarm" => true}}, ordinary],
+               "next_page" => token
+             } = first
+      refute Map.has_key?(ordinary["message"], "alarm")
+      second = decode_response(get(ctx, "a2", "/v2/inbox?limit=2&page=" <> URI.encode_www_form(token)))
+      assert %{"items" => [last]} = second
+      assert ordinary["rank"]["key"] < last["rank"]["key"]
+
+      if fixture_path = System.get_env("HARKLIGHT_ALARM_FIXTURE_PATH") do
+        File.write!(fixture_path, JSON.encode!(%{
+          "me" => decode_response(discovery),
+          "inbox_page_1" => first,
+          "inbox_page_2" => second,
+          "alarm_detail" => decode_response(get(ctx, "a2", "/v2/items/" <> id)),
+          "item_changes" => decode_response(get(ctx, "a2", "/v2/changes?after=0"))
+        }))
+      end
+
+      revise = %{"message" => original |> Map.delete("alarm") |> Map.put("title", "Still Alarm")}
+      revised = request(ctx, "a1", "PUT", path <> "/" <> id, revise, 2, [{"if-match", ~s("1")}])
+      assert revised.status == 200, revised.body
+
+      assert %{"item" => %{"message" => %{"alarm" => true, "urgency" => "low"}}} =
+               decode_response(get(ctx, "a2", "/v2/items/" <> id))
+
+      clear = put_in(revise["message"]["alarm"], false)
+      cleared = request(ctx, "a1", "PUT", path <> "/" <> id, clear, 3, [{"if-match", ~s("2")}])
+      assert cleared.status == 200, cleared.body
+      refute Map.has_key?(get_in(decode_response(get(ctx, "a2", "/v2/items/" <> id)), ["item", "message"]), "alarm")
+    end
+
     test "revise uses If-Match, advances revision, and replays before checking it", ctx do
       id = forward(ctx, "a1", 1, @first_session)
       path = "/v2/agent/messages/" <> id

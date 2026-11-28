@@ -573,6 +573,7 @@ defmodule AttentionServer.ClientAPI.Reads do
           @client_features
           |> Map.new(&{&1, Map.get(flags, &1) == true})
           |> Map.put("handoff_captions", true)
+          |> Map.put("alarm", true)
           |> migration_feature(state, key),
         "limits" => %{
           "upload_cap_bytes_per_file" =>

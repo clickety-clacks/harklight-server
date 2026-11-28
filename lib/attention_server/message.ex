@@ -530,10 +530,14 @@ defmodule AttentionServer.Message do
         end
       end)
 
+    normalized = if normalized["alarm"] == false, do: Map.delete(normalized, "alarm"), else: normalized
     {normalized, Enum.reverse(warnings)}
   end
 
   def normalize_optional_fields(message, _accepted_at, _style_hold?), do: {message, []}
+
+  def alarm?(%{"alarm" => true}), do: true
+  def alarm?(_message), do: false
 
   def valid_urgency?(value), do: value in @urgencies
 
