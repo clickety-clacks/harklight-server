@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.ImportSessionTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth, ImportStreams, ImportReceipts, ImportMessages}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth, ImportStreams, ImportReceipts, ImportMessages, ImportFeeds}
     alias AttentionServer.Repository.Postgres.{Attributes, Operations, Repo, Transaction}
     alias AttentionServer.ClientAPI.{Idempotency, Writes}
 
@@ -88,6 +88,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
 
         # Synthetic setup: allocation high deliberately exceeds retained history.
         source_path = Path.join(fixture.root, "relay.sqlite3")
+        seed_advisory(source_path)
         expected_organizations = seed_organizations(source_path, epoch)
         {:ok, sqlite} = Exqlite.Sqlite3.open(source_path)
 
@@ -405,6 +406,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportReceipts.run(db, identity, bundle)
         assert :ok = ImportReceipts.run(db, identity, bundle)
         verify_receipts(db, bundle, manifest)
+        assert :ok = ImportFeeds.run(db, identity, bundle)
+        assert :ok = ImportFeeds.run(db, identity, bundle)
+        verify_feeds(db, bundle, manifest)
         assert :ok = ImportMessages.run(db, identity, bundle)
         assert :ok = ImportMessages.run(db, identity, bundle)
         start_supervised!({Repo, config})
@@ -640,6 +644,79 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:error, :idempotency_conflict} = run.(recent, digest, expires + 1, no_write, project)
       assert {:ok, {201, %{"settings" => "current"}, true}} =
                run.(recent, other, expires + 1, no_write, project)
+    end
+
+    defp seed_advisory(path) do
+      alias AttentionServer.{BounceDecision, BouncePolicy, Engine, Store}
+      {:ok, store} = Store.open_relay(path)
+      {key = {person, sender, external_id}, record} = Enum.find(store.engine.messages, fn {key, record} ->
+        is_nil(record.terminal) and is_binary(Map.get(record, :session_handle)) and
+          not BounceDecision.opened?(store.engine, key, 1) and
+          not Enum.any?(store.engine.conversation_events, fn {_, event} ->
+            event.key == key and event.payload["kind"] == "discussion"
+          end)
+      end)
+      scope = {person, record.origin, record.session_handle}
+      session = Map.fetch!(store.engine.origin_sessions, scope)
+      support = %{"route" => "other", "cli_version" => "synthetic", "unsupported_reason" => nil,
+        "advisory_v1" => true, "origin" => record.origin, "reported_at" => record.accepted_at}
+      engine = Engine.put_row(store.engine, :origin_sessions, scope, Map.put(session, :support, support))
+      {:ok, levels} = BouncePolicy.normalize_levels([
+        %{"name" => "Follow up", "lower_bound" => 0, "bounce_after_days" => 1}
+      ])
+      {:ok, engine, _} = BounceDecision.configure_levels(engine, person, levels, record.accepted_at)
+      engine = BounceDecision.record_scores(engine, person,
+        [%{"sender_id" => sender, "message_id" => external_id, "score" => 0.9}], record.accepted_at)
+      engine = BounceDecision.evaluate_due(engine, record.accepted_at + 86_400_001)
+      feed = Map.fetch!(engine.advisory_feeds, scope)
+      assert feed.high > 0
+      engine = Enum.reduce(feed.entries, engine, fn {_, entry}, acc ->
+        {:ok, next, _} = BounceDecision.advisory_ack(acc, record.origin, record.session_handle, entry["advisory_id"])
+        next
+      end)
+      assert BounceDecision.valid_state?(engine)
+      {:ok, store} = Store.commit(store, engine, %{person: person, actor: "fixture", action: "synthetic_advisory"})
+      :ok = Store.close(store)
+    end
+
+    defp verify_feeds(db, bundle, manifest) do
+      assert {:ok, counts} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, %{}, fn
+        {{family, scope, part}, value}, counts when family in [:origin_feed, :advisory] ->
+          {person, origin, handle} = case scope do
+            {person, origin} -> {person, origin, ""}
+            triple -> triple
+          end
+          {table, params, sql, typed} = case {family, part} do
+            {family, :high} ->
+              kind = if family == :origin_feed, do: "origin_feed", else: "advisory_feed"
+              {"allocation_highs", [person, origin, handle, kind],
+                "SELECT high FROM harklight.allocation_highs WHERE person_id=$1 AND origin_key=$2 AND session_handle=$3 AND kind=$4", false}
+            {:origin_feed, {:entry, position}} ->
+              {"origin_feed_entries", [person, origin, position],
+                "SELECT body::text FROM harklight.origin_feed_entries WHERE person_id=$1 AND origin_key=$2 AND position=$3", true}
+            {:origin_feed, {:delivery_ack, position}} ->
+              {"origin_delivery_acks", [person, origin, position],
+                "SELECT body::text FROM harklight.origin_delivery_acks WHERE person_id=$1 AND origin_key=$2 AND position=$3", true}
+            {:advisory, {:entry, position}} ->
+              {"advisory_feed_entries", [person, origin, handle, position],
+                "SELECT body::text FROM harklight.advisory_feed_entries WHERE person_id=$1 AND origin_key=$2 AND session_handle=$3 AND position=$4", true}
+            {:advisory, {:receipt, id}} ->
+              {"advisory_feed_receipts", [person, origin, handle, id],
+                "SELECT true FROM harklight.advisory_feed_receipts WHERE person_id=$1 AND origin_key=$2 AND session_handle=$3 AND advisory_id=$4", false}
+          end
+          assert {:ok, %{rows: [[actual]]}} = ImportSession.query(db, sql, params)
+          if typed, do: assert_typed(actual, value), else: assert(actual == value)
+          {:ok, Map.update(counts, table, 1, &(&1 + 1))}
+        _, counts -> {:ok, counts}
+      end)
+      for table <- ~w(origin_feed_entries origin_delivery_acks advisory_feed_entries advisory_feed_receipts) do
+        expected = Map.fetch!(counts, table)
+        assert expected > 0
+        assert {:ok, %{rows: [[^expected]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight." <> table, [])
+      end
+      expected = Map.fetch!(counts, "allocation_highs")
+      assert {:ok, %{rows: [[^expected]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.allocation_highs WHERE kind IN ('origin_feed','advisory_feed')", [])
     end
 
     defp verify_messages(db, bundle, manifest) do
