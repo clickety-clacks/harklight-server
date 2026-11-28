@@ -288,3 +288,24 @@ receipts retain expiry at their original timestamp plus 30 days and have
 source flag. Already-expired but still-stored rows are copied, leaving retention
 decisions to the reader. Full source bytes remain in SQL facts. Repeated import
 uses checkpoints and does not allocate new receipts or publish the target.
+
+`ImportMessages.run/3` projects ordinary, principal-backed message records and
+all retained revision bodies, followed by the original recipient item IDs.
+Internal message IDs combine the person and accepted item position; public item
+IDs, sender/message IDs, session, ordering, terminal state and supplemental
+attributes remain unchanged. The current PostgreSQL item reader is exercised
+against these rows while runtime admission still rejects the loading database.
+
+This intermediate stage refuses a historical revision whose timestamp is not
+retained by FORMAT32. FORMAT32 records the first and latest timestamps, but can
+omit intermediate ones; no timestamp is invented. A schema follow-up must allow
+that absence and represent historical/system origins without creating login
+authority. Shared messages, seen state and conversation/answer projections also
+remain later stages. This is not a full-history conversion or activation command.
+
+The ordinary-record stage checks both origin and recipient item readers,
+including wrong-origin and wrong-person rejection and exact attachment-bearing
+record attributes. It does not populate attachment chunks or attachment link
+rows, per-recipient seen state, conversations or answers. Those stages and their
+field-level reader comparisons are required before import validation and
+activation; this stage's success alone is not a complete history import.

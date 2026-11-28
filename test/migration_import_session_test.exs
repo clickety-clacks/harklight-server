@@ -4,7 +4,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.ImportSessionTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth, ImportStreams, ImportReceipts}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportFacts, ImportOrganizations, ImportSession, ImportTables, SourceTables, ImportAuth, ImportStreams, ImportReceipts, ImportMessages}
     alias AttentionServer.Repository.Postgres.Attributes
 
     for epoch <- [1, 17] do
@@ -390,6 +390,13 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportReceipts.run(db, identity, bundle)
         assert :ok = ImportReceipts.run(db, identity, bundle)
         verify_receipts(db, bundle, manifest)
+        assert :ok = ImportMessages.run(db, identity, bundle)
+        assert :ok = ImportMessages.run(db, identity, bundle)
+        repo = AttentionServer.Repository.Postgres.Repo
+        start_supervised!({repo, config})
+        assert {:error, :postgres_not_active} = AttentionServer.Repository.Postgres.Transaction.verify_ready()
+        verify_messages(db, bundle, manifest)
+        stop_supervised!(repo)
 
         assert {:ok, :ok} =
                  Frames.fold(
@@ -561,6 +568,52 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         end
         assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
         Agent.stop(fixture.clock)
+      end
+    end
+
+    defp verify_messages(db, bundle, manifest) do
+      alias AttentionServer.Repository.Postgres.Items
+      alias AttentionServer.ClientAPI.Resources
+      assert {:ok, {count, revisions}} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, {0, 0},
+        fn
+          {{:row, :messages, {person, sender, external_id} = key}, record}, {count, rev_count} ->
+            id = ImportMessages.id(key, record)
+            item = Resources.item_id(record)
+            current = Map.get(record, :revision, 1)
+            expected = Map.merge(record, %{revision: current, session_handle: Map.get(record, :session_handle), free_order: Map.get(record, :free_order)})
+            assert {:ok, ^key, ^expected} = Items.agent_item({person, record.origin}, item)
+            assert {:error, :not_found} = Items.agent_item({person, "synthetic-wrong-origin"}, item)
+            assert {:error, :not_found} = Items.recipient_item("synthetic-wrong-person", item)
+            if AttentionServer.BounceDecision.person_visible?(record) do
+              assert {:ok, ^key, ^expected} = Items.recipient_item(person, item)
+            else
+              assert {:error, :not_found} = Items.recipient_item(person, item)
+            end
+            assert {:ok, %{rows: [[^person, ^sender, ^external_id, ^current]]}} = ImportSession.query(db,
+              "SELECT person_id,sender_id,message_id,revision FROM harklight.messages WHERE id=$1", [id])
+            versions = Map.get(record, :revisions, %{1 => record.message})
+            for {rev, body} <- versions do
+              assert {:ok, %{rows: [[at, text]]}} = ImportSession.query(db,
+                "SELECT accepted_at_ms,body::text FROM harklight.message_revisions WHERE message_id=$1 AND revision=$2", [id, rev])
+              assert at == if(rev == 1, do: record.accepted_at, else: record.revision_accepted_at)
+              assert_typed(text, body)
+            end
+            assert {:ok, %{rows: [[^person, ^item]]}} = ImportSession.query(db,
+              "SELECT person_id,item_id FROM harklight.message_recipients WHERE message_id=$1", [id])
+            {:ok, {count + 1, rev_count + map_size(versions)}}
+          _, acc -> {:ok, acc}
+        end)
+      assert count > 0
+      assert {:ok, attached} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, 0,
+        fn
+          {{:row, :messages, _}, record}, n ->
+            files = record |> Map.get(:files_by_revision, %{}) |> Map.values() |> List.flatten()
+            {:ok, n + length(files)}
+          _, n -> {:ok, n}
+        end)
+      assert attached > 0
+      for {table, expected} <- [{"messages", count}, {"message_recipients", count}, {"message_revisions", revisions}] do
+        assert {:ok, %{rows: [[^expected]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight." <> table, [])
       end
     end
 
