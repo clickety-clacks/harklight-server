@@ -36,10 +36,22 @@ The authoritative columns and constraints live in
   digest have been validated. An empty file has zero chunks. Writers may
   only link complete files. Keep each attachment ordinal and its wire
   attributes from the selected message revision.
+- PostgreSQL admissions reserve the declared bytes against one person,
+  across upload owners. A new manifest adds the integer
+  `reservation_expires_at_ms` key beside its typed attributes envelope.
+  Remove this key when decoding the envelope. Exact scoped retries match the
+  declared size, digest and typed metadata and retain the original expiration.
+  Cleanup takes bounded batches of expired, unlinked reservations under
+  manifest locks. Imported manifests without a reservation timestamp are
+  excluded.
 - Claims are scoped to one job, with an attempt count, unique claim token
-  and expiry. A late worker must match its claim token to finish. Preserve
-  resumable work, receipt distinctions and attempt history in job attributes
-  where the backend relies on them.
+  and expiry. A worker may record success while its token still matches an
+  unfinished job, including after lease expiry. The fifth failed or expired
+  attempt ends the job. Exhaustion sets `jobs.completed_at_ms` and stores a
+  typed `compatibility_facts` row in the same transaction. The family is
+  `job_exhaustion`, the address is `Attributes.key({kind, id})`, and the
+  body records the attempt count, time and reason. The original job body
+  remains available.
 
 Importer order follows the foreign keys. Insert identity and people before
 principals and memberships, then origin sessions and messages, then message
