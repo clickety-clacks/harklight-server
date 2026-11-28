@@ -158,9 +158,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
 
         # A removed resource may have no surviving item, but its cursor event
         # and canonical revision must survive. Independent highs may exceed it.
-        stream_person = session_person
-        {:ok, [[head]]} = AttentionServer.Store.RecordTable.select(sqlite,
-          "SELECT head FROM client_change_log_meta WHERE person_id=?", [stream_person])
+        {:ok, [[stream_person, head]]} = AttentionServer.Store.RecordTable.select(sqlite,
+          "SELECT person_id,head FROM client_change_log_meta ORDER BY person_id LIMIT 1")
         removed_id = AttentionServer.ChangeLog.item_resource({stream_person, "app:synthetic", "removed-migration"})
         :ok = AttentionServer.Store.RecordTable.run(sqlite,
           "UPDATE client_change_log_meta SET head=? WHERE person_id=?", [head + 20, stream_person])
