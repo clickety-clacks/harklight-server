@@ -50,14 +50,22 @@ defmodule AttentionServer.ClientAPI.Auth do
   @write_methods ~w(POST PUT PATCH DELETE)
 
   @doc "The enrolled principal for a request on the device listener."
-  @spec device(Plug.Conn.t(), GenServer.server()) ::
-          {:ok, Principal.t()} | {:error, :unauthorized}
+  @spec device(Plug.Conn.t(), GenServer.server() | {:postgres, :self_hosted | :saas}) ::
+          {:ok, Principal.t()} | {:error, :unauthorized | :unavailable}
   def device(conn, relay) do
     with %{ssl_cert: der} when is_binary(der) <- Plug.Conn.get_peer_data(conn),
          {:ok, key} <- DeviceIdentity.from_certificate(der) do
       enrolled_principal(relay, key)
     else
       _ -> {:error, :unauthorized}
+    end
+  end
+
+  defp enrolled_principal({:postgres, mode}, key) do
+    case AttentionServer.Repository.Postgres.Certificates.resolve(key, mode) do
+      {:ok, person, kind} -> {:ok, %Principal{person: person, kind: kind, key: key}}
+      {:error, :storage_unavailable} -> {:error, :unavailable}
+      {:error, :unauthorized} -> {:error, :unauthorized}
     end
   end
 
