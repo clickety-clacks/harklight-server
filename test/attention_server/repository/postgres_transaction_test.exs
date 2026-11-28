@@ -2,7 +2,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
   defmodule AttentionServer.Repository.PostgresTransactionTest do
     use ExUnit.Case, async: false
 
-    alias AttentionServer.Repository.Postgres.{Operations, Pool, Repo, Transaction}
+    alias AttentionServer.Repository.Postgres.{Attributes, Jobs, Operations, Pool, Repo, Transaction}
 
     setup_all do
       config = [url: System.fetch_env!("HARKLIGHT_POSTGRES_TEST_URL")]
@@ -366,6 +366,29 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                    flunk("conflicting operation ran")
                  end)
                end)
+    end
+
+    test "a stopped provider leaves its job recoverable after the lease expires" do
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.jobs (kind, id, person_id, ready_at_ms, body)
+                 VALUES ('push', 'synthetic-push', 'receipt-person', 10, $1)
+                 """,
+                 [Attributes.encode(%{item_id: "synthetic-item"})]
+               )
+
+      assert {:ok, %{attempts: 1, body: %{item_id: "synthetic-item"}} = first} =
+               Jobs.claim("push", 10, 20, "first-claim")
+
+      assert {:ok, nil} = Jobs.claim("push", 19, 30, "unused-claim")
+      assert {:ok, %{attempts: 2} = recovered} = Jobs.claim("push", 20, 30, "recovered")
+      assert {:error, :claim_lost} = Jobs.complete(first, 21)
+      assert {:ok, :recorded} = Jobs.retry_at(recovered, 21, 25)
+      assert {:ok, nil} = Jobs.claim("push", 24, 40, "too-early")
+      assert {:ok, %{attempts: 3} = final} = Jobs.claim("push", 25, 40, "final-claim")
+      assert {:ok, :recorded} = Jobs.complete(final, 26)
+      assert {:ok, nil} = Jobs.claim("push", 40, 50, "done")
     end
 
     defp change(id) do
