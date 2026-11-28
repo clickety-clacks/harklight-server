@@ -19,6 +19,24 @@ CREATE TABLE server_identity (
   cursor_epoch bigint NOT NULL CHECK (cursor_epoch > 0)
 );
 
+CREATE TABLE import_state (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  import_id text NOT NULL UNIQUE,
+  source_sha256 bytea NOT NULL CHECK (octet_length(source_sha256) = 32),
+  schema_sha256 bytea NOT NULL CHECK (octet_length(schema_sha256) = 32),
+  phase text NOT NULL CHECK (phase IN ('loading', 'validated', 'active')),
+  manifest_sha256 bytea CHECK (octet_length(manifest_sha256) = 32),
+  CHECK ((phase = 'loading') = (manifest_sha256 IS NULL))
+);
+
+CREATE TABLE import_checkpoints (
+  import_id text REFERENCES import_state (import_id),
+  family text,
+  last_ordinal bigint NOT NULL CHECK (last_ordinal >= 0),
+  cumulative_sha256 bytea NOT NULL CHECK (octet_length(cumulative_sha256) = 32),
+  PRIMARY KEY (import_id, family)
+);
+
 CREATE TABLE people (
   id text PRIMARY KEY,
   delivery_state text,
@@ -76,10 +94,12 @@ CREATE INDEX organization_members_person_idx ON organization_members (person_id,
 CREATE TABLE groups (
   id text PRIMARY KEY,
   organization_id text NOT NULL REFERENCES organizations,
-  manager_id text NOT NULL REFERENCES people,
+  manager_id text REFERENCES people,
   name text NOT NULL,
-  hosted_ref text UNIQUE,
-  attributes jsonb NOT NULL DEFAULT '{}'
+  hosted_ref text,
+  attributes jsonb NOT NULL DEFAULT '{}',
+  UNIQUE (organization_id, hosted_ref),
+  CHECK ((manager_id IS NULL) <> (hosted_ref IS NULL))
 );
 CREATE INDEX groups_organization_idx ON groups (organization_id, name);
 
@@ -108,6 +128,64 @@ CREATE TABLE origin_sessions (
   attributes jsonb NOT NULL DEFAULT '{}',
   PRIMARY KEY (person_id, origin_key, handle),
   FOREIGN KEY (person_id, origin_key) REFERENCES principals (person_id, key)
+);
+
+CREATE TABLE allocation_highs (
+  person_id text REFERENCES people,
+  origin_key text,
+  session_handle text,
+  kind text CHECK (kind IN ('accepted', 'free_order', 'conversation', 'origin_feed', 'advisory_feed')),
+  high bigint NOT NULL CHECK (high >= 0),
+  PRIMARY KEY (person_id, origin_key, session_handle, kind),
+  CHECK ((kind IN ('origin_feed', 'advisory_feed')) = (origin_key <> '')),
+  CHECK ((kind = 'advisory_feed') = (session_handle <> ''))
+);
+
+CREATE TABLE origin_feed_entries (
+  person_id text,
+  origin_key text,
+  session_handle text,
+  position bigint CHECK (position > 0),
+  body jsonb NOT NULL,
+  PRIMARY KEY (person_id, origin_key, position),
+  FOREIGN KEY (person_id, origin_key) REFERENCES principals (person_id, key)
+);
+
+CREATE TABLE origin_delivery_acks (
+  person_id text,
+  origin_key text,
+  position bigint CHECK (position > 0),
+  body jsonb NOT NULL,
+  PRIMARY KEY (person_id, origin_key, position),
+  FOREIGN KEY (person_id, origin_key) REFERENCES principals (person_id, key)
+);
+
+CREATE TABLE advisory_feed_entries (
+  person_id text,
+  origin_key text,
+  session_handle text,
+  position bigint CHECK (position > 0),
+  body jsonb NOT NULL,
+  PRIMARY KEY (person_id, origin_key, session_handle, position),
+  FOREIGN KEY (person_id, origin_key) REFERENCES principals (person_id, key)
+);
+
+CREATE TABLE advisory_feed_receipts (
+  person_id text,
+  origin_key text,
+  session_handle text,
+  advisory_id text,
+  PRIMARY KEY (person_id, origin_key, session_handle, advisory_id),
+  FOREIGN KEY (person_id, origin_key) REFERENCES principals (person_id, key)
+);
+
+-- One row per independently addressed fact. These supplementary rows carry
+-- durable FORMAT32 fields that do not belong in a principal or wire resource.
+CREATE TABLE compatibility_facts (
+  family text,
+  address bytea,
+  body jsonb NOT NULL,
+  PRIMARY KEY (family, address)
 );
 
 CREATE TABLE messages (
