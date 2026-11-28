@@ -3,7 +3,7 @@ defmodule AttentionServer.CommitProfile do
   Bounded, opt-in profiling of a Relay and its persistence tasks.
 
   `capture/2` does not change the request path. It returns aggregate MFA-only
-  samples and per-function runtime counters; it never reads messages, process
+  samples and Relay-only per-function runtime counters; it never reads messages, process
   dictionaries, function arguments, return values, or application state.
   Enable explicitly with `enabled: true` or the `:commit_profile` application
   setting (default false). Intended for isolated synthetic workload fixtures.
@@ -17,8 +17,6 @@ defmodule AttentionServer.CommitProfile do
     {AttentionServer.Store.Persistence, :run, 1},
     {AttentionServer.Store.Persistence, :await, 1},
     {Task, :async, 3},
-    {AttentionServer.Store.RecordTable, :transaction, 2},
-    {AttentionServer.Store.RecordTable, :write_generation, 4},
     {AttentionServer.ChangeLog, :notify, 1},
     {AttentionServer.ChangeLog, :read, 4},
     {AttentionServer.ClientAPI.FeedStep, :handle_call, 3}
@@ -89,7 +87,9 @@ defmodule AttentionServer.CommitProfile do
           %{function: mfa_name(mfa), matches: :trace.function(session, mfa, true, [:call_time])}
         end
 
-      :trace.process(session, relay, true, [:call, :set_on_spawn])
+      # Only one process owns timing rows. Inheriting call_time into short-lived
+      # tasks retains a VM row per exited task until session destruction.
+      :trace.process(session, relay, true, [:call])
       start = System.monotonic_time(:millisecond)
       initial = %{samples: 0, queue_max: 0, queue_total: 0, stacks: %{}, dropped_stacks: 0}
       stats = sample(relay, start + duration, interval, initial)
@@ -98,6 +98,7 @@ defmodule AttentionServer.CommitProfile do
       {:ok,
        Map.merge(stats, %{
          schema: 1,
+         timer_scope: "relay_only",
          elapsed_ms: System.monotonic_time(:millisecond) - start,
          interval_ms: interval,
          coverage: coverage,
