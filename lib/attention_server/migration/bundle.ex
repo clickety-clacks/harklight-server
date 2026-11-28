@@ -1,11 +1,12 @@
 defmodule AttentionServer.Migration.Bundle do
   @moduledoc false
-  alias AttentionServer.Migration.{BundleValidation, Format32, Frames, Source}
+  alias AttentionServer.Migration.{BundleValidation, Format32, Frames, Source, MaterialProvenance}
   alias AttentionServer.Store.RecordCodec
   alias Exqlite.Sqlite3
 
   def export(path, destination, opts, observer \\ &Source.observe/2) do
     with {:ok, captured} <- Source.capture(path, destination, opts, observer),
+         {:ok, material_before} <- MaterialProvenance.capture(Keyword.get(opts, :material, %{})),
          {:ok, inventory} <-
            Format32.preflight(captured.copy,
              provenance: captured.provenance,
@@ -13,13 +14,15 @@ defmodule AttentionServer.Migration.Bundle do
            ),
          {:ok, data} <- export_data(captured.copy, path <> ".uploads", destination, inventory),
          {:ok, material} <- copy_material(Keyword.get(opts, :material, %{}), destination),
+         {:ok, material_provenance} <- MaterialProvenance.confirm(material_before, destination, material),
          {:ok, receipt} <- Source.confirm(path, captured.provenance, opts, observer),
          manifest = %{
            version: 1,
            source: inventory,
            provenance: receipt,
            data: data,
-           material: material
+           material: material,
+           material_provenance: material_provenance
          },
          :ok <- BundleValidation.validate(destination, manifest),
          {:ok, summary} <- Frames.write(Path.join(destination, "manifest.frames"), [manifest]),
@@ -48,7 +51,8 @@ defmodule AttentionServer.Migration.Bundle do
         AttentionServer.Migration.Provenance,
         Format32,
         Source,
-        BundleValidation
+        BundleValidation,
+        MaterialProvenance
       ],
       &Code.ensure_loaded!/1
     )

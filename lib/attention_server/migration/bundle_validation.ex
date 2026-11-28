@@ -1,6 +1,6 @@
 defmodule AttentionServer.Migration.BundleValidation do
   @moduledoc false
-  alias AttentionServer.Migration.{Frames, Provenance, Source, SourceSchema}
+  alias AttentionServer.Migration.{Frames, MaterialProvenance, Provenance, Source, SourceSchema}
 
   # Integrity validation is separate from target-schema and relational validation.
   # A successful result here never authorizes database activation.
@@ -9,7 +9,8 @@ defmodule AttentionServer.Migration.BundleValidation do
         source: source,
         provenance: receipt,
         data: data,
-        material: material
+        material: material,
+        material_provenance: material_provenance
       }) do
     with :ok <- Provenance.validate(receipt, source.source_sha256, source.source_bytes),
          :ok <-
@@ -19,7 +20,8 @@ defmodule AttentionServer.Migration.BundleValidation do
          true <- Map.keys(data.tables) |> Enum.sort() == Enum.sort(Map.keys(source.tables)),
          :ok <- tables(root, data.tables, source.tables),
          :ok <- files(root, data.files, "files/uploads/"),
-         :ok <- files(root, material, "material/") do
+         :ok <- files(root, material, "material/"),
+         :ok <- MaterialProvenance.verify(root, material, material_provenance) do
       :ok
     else
       {:error, _} = error -> error

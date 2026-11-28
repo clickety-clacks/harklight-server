@@ -40,6 +40,11 @@ defmodule AttentionServer.Migration.BundleTest do
     secret = Path.join(fixture.root, "certs/expired.key")
     person_file = Path.join(root, "person-id")
     File.write!(person_file, hd(history["people"]) <> "\n")
+    env = Path.join(root, "server.env")
+    certs = Path.join(fixture.root, "certs")
+    File.write!(env, Enum.map_join([
+      {"CERTFILE", "server.pem"}, {"KEYFILE", "server.key"}, {"CACERTFILE", "ca.pem"}
+    ], "\n", fn {key, file} -> "export ATTENTION_SERVER_#{key}='#{Path.join(certs, file)}'" end))
     path = Path.join(fixture.root, "relay.sqlite3")
     before = File.read!(path)
     destination = Path.join(root, "export")
@@ -49,7 +54,11 @@ defmodule AttentionServer.Migration.BundleTest do
         {:operator, "synthetic test supervisor", "GenServer.stop returned; fixture stopped"},
       material: %{"owner/identity.key" => secret,
         "owner/identity.pem" => Path.join(fixture.root, "certs/expired.pem"),
-        "person-id" => person_file}
+        "person-id" => person_file, "server.env" => env,
+        "tls/server.pem" => Path.join(certs, "server.pem"),
+        "tls/server.key" => Path.join(certs, "server.key"),
+        "tls/ca.pem" => Path.join(certs, "ca.pem"),
+        "tls/ca.key" => Path.join(certs, "ca.key")}
     ]
 
     assert {:ok, summary} = Bundle.export(path, destination, opts)
@@ -64,6 +73,8 @@ defmodule AttentionServer.Migration.BundleTest do
 
     assert {:ok, ^manifest, ^summary} = Bundle.verify(destination)
     assert {:ok, %{"contract_version" => 1, "command" => "verify", "result" => "verified_export"}} = CLI.run(["verify", destination])
+    assert manifest.material_provenance["anchor"] == "stopped_source_configuration"
+    assert Enum.all?(manifest.material_provenance["files"], fn {_, entry} -> entry["before"] == entry["after"] end)
     assert manifest.data.records.count == manifest.source.records.count
     assert map_size(manifest.data.files) > 0
     assert File.read!(Path.join(destination, "material/owner/identity.key")) == File.read!(secret)
