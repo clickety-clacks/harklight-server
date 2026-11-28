@@ -56,6 +56,8 @@ jobs:
           POSTGRES_USER: fixture
           POSTGRES_PASSWORD: fixture-password
           POSTGRES_DB: fixture
+        ports:
+          - 5432/tcp
         options: >-
           --health-cmd "pg_isready -U fixture -d fixture"
           --health-interval 5s --health-timeout 5s --health-retries 10
@@ -65,3 +67,13 @@ jobs:
         run: |
           cat priv/postgres/001_initial.sql test/attention_server/repository/postgres_schema_v1.sql |
             docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d fixture -f -
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.3.3'
+          elixir-version: '1.19.5'
+          version-type: strict
+      - run: mix deps.get
+      - name: Verify isolated PostgreSQL transactions
+        env:
+          HARKLIGHT_POSTGRES_TEST_URL: postgres://fixture:fixture-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/fixture
+        run: ATTENTION_SERVER_ENABLE=0 mix test test/attention_server/repository/postgres_transaction_test.exs

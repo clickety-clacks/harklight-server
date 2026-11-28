@@ -25,6 +25,8 @@ defmodule AttentionServer.MixProject do
   defp deps do
     [
       {:exqlite, "0.39.0"},
+      {:ecto_sql, "~> 3.14.0"},
+      {:postgrex, "~> 0.22.0"},
       {:mint, "~> 1.11.0"},
       {:plug, "~> 1.20.0"},
       {:bandit, "~> 1.14.1"},
