@@ -12,15 +12,23 @@ The explicit migration job applies
 [`001_initial.sql`](../priv/postgres/001_initial.sql),
 [`002_message_history.sql`](../priv/postgres/002_message_history.sql),
 [`003_large_text.sql`](../priv/postgres/003_large_text.sql),
-[`004_conversation_read_positions.sql`](../priv/postgres/004_conversation_read_positions.sql), and
-[`005_shared_message_history.sql`](../priv/postgres/005_shared_message_history.sql)
+[`004_conversation_read_positions.sql`](../priv/postgres/004_conversation_read_positions.sql),
+[`005_shared_message_history.sql`](../priv/postgres/005_shared_message_history.sql), and
+[`006_conversation_entry_uploads.sql`](../priv/postgres/006_conversation_entry_uploads.sql)
 in order.
 They use the same advisory lock. For a fresh import, the schema digest is
 SHA-256 over the ordered files' concatenated bytes. When resuming an import
 claimed under an earlier version, keep its original pinned digest.
 Version 2 represents message history, version 3 adds shared large text,
-version 4 represents revisionless read-position facts, and version 5 represents
-shared message identities and retained sender and group history.
+version 4 represents revisionless read-position facts, version 5 represents
+shared message identities and retained sender and group history, and version 6
+preserves attachment links owned by conversation entries.
+
+Entry attachment ordinals are local to the entry. Store the exact source
+descriptor in the typed attributes for its conversation, entry, and ordinal.
+The importer or writer checks the completed upload and its source ownership
+and entry scope in the linking transaction. Retention preserves manifests
+referenced by either message revisions or conversation entries.
 
 - Keep person IDs and principal keys as opaque text. Preserve the server
   instance ID, cursor signing bytes and integer epoch exactly. Preserve
@@ -133,7 +141,7 @@ to begin in `loading`, rejects skipped or reversed phase transitions, and
 prevents replacing the source, schema, import identity or validated manifest.
 Restarting from scratch requires a new unpublished destination. An opted-in
 runtime must require both
-schema version 5 and `phase = 'active'` plus the server identity row. The
+schema version 6 and `phase = 'active'` plus the server identity row. The
 identity row alone cannot publish partial imports. An isolated fresh database
 uses the same lifecycle with a manifest describing the newly provisioned
 synthetic data.

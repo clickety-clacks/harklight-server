@@ -2214,6 +2214,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       owner = "synthetic-upload-writer"
       target = {person, owner, "linked-upload"}
       orphan = {person, owner, "orphan-upload"}
+      entry_only = {person, owner, "entry-only-upload"}
       message = "synthetic-attachment-message"
       observer = self()
       assert {:ok, _} = Transaction.query("INSERT INTO harklight.people VALUES ($1)", [person])
@@ -2237,7 +2238,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                  [message]
                )
 
-      for {_person, _owner, id} <- [target, orphan] do
+      for {_person, _owner, id} <- [target, orphan, entry_only] do
         assert {:ok, ^id} =
                  Uploads.begin_upload(
                    person, owner, id, 0, :crypto.hash(:sha256, <<>>), %{}, upload_limits(0, 0)
@@ -2248,6 +2249,22 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:error, :incomplete_upload} =
                Transaction.run([], fn _ -> Uploads.link(target, message, 1, 0, %{}) end)
       assert {:ok, "linked-upload"} = Uploads.complete(target, 10)
+      assert {:ok, "entry-only-upload"} = Uploads.complete(entry_only, 10)
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.conversations (id, message_id) VALUES ($1, $1)", [message]
+      )
+      assert {:ok, _} = Transaction.query(
+        """
+        INSERT INTO harklight.conversation_entries (id, conversation_id, position, request_revision, kind, body)
+        VALUES ('first', $1, 1, 1, 'reply', '{}'), ('second', $1, 2, 1, 'reply', '{}')
+        """, [message]
+      )
+      assert {:ok, _} = Transaction.query(
+        """
+        INSERT INTO harklight.conversation_entry_uploads (conversation_id, entry_id, ordinal, upload_id)
+        VALUES ($1, 'first', 0, 'entry-only-upload'), ($1, 'second', 0, 'entry-only-upload')
+        """, [message]
+      )
 
       linker =
         Task.async(fn ->
@@ -2267,6 +2284,14 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                Transaction.run([], fn _ -> Uploads.link(orphan, message, 1, 1, %{}) end)
       assert {:ok, %{rows: [["linked-upload"]]}} =
                Transaction.query("SELECT upload_id FROM harklight.message_uploads WHERE message_id = $1", [message])
+      assert {:ok, %{num_rows: 1}} = Transaction.query(
+        "DELETE FROM harklight.conversation_entry_uploads WHERE conversation_id = $1 AND entry_id = 'first'", [message]
+      )
+      assert {:ok, 0} = Uploads.cleanup(person, 100)
+      assert {:ok, %{num_rows: 1}} = Transaction.query(
+        "DELETE FROM harklight.conversation_entry_uploads WHERE conversation_id = $1 AND entry_id = 'second'", [message]
+      )
+      assert {:ok, 1} = Uploads.cleanup(person, 100)
     end
 
     defp upload_limits(file, account) do
