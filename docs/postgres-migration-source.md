@@ -393,6 +393,18 @@ directories, files and owner/completion markers. Standard owner material require
 `person-id`, `owner/identity.pem` and `owner/identity.key`: the private key's public
 SPKI fingerprint must match the certificate and the selected person's current
 owner fingerprint in the decoded source records. A valid certificate/key pair
-from another identity is refused. Other identity kinds, including TLS material,
-remain refused until their source continuity mapping is implemented; this is not
-yet a complete self-hosted migration route.
+from another identity is refused. TLS continuity rests on stopped-source provenance, not a store fingerprint.
+The export observes `server.env` and every declared material file before and
+after copying within the stopped-source window. Its configured `CERTFILE`,
+`KEYFILE` and `CACERTFILE` paths must identify the exact captured files. The
+parser accepts literal installer shell quoting without executing the file;
+expand computed paths to explicit absolute literals before stopping/exporting.
+The importer checks the server certificate/private-key pair, the optional
+`tls/ca.key` pair, and the server certificate chain to that captured CA. These
+are continuity checks, not certificate renewal; existing validity dates stay
+unchanged. Every retained guided-join invitation's `ca_sha256`, where present,
+must equal the captured CA's DER SHA-256. With no retained pin, TLS relies on
+the captured source configuration alone. A foreign key, CA, configured path,
+changed source file or pin mismatch refuses staging. Unknown material kinds
+remain refused until they have an explicit typed continuity mapping. Final
+material completeness and activation are still separate unfinished gates.
