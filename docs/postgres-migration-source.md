@@ -367,3 +367,23 @@ message's internal ID and copies exact per-person read positions. Positive read
 positions must resolve to the same source conversation's origin reply. This phase
 does not yet project conversation entries, seen revisions, answers or shared
 conversation history, and cannot validate or activate a destination.
+
+`ImportMaterial.run/3` copies the verified bundle's declared configuration and
+identity files into a separate private staging directory bound to the original
+import identity. It never writes to the original state paths. Copies use bounded
+reads, private permissions, a partial file followed by rename, and size/digest
+readback. A retry verifies finished files and resumes unfinished copies; an
+existing mismatched file or identity is refused. The returned material inventory
+contains relative restore paths and digests, never file contents. It does not by
+itself establish that every required configuration or identity file was declared;
+that completeness check remains part of final migration validation.
+
+The planned `validate` result uses a `material` object with `root` (absolute path
+to the verified staged files), `manifest_sha256`, and `files` (each containing
+`path`, `size`, and `sha256`). Paths retain the export material map's relative
+restore names, including `external/...`; those external entries require the
+installer's explicit original destination mapping. The installer must verify the
+inventory and bytes before installing them. `server.env` remains source material;
+the installer applies the explicit backend configuration change separately after
+successful activation. Export and verify include additive `contract_version: 1`
+and `command` fields; their existing result and digest fields remain unchanged.

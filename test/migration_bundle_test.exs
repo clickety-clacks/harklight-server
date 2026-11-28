@@ -60,10 +60,36 @@ defmodule AttentionServer.Migration.BundleTest do
              end)
 
     assert {:ok, ^manifest, ^summary} = Bundle.verify(destination)
-    assert {:ok, %{"result" => "verified_export"}} = CLI.run(["verify", destination])
+    assert {:ok, %{"contract_version" => 1, "command" => "verify", "result" => "verified_export"}} = CLI.run(["verify", destination])
     assert manifest.data.records.count == manifest.source.records.count
     assert map_size(manifest.data.files) > 0
     assert File.read!(Path.join(destination, "material/owner/identity")) == File.read!(secret)
+
+    identity = %{id: "synthetic-material-import", source: Base.decode16!(summary.sha256, case: :lower),
+      schema: AttentionServer.Repository.Postgres.Schema.digest()}
+    staging = Path.join(root, "private-stage")
+    assert {:ok, material} = AttentionServer.Migration.ImportMaterial.run(destination, identity, staging)
+    assert material["root"] == Path.join(staging, "files")
+    staged = Path.join(material["root"], "owner/identity")
+    assert File.read!(staged) == File.read!(secret)
+    assert Bitwise.band(File.stat!(staged).mode, 0o777) == 0o600
+    assert Bitwise.band(File.stat!(Path.dirname(staged)).mode, 0o777) == 0o700
+    assert {:ok, ^material} = AttentionServer.Migration.ImportMaterial.run(destination, identity, staging)
+    assert {:error, :import_source_mismatch} = AttentionServer.Migration.ImportMaterial.run(destination,
+      %{identity | source: :crypto.hash(:sha256, "other")}, staging)
+    assert {:error, :material_identity_mismatch} = AttentionServer.Migration.ImportMaterial.run(destination,
+      %{identity | id: "different-import"}, staging)
+    original_material = File.read!(staged)
+    File.write!(staged, "corrupt staged content")
+    assert {:error, :material_content_mismatch} = AttentionServer.Migration.ImportMaterial.run(destination, identity, staging)
+    File.rm!(staged)
+    File.write!(staged <> ".partial", "interrupted copy")
+    File.rm!(Path.join(staging, "COMPLETE.json"))
+    assert {:ok, ^material} = AttentionServer.Migration.ImportMaterial.run(destination, identity, staging)
+    assert File.read!(staged) == original_material
+    refute File.exists?(staged <> ".partial")
+    assert File.read!(secret) == original_material
+    refute String.contains?(AttentionServer.JSON.encode!(material), original_material)
 
     for {relative, expected} <- manifest.data.files do
       bytes = File.read!(Path.join(destination, relative))
