@@ -4,7 +4,7 @@ defmodule AttentionServer.Migration.ImportSharedEntryUploads do
   alias AttentionServer.Migration.{Bundle, ImportRows, ImportSession, ImportSharedConversations, ImportUploads}
   alias AttentionServer.Repository.Postgres.Attributes
 
-  # Staged against the core-owned v6 contract. No schema creation or startup use.
+  # Uses explicit schema 006. No schema creation or startup use.
   def run(db, identity, bundle) do
     with {:ok, %{rows: [[version]]}} when is_integer(version) and version >= 6 <- ImportSession.query(db,
            "SELECT max(version) FROM harklight.schema_migrations", []),
