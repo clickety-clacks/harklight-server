@@ -32,8 +32,6 @@ usage: harklight-postgres COMMAND [options]
   status                 report the configured database, service and connection
   migrate [--resume DIR] copy the stopped FORMAT32 store into the empty PostgreSQL database,
                          validate it and stage identity material; never activates
-  migrate-activate --resume DIR
-                         activate a validated destination (a separate explicit step)
   backup ARCHIVE         write one archive: database dump, state directory and checksums
   restore ARCHIVE        restore that archive (add --replace to overwrite existing data)
 
@@ -905,39 +903,7 @@ PY
   if ! out="$(install_material)"; then material_failed; fi
   note "identity material verified: $out"
   note "The destination is imported and validated. It has NOT been activated; server.env was not changed and Harklight Server was not started."
-  note "Activation is a separate explicit step: harklight-postgres migrate-activate --resume $work_dir"
-}
-
-do_migrate_activate() {
-  [[ -n "$resume_dir" ]] || fail "usage: harklight-postgres migrate-activate --resume WORKDIR"
-  migrate_setup
-  work_dir="$resume_dir"
-  [[ -f "$work_dir/done.validate" && -f "$work_dir/validate.json" ]] || fail "$work_dir has no completed validation; run migrate first"
-  local receipt="$work_dir/receipt.json" out validation_sha phase
-  validation_sha="$(json_field "$(< "$work_dir/validate.json")" validation_sha256)"
-  [[ "$validation_sha" =~ ^[0-9a-f]{64}$ ]] || fail "the recorded validation has no digest"
-  "$0" verify-roles --root "$root" --state "$state" --pg-bin "$pg_bin" >/dev/null || fail "the runtime role boundary does not verify; not activating"
-  if ! out="$(install_material)"; then material_failed; fi
-  if ! "$migration_bin" activate --receipt "$receipt" --validation-sha256 "$validation_sha" > "$work_dir/activate.json" 2> "$work_dir/activate.err"; then
-    phase="$("$migration_bin" status --receipt "$receipt" 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("phase",""))' 2>/dev/null || true)"
-    [[ -n "$phase" ]] || phase=unreadable
-    cat >&2 <<EOF
-harklight-postgres: activation reported a failure. The database lifecycle phase is: $phase.
-Read the importer status output before retrying; do not assume either outcome.
-Keep the old Server stopped, do not start any Server, and do not change server.env.
-Retry: harklight-postgres migrate-activate --resume $work_dir
-EOF
-    exit 2
-  fi
-  [[ "$(json_field "$(< "$work_dir/activate.json")" contract_version 2>/dev/null || true)" == 1 ]] || fail "activation output was not a contract-v1 result; read the importer's status before doing anything else"
-  out="$(migration_step status status --receipt "$receipt")"
-  [[ "$(json_field "$out" phase)" == active ]] || fail "activation reported success but the database is not active; read the importer's status"
-  : > "$work_dir/done.activate"
-  note "PostgreSQL destination is active for this import. server.env was not changed and Harklight Server was not started."
-  note "To use it, add to $state/server.env:"
-  note "  export ATTENTION_SERVER_STORE_BACKEND=postgres"
-  note "  source $env_file"
-  note "Rollback to the old stack is valid only until PostgreSQL has accepted new writes; backup: $work_dir/backup"
+  note "Activation is not part of this command and is not available yet."
 }
 
 # ------------------------------------------------------- backup / restore
@@ -1148,7 +1114,6 @@ case "$cmd" in
   apply-grants) do_apply_grants ;;
   verify-roles) do_verify_roles ;;
   migrate) do_migrate ;;
-  migrate-activate) do_migrate_activate ;;
   backup) do_backup ;;
   restore) do_restore ;;
   *) usage ;;

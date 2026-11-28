@@ -116,48 +116,38 @@ ok "material map names server.env, person-id, tls and owner files and external k
 # Resume with the Server not proven stopped runs nothing.
 echo "failed 123" > "$UNIT_STATE"; : > "$FAKE_DIR/calls.log"
 expect_fail "resume refuses a Server not proven stopped" "not proven stopped" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
-expect_fail "activation refuses a Server not proven stopped" "not proven stopped" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
-[[ "$(calls)" == "status status " ]] || bad "importer commands ran with the Server not proven stopped: $(calls)"
+[[ "$(calls)" == "status " ]] || bad "importer commands ran with the Server not proven stopped: $(calls)"
 echo "inactive 0" > "$UNIT_STATE"
 
 # Material that fails verification blocks activation.
 staged="$wd/staging/root/server.env"
 cp "$staged" "$scratch/staged.keep"; echo tampered >> "$staged"
-expect_fail "activation refuses staged material whose hash differs" "could not be verified" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+expect_fail "resume refuses staged material whose hash differs" "could not be verified" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
 [[ "$(m -c 'select phase from harklight.import_state')" == validated ]] || bad "activated despite bad material"
 cp "$scratch/staged.keep" "$staged"
 cp "$wd/staging/COMPLETE.json" "$scratch/complete.keep"; echo ' ' >> "$wd/staging/COMPLETE.json"
-expect_fail "activation refuses a COMPLETE.json that does not match its digest" "does not match its recorded digest" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+expect_fail "resume refuses a COMPLETE.json that does not match its digest" "does not match its recorded digest" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
 cp "$scratch/complete.keep" "$wd/staging/COMPLETE.json"
 echo changed > "$scratch/ext/server.key"; chmod 600 "$scratch/ext/server.key"
-expect_fail "material install never overwrites a differing file" "was not overwritten" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+expect_fail "material install never overwrites a differing file" "was not overwritten" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
 printf 'synthetic external key\n' > "$scratch/ext/server.key"; chmod 644 "$scratch/ext/server.key"
-expect_fail "material install refuses an identical file that is not private" "not private" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+expect_fail "material install refuses an identical file that is not private" "not private" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
 chmod 600 "$scratch/ext/server.key"
 chmod 644 "$staged"
-expect_fail "material install refuses staged files that are not private" "is not private" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+expect_fail "material install refuses staged files that are not private" "is not private" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
 chmod 600 "$staged"
 chmod 755 "$wd/staging"
-expect_fail "material install refuses a staging directory that is not private" "is not private" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd"
+expect_fail "material install refuses a staging directory that is not private" "is not private" "$tool" migrate "${args[@]}" --migration-bin "$fake" --resume "$wd"
 chmod 700 "$wd/staging"
 [[ "$(m -c 'select phase from harklight.import_state')" == validated ]] || bad "activated despite material problems"
-ok "material problems block activation and leave the destination validated"
-
-# Activation is a separate explicit step; an ambiguous failure never claims "nothing was activated".
-expect_fail "activation without a completed migration is refused" "has no completed validation" "$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$scratch"
-export FAKE_FAIL_AT=activate
-out="$("$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd" 2>&1 || true)"
-[[ "$out" == *"lifecycle phase is: validated"* && "$out" != *"Nothing was activated"* ]] || bad "failed activation did not report the real phase: $out"
-unset FAKE_FAIL_AT
-"$tool" migrate-activate "${args[@]}" --migration-bin "$fake" --resume "$wd" >"$scratch/activate.out"
-[[ "$(m -c 'select phase from harklight.import_state')" == active && -e "$wd/done.activate" && "$(envsha)" == "$before_env" ]] || bad "explicit activation failed"
-grep -q 'ATTENTION_SERVER_STORE_BACKEND=postgres' "$scratch/activate.out" || bad "missing final guidance"
-ok "explicit activation reports the real phase on failure, then activates and leaves server.env alone"
+ok "material problems are refused and the destination stays validated"
 
 q() { PGPASSWORD="$(< "$root/postgres/harklight.password")" "$pg_bin/psql" --no-psqlrc -qtA "postgres://harklight@127.0.0.1:$port/harklight?sslmode=disable" -c "$1"; }
 q "select phase from harklight.import_state" >/dev/null
-if q "update harklight.import_state set phase = 'loading'" >/dev/null 2>&1; then bad "runtime role could rewrite import_state"; fi
-ok "runtime role can read but not change the activated import state"
+if q "update harklight.import_state set phase = 'active'" >/dev/null 2>&1; then bad "runtime role could activate the import"; fi
+[[ "$(m -c 'select phase from harklight.import_state')" == validated ]] || bad "phase is not validated at the end"
+ok "runtime role can read but not change the import state; nothing in this slice activates it"
 
+grep -q activate "$FAKE_DIR/calls.log" && bad "activate was called" || true
 expect_fail "migrate refuses a destination that already holds data" "empty, unpublished destination" "$tool" migrate "${args[@]}" --migration-bin "$fake"
 printf 'all %d checks passed\n' "$pass"

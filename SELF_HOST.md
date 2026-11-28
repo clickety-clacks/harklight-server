@@ -687,7 +687,6 @@ Run `harklight-postgres status` afterwards.
 ### Migrating an existing SQLite store (not yet available)
 
     "$PACKAGE/bin/harklight-postgres" migrate
-    "$PACKAGE/bin/harklight-postgres" migrate-activate --resume WORKDIR
 
 `migrate` is the installer's side of the stopped-store migration. The packaged
 `bin/harklight-migration` in this release can export and verify, but it does
@@ -703,12 +702,8 @@ grants, and verify the importer's staged identity material against its recorded
 digests, installing only the listed files at their original locations (never
 overwriting a differing file, and refusing material that is not private).
 `migrate` never activates the destination, never edits `server.env` and never
-starts the Server. Activation is the separate explicit command
-`migrate-activate`, which re-checks the stopped Server and the material, runs
-the importer's activation, and then reads the database's real lifecycle phase;
-if activation reports a failure it prints that phase instead of assuming either
-outcome. If any step fails, keep the old Server stopped, fix the cause and run
-`migrate --resume WORKDIR`, or abandon the unpublished destination and restore
+starts the Server; activation is not available in this release. If any step fails, keep the old Server stopped, fix the cause and run
+`migrate --resume WORKDIR` (it repeats every check), or abandon the unpublished destination and restore
 the original backup. Rolling back to the old stack is only valid before
 PostgreSQL has accepted new writes. The orchestration is tested against a test
 double that follows the importer's recorded command contract; it has not been
