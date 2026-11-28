@@ -486,3 +486,11 @@ source facts. Current metadata uses the same source fallback semantics and a
 separate atomic checkpoint; future runtime writers must recompute it when the
 substantive revision changes. Any externalized origin-result field uses the
 verified LargeText path projection rather than a raw marker.
+
+`ImportSubscriptions.run/3` projects exact inbound device subscriptions into
+`device_subscription_heads` and `device_subscription_senders` compatibility
+facts. The source revision and sender set are copied together with the loading
+checkpoint; active devices without a source subscription get the source's
+known-empty revision 0. Revoked devices without a row get no invented head.
+Sender grants remain separate certificate authority and are never treated as
+inbound subscriptions. Raw source subscriptions remain unchanged.
