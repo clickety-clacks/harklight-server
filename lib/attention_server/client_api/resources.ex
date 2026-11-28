@@ -329,12 +329,22 @@ defmodule AttentionServer.ClientAPI.Resources do
           )
       end)
 
+    chat_payload(Map.get(record, :session_handle), %{
+      chat_started: Map.get(summary, :chat_started, false),
+      read_through: read_through,
+      latest_origin_reply_seq: Map.get(summary, :latest_origin_reply_seq),
+      unread_replies: unread
+    }, reply)
+  end
+
+  @doc false
+  def chat_payload(handle, summary, reply) do
     chat = %{
-      "available" => is_binary(Map.get(record, :session_handle)),
-      "started" => Map.get(summary, :chat_started, false),
-      "read_position" => optional_entry_id(read_through),
-      "last_origin_reply" => optional_entry_id(Map.get(summary, :latest_origin_reply_seq)),
-      "unread_replies" => unread
+      "available" => is_binary(handle),
+      "started" => summary.chat_started,
+      "read_position" => optional_entry_id(summary.read_through),
+      "last_origin_reply" => optional_entry_id(summary.latest_origin_reply_seq),
+      "unread_replies" => summary.unread_replies
     }
 
     # Today's chat-reply row, whenever the item has an agent reply (contract

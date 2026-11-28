@@ -1,6 +1,7 @@
 defmodule AttentionServer.Repository.Postgres.Operations do
   @moduledoc false
 
+  alias AttentionServer.JSON
   alias AttentionServer.ClientAPI.{Idempotency, Writes}
   alias AttentionServer.Repository.Postgres.{Attributes, Repo, Transaction}
 
@@ -36,16 +37,65 @@ defmodule AttentionServer.Repository.Postgres.Operations do
     end
   end
 
+  # Native web writes retain the original response. The caller holds the
+  # person lock across both receipt namespaces and the settings update.
+  def execute_native_client({person, key}, digest, at_ms, write, project) do
+    if Repo.in_transaction?() do
+      native_receipt(person, key, digest, at_ms, write, project)
+    else
+      {:error, :transaction_required}
+    end
+  end
+
+  defp native_receipt(person, key, digest, at_ms, write, project) do
+    with {:ok, nil} <- retained(person, "", key, digest, at_ms, project) do
+      case lookup([person, "", @recent, key], digest, at_ms) do
+        {:ok, nil} ->
+          execute({person, "", @retained, key}, digest, at_ms, nil, fn ->
+            with {:ok, status, body} <- write.(),
+                 :ok <- save_original_body(person, key, digest, status, body, at_ms) do
+              {:ok, status, body}
+            end
+          end)
+
+        {:ok, {status, evidence, false}} ->
+          project_recent(status, evidence, true, project)
+
+        {:ok, _} -> {:error, :receipt_unavailable}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp save_original_body(person, key, digest, status, body, at_ms) do
+    address = Attributes.key({person, key})
+    raw = [person, key, Base.encode16(digest, case: :lower), status, JSON.encode!(body), at_ms, 1]
+
+    case Transaction.query(
+           "INSERT INTO harklight.compatibility_facts (family, address, body) VALUES ($1, $2, $3)",
+           [@retained, address, Attributes.encode(raw)]
+         ) do
+      {:ok, %{num_rows: 1}} -> :ok
+      {:ok, _} -> {:error, :receipt_unavailable}
+      {:error, _} = error -> error
+    end
+  end
+
   defp recent(scope, digest, at_ms, write, project) do
     expires_at_ms = at_ms + Idempotency.retention_ms()
 
     with {:ok, {status, evidence, false}, replayed?} <-
-           execute_receipt(scope, digest, at_ms, expires_at_ms, false, write),
-         {:replay, ^status, body} <- Writes.render_receipt(evidence, status, :recent, project) do
-      {:ok, {status, body, replayed?}}
+           execute_receipt(scope, digest, at_ms, expires_at_ms, false, write) do
+      project_recent(status, evidence, replayed?, project)
     else
       {:ok, _, _} -> {:error, :receipt_unavailable}
       {:error, _} = error -> error
+    end
+  end
+
+  defp project_recent(status, evidence, replayed?, project) do
+    with {:replay, ^status, body} <- Writes.render_receipt(evidence, status, :recent, project) do
+      {:ok, {status, body, replayed?}}
     end
   end
 

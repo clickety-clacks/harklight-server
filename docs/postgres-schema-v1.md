@@ -11,14 +11,16 @@ startup must check the installed version and performs no DDL.
 The explicit migration job applies
 [`001_initial.sql`](../priv/postgres/001_initial.sql),
 [`002_message_history.sql`](../priv/postgres/002_message_history.sql),
-[`003_large_text.sql`](../priv/postgres/003_large_text.sql), and
-[`004_conversation_read_positions.sql`](../priv/postgres/004_conversation_read_positions.sql)
+[`003_large_text.sql`](../priv/postgres/003_large_text.sql),
+[`004_conversation_read_positions.sql`](../priv/postgres/004_conversation_read_positions.sql), and
+[`005_shared_message_history.sql`](../priv/postgres/005_shared_message_history.sql)
 in order.
 They use the same advisory lock. For a fresh import, the schema digest is
 SHA-256 over the ordered files' concatenated bytes. When resuming an import
 claimed under an earlier version, keep its original pinned digest.
-Version 2 represents message history, version 3 adds shared large text, and
-version 4 represents revisionless read-position facts.
+Version 2 represents message history, version 3 adds shared large text,
+version 4 represents revisionless read-position facts, and version 5 represents
+shared message identities and retained sender and group history.
 
 - Keep person IDs and principal keys as opaque text. Preserve the server
   instance ID, cursor signing bytes and integer epoch exactly. Preserve
@@ -32,6 +34,16 @@ version 4 represents revisionless read-position facts.
   facts in the same conversation. A source read-position fact has a null
   `request_revision`. Keep its original `read_through_conversation_seq`
   and the corresponding `read_positions` row.
+- For shared messages, set `kind = 'shared'` and keep the original shared ID
+  in both `messages.id` and `messages.message_id`. Keep the original sender
+  person, key, and sender ID, with a null `session_handle`. Ordinary and shared
+  identity tuples have separate uniqueness. A historical sender key records
+  provenance. Sender requests still require a current principal and grant.
+  Keep the complete typed source record, including frozen state and group ID
+  and name, in attributes. Set the normalized `group_id` reference only for
+  an existing group. Deleting that group clears the reference while retaining
+  the historical attributes. Keep each recipient's exact local item ID and
+  typed row, including seen and frozen-revision data.
 - Store each original revision as a separate row. Keep exact wire values and
   legacy fields needed for projection in the versioned JSON bodies or
   attributes. Canonical digests are stored as bytes without rehashing during
@@ -121,7 +133,7 @@ to begin in `loading`, rejects skipped or reversed phase transitions, and
 prevents replacing the source, schema, import identity or validated manifest.
 Restarting from scratch requires a new unpublished destination. An opted-in
 runtime must require both
-schema version 4 and `phase = 'active'` plus the server identity row. The
+schema version 5 and `phase = 'active'` plus the server identity row. The
 identity row alone cannot publish partial imports. An isolated fresh database
 uses the same lifecycle with a manifest describing the newly provisioned
 synthetic data.
