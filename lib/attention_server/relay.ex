@@ -44,6 +44,7 @@ defmodule AttentionServer.Relay do
   }
 
   alias AttentionServer.JSON, warn: false
+  alias AttentionServer.Repository.Command
   alias AttentionServer.Repository.CommittedRead
   alias AttentionServer.Store.Persistence
 
@@ -1002,7 +1003,7 @@ defmodule AttentionServer.Relay do
     with {:ok, person} <- Engine.authorized_person(state.store.engine, key),
          {:ok, nil} <- before_app_command(state, durable),
          :ok <- client_command_enabled(state, command),
-         :ok <- verify_staged_reply_sources(state.store, person, sources) do
+         :ok <- Command.verify_sources(state.store, person, sources) do
       {reply, next} = perform_command(state, key, command, sources, durable)
       {:reply, committed_app_response(next, durable, reply), next}
     else
@@ -3160,17 +3161,6 @@ defmodule AttentionServer.Relay do
   @doc false
   def apply_agent_command(state, request), do: dispatch_call(request, nil, state)
 
-  # Copying uploads takes place outside the Relay. Check the source handles
-  # here so a completed discard cannot be followed by a reply using that handle.
-  defp verify_staged_reply_sources(store, person, sources) do
-    Enum.reduce_while(sources, :ok, fn {_upload_id, file_id}, :ok ->
-      case AttentionServer.ClientAPI.Uploads.fetch(store, person, file_id) do
-        {:ok, _} -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
-
   defp client_command_enabled(%{push_enabled: false}, %{"type" => type})
        when type in ["push_register", "push_remove"],
        do: {:error, "forbidden", nil, nil}
@@ -3178,12 +3168,8 @@ defmodule AttentionServer.Relay do
   defp client_command_enabled(_state, _command), do: :ok
 
   defp perform_command(state, key, command, staged_sources, durable \\ nil) do
-    {next_engine, reply} = Engine.request_command(state.store.engine, key, command, state.clock.())
-
-    next_engine =
-      if match?({:ok, _}, reply),
-        do: record_staged_reply_sources(next_engine, staged_sources),
-        else: next_engine
+    {next_engine, reply} =
+      Command.execute(state.store, key, command, staged_sources, state.clock.())
 
     next_engine = with_coverage_availability(state, key, next_engine)
     next_engine = initial_delivery_availability(state, key, next_engine, command)
@@ -3225,15 +3211,6 @@ defmodule AttentionServer.Relay do
   end
 
   defp refresh_new_agent_session(_, next, _, _), do: next
-
-  defp record_staged_reply_sources(engine, sources) when map_size(sources) == 0, do: engine
-
-  defp record_staged_reply_sources(engine, sources) do
-    Enum.reduce(sources, engine, fn {upload_id, file_id}, state ->
-      upload = Map.fetch!(state.uploads, upload_id)
-      Engine.put_row(state, :uploads, upload_id, Map.put_new(upload, :staged_file_id, file_id))
-    end)
-  end
 
   defp before_app_command(_state, nil), do: {:ok, nil}
 
@@ -3325,29 +3302,12 @@ defmodule AttentionServer.Relay do
 
   defp storage_failure(_command), do: {:error, "storage_unavailable", nil, nil}
 
-  if Mix.env() == :test do
-    defp commit_request(store, next, %{action: "message_open"} = audit, raw)
-         when is_binary(raw) do
-      case JSON.decode_line(raw) do
-        {:ok, command} -> commit_request(store, next, audit, command)
-        _ -> {:error, :storage_unavailable, store}
-      end
-    end
-  end
-
-  defp commit_request(store, next, %{action: "message_open", person: person} = audit, %{
-         "sender_id" => sender,
-         "message_id" => id
-       }) do
-    with {:ok, next} <-
-           AttentionServer.AgentAPI.Advisories.stamp_decisions(store, next, [{person, sender, id}]) do
-      commit(store, next, audit)
-    else
+  defp commit_request(store, next, audit, original) do
+    case Command.prepare_commit(store, next, audit, original) do
+      {:ok, prepared} -> commit(store, prepared, audit)
       _ -> {:error, :storage_unavailable, store}
     end
   end
-
-  defp commit_request(store, next, audit, _original), do: commit(store, next, audit)
 
   defp hosted_jev_connection(opts) do
     if Keyword.get(opts, :deployment_mode) == :saas do
