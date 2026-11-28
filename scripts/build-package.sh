@@ -24,6 +24,7 @@ install -m 755 scripts/migration-export.sh "$stage/$name/bin/harklight-migration
 install -m 644 docs/postgres-migration-source.md "$stage/$name/MIGRATION.md"
 install -m 755 scripts/check-store-compatibility.py "$stage/$name/bin/harklight-check-store"
 install -m 755 scripts/start-server-checked.sh "$stage/$name/bin/harklight-start-server-checked"
+install -m 755 scripts/harklight-postgres.sh "$stage/$name/bin/harklight-postgres"
 install -m 644 SELF_HOST.md "$stage/$name/SELF_HOST.md"
 install -m 644 GUIDED_JOIN.md "$stage/$name/GUIDED_JOIN.md"
 mkdir -p "$stage/$name/fixtures/compatibility"
