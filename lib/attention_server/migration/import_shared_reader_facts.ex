@@ -1,11 +1,12 @@
 defmodule AttentionServer.Migration.ImportSharedReaderFacts do
   @moduledoc false
   alias AttentionServer.{JSON, SharedMessages}
-  alias AttentionServer.Migration.{Bundle, ImportRows, ImportSession, ImportSharedMessages}
+  alias AttentionServer.Migration.{Bundle, ImportRows, ImportSession, ImportSharedMessages, ImportUploads}
   alias AttentionServer.Repository.Postgres.Attributes
 
   def run(db, identity, bundle) do
     with :ok <- ImportSharedMessages.run(db, identity, bundle),
+         :ok <- ImportUploads.run(db, identity, bundle),
          {:ok, manifest, _} <- Bundle.verify(bundle),
          :ok <- phase(db, identity, bundle, manifest, "people", [:persons]),
          :ok <- phase(db, identity, bundle, manifest, "organizations", [:local_organizations, :hosted_organizations]),
@@ -40,7 +41,12 @@ defmodule AttentionServer.Migration.ImportSharedReaderFacts do
       revisions = Map.keys(Map.get(record, :history, %{})) ++ [record.revision]
       each(Enum.sort(Enum.uniq(revisions)), fn revision ->
         historical = SharedMessages.historical_record(record, revision)
-        fact(db, "shared_revision_files", {id, revision}, Map.get(historical, :files, []))
+        files = Map.get(historical, :files, [])
+        with :ok <- each(Enum.with_index(files), fn {file, ordinal} ->
+               link(db, record, revision, ordinal, file)
+             end) do
+          fact(db, "shared_revision_files", {id, revision}, files)
+        end
       end)
     end
   end
@@ -60,6 +66,34 @@ defmodule AttentionServer.Migration.ImportSharedReaderFacts do
       _ -> {:error, :shared_reader_source_mismatch}
     end
   end
+
+  defp link(db, record, revision, ordinal, %{"upload_id" => id} = file) do
+    with {:ok, %{rows: [[source_body]]}} <- ImportSession.query(db,
+           "SELECT body FROM harklight.compatibility_facts WHERE family='uploads' AND address=$1",
+           [Attributes.key({:row, :uploads, id})]),
+         {:ok, source} <- Attributes.decode(source_body),
+         true <- source.person == record.sender_person and source.uploader == record.sender_key and
+           source.message_id == record.id and source.sender_id == record.sender_id and
+           not Map.has_key?(source, :shared_entry_id) and source.revision <= revision,
+         original = SharedMessages.historical_record(record, source.revision),
+         true <- Enum.any?(Map.get(original, :files, []), &(&1["upload_id"] == id)),
+         [expected] = AttentionServer.ClientAPI.SharedAttachments.references([{source, nil}]),
+         true <- file == expected,
+         {:ok, hash} <- Base.decode16(source.sha256, case: :lower),
+         {:ok, %{num_rows: 1}} <- ImportSession.query(db, """
+           INSERT INTO harklight.message_uploads(message_id,revision,ordinal,upload_id,attributes)
+           SELECT $1,$2,$3,id,$4::text::jsonb FROM harklight.uploads
+           WHERE id=$5 AND person_id=$6 AND owner_key=$7 AND completed_at_ms IS NOT NULL
+             AND size_bytes=$8 AND sha256=$9 AND attributes=$10::text::jsonb
+           """, [record.id, revision, ordinal, JSON.encode!(Attributes.encode(file)), id,
+             source.person, source.uploader, source.size, hash, JSON.encode!(Attributes.encode(source))]) do
+      :ok
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :shared_upload_scope_mismatch}
+    end
+  end
+  defp link(_, _, _, _, _), do: {:error, :shared_upload_scope_mismatch}
 
   defp fact(db, family, key, value) do
     case ImportSession.query(db, """
