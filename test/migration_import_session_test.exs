@@ -468,6 +468,85 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       Agent.stop(fixture.clock)
     end
 
+    for mode <- [:implicit, :reset], epoch <- [1, 17] do
+      @tag timeout: 120_000, mode: mode, epoch: epoch
+      test "source stream fallback #{mode} at epoch #{epoch}", %{mode: mode, epoch: epoch} do
+        alias AttentionServer.{ChangeLog, Store}
+        alias AttentionServer.Store.RecordTable
+        alias AttentionServer.Repository.Postgres.{Repo, Streams}
+        uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
+        assert uri.host in ["localhost", "127.0.0.1"]
+        [user, password] = String.split(uri.userinfo, ":", parts: 2)
+        config = [hostname: uri.host, port: uri.port, username: URI.decode(user),
+          password: URI.decode(password), database: "migration_#{mode}_#{epoch}"]
+        db = start_supervised!({Postgrex, config})
+        root = Path.join(System.tmp_dir!(), "stream-fallback-#{System.unique_integer([:positive])}")
+        File.mkdir!(root)
+        File.chmod!(root, 0o700)
+        on_exit(fn -> File.rm_rf!(root) end)
+        fixture = CompatibilityScenarios.fixture(Path.join(root, "history"))
+        {:ok, relay} = CompatibilityScenarios.start(fixture)
+        try do
+          CompatibilityScenarios.run(relay, fixture)
+        after
+          GenServer.stop(relay)
+        end
+        path = Path.join(fixture.root, "relay.sqlite3")
+        {:ok, store} = Store.open_relay(path)
+        {{person, _, _}, _} = Enum.at(store.engine.messages, 0)
+        assert ChangeLog.seeded?(store.engine, person)
+        :ok = RecordTable.run(store.db,
+          "INSERT INTO client_change_log_epoch VALUES(1,?) ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch", [epoch])
+
+        if mode == :implicit do
+          # Valid cut-over history: durable content exists before a person has
+          # any change-log rows. Do not derive a head from allocation counters.
+          for table <- ~w(client_change_log_meta client_changes client_resource_revs client_resource_created) do
+            :ok = RecordTable.run(store.db, "DELETE FROM " <> table <> " WHERE person_id=?", [person])
+          end
+        else
+          # Exercise the real reconciliation operation, which deliberately
+          # clears revision rows but retains resource creation timestamps.
+          {:ok, [[version]]} = RecordTable.select(store.db,
+            "SELECT store_version FROM client_change_log_state WHERE id=1")
+          :ok = ChangeLog.enable(store.db, version + 1)
+          assert {:ok, [[0]]} = RecordTable.select(store.db, "SELECT count(*) FROM client_resource_revs")
+        end
+
+        source = %{store | change_log: true}
+        assert {:ok, head} = ChangeLog.head(source, person)
+        if mode == :implicit, do: assert(head == epoch)
+        assert {:ok, [], false, ^head} = ChangeLog.read(source, person, head, 50)
+        assert {:error, :cursor_expired} = ChangeLog.read(source, person, head - 1, 50)
+        assert {:ok, created} = RecordTable.select(store.db,
+          "SELECT person_id,resource_id,created_at_ms FROM client_resource_created")
+        expected_created = Enum.map(created, fn [p, id, at] ->
+          assert {:ok, rev} = ChangeLog.rev(source, p, id)
+          {p, id, at, rev}
+        end)
+        if mode == :reset, do: assert(expected_created != [])
+        :ok = Store.close(store)
+        bundle = Path.join(root, "export")
+        assert {:ok, summary} = Bundle.export(path, bundle,
+          supervisor: {:operator, "synthetic fixture", "stopped fallback source"}, material: %{})
+        identity = %{id: "synthetic-fallback", source: Base.decode16!(summary.sha256, case: :lower),
+          schema: AttentionServer.Repository.Postgres.Schema.digest()}
+        assert :ok = ImportStreams.run(db, identity, bundle)
+        assert :ok = ImportStreams.run(db, identity, bundle)
+        start_supervised!({Repo, config})
+        assert {:ok, [], false, ^head} = Streams.person_page(person, head, 50)
+        assert {:error, :cursor_expired} = Streams.person_page(person, head - 1, 50)
+        stop_supervised!(Repo)
+        for {p, id, at, rev} <- expected_created do
+          {:ok, kind} = ImportStreams.person_kind(id)
+          assert {:ok, %{rows: [[^rev, ^at]]}} = ImportSession.query(db,
+            "SELECT revision,first_seen_at_ms FROM harklight.stream_resource_revisions WHERE person_id=$1 AND origin_key='' AND resource_kind=$2 AND resource_id=$3", [p, kind, id])
+        end
+        assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+        Agent.stop(fixture.clock)
+      end
+    end
+
     defp verify_streams(db, bundle, manifest) do
       for table <- ~w(client_change_log_meta agent_change_log_meta client_resource_revs client_resource_created client_changes agent_changes agent_item_advisory_changes) do
         source = Map.fetch!(manifest.data.tables, table)

@@ -2,24 +2,65 @@ defmodule AttentionServer.Migration.ImportStreams do
   @moduledoc false
   alias AttentionServer.Migration.{Bundle, ImportAccounts, ImportRows, ImportSession, ImportTables}
 
-  @tables ~w(client_change_log_meta agent_change_log_meta client_resource_revs client_resource_created client_changes agent_changes agent_item_advisory_changes)
+  @tables ~w(client_change_log_meta agent_change_log_meta implicit_person_meta client_resource_revs client_resource_created client_changes agent_changes agent_item_advisory_changes)
 
   def run(db, identity, root) do
     with :ok <- ImportAccounts.run(db, identity, root),
          :ok <- ImportTables.run(db, identity, root),
          {:ok, manifest, _} <- Bundle.verify(root) do
       Enum.reduce_while(@tables, :ok, fn table, :ok ->
+        result = if table == "implicit_person_meta" do
+          implicit_heads(db, identity, root, manifest)
+        else
+          import_table(db, identity, root, manifest, table)
+        end
+        case result do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+      end)
+    end
+  end
+
+  defp import_table(db, identity, root, manifest, table) do
         case Map.fetch(manifest.data.tables, table) do
-          :error -> {:cont, :ok}
+          :error -> :ok
           {:ok, source} ->
             case ImportRows.run(db, identity, "streams/" <> table <> "/v1",
                    Path.join(root, source.file), source.summary, fn _ -> true end,
                    fn tx, rows -> each(rows, &row(tx, table, &1)) end) do
-              {:ok, _} -> {:cont, :ok}
-              error -> {:halt, error}
+              {:ok, _} -> :ok
+              error -> error
             end
         end
-      end)
+  end
+
+  # Match ChangeLog.seeded?/2 using retained facts, not independent allocation
+  # highs. Explicit metadata has already been copied and always wins.
+  defp implicit_heads(db, identity, root, manifest) do
+    select = fn
+      {{:row, field, _}, _} -> field in [:messages, :conversation_events, :bounce_levels, :alert_choices]
+      _ -> false
+    end
+    case ImportRows.run(db, identity, "streams/implicit_person_meta/v1",
+           Path.join(root, "records.frames"), manifest.data.records, select,
+           fn tx, rows ->
+             each(rows, fn {{:row, field, key}, _} ->
+               person = if field in [:messages, :conversation_events], do: elem(key, 0), else: key
+               case ImportSession.query(tx,
+                      """
+                      INSERT INTO harklight.stream_heads(person_id,origin_key,head,floor,seed_revision)
+                      SELECT $1,'',cursor_epoch,cursor_epoch,cursor_epoch FROM harklight.server_identity
+                      ON CONFLICT(person_id,origin_key) DO NOTHING
+                      """, [person]) do
+                 {:ok, %{num_rows: count}} when count in [0, 1] -> :ok
+                 {:ok, _} -> {:error, :stream_reference_mismatch}
+                 error -> error
+               end
+             end)
+           end) do
+      {:ok, _} -> :ok
+      error -> error
     end
   end
 
@@ -56,7 +97,19 @@ defmodule AttentionServer.Migration.ImportStreams do
   defp row(db, "client_resource_created", [person, id, at]) do
     with {:ok, kind} <- person_kind(id) do
       execute(db,
-        "UPDATE harklight.stream_resource_revisions SET first_seen_at_ms=$5 WHERE person_id=$1 AND origin_key=$2 AND resource_kind=$3 AND resource_id=$4",
+        """
+        INSERT INTO harklight.stream_resource_revisions
+          (person_id,origin_key,resource_kind,resource_id,revision,first_seen_at_ms)
+        SELECT head.person_id,head.origin_key,$3,$4,coalesce(resource.revision,head.seed_revision),$5
+        FROM harklight.stream_heads head
+        LEFT JOIN harklight.stream_resource_revisions resource
+          ON resource.person_id=head.person_id AND resource.origin_key=head.origin_key
+          AND resource.resource_kind=$3 AND resource.resource_id=$4
+        WHERE head.person_id=$1 AND head.origin_key=$2
+          AND coalesce(resource.revision,head.seed_revision) > 0
+        ON CONFLICT(person_id,origin_key,resource_kind,resource_id)
+        DO UPDATE SET first_seen_at_ms=excluded.first_seen_at_ms
+        """,
         [person, "", kind, id, at])
     end
   end

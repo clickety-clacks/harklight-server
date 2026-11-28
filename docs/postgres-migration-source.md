@@ -267,3 +267,13 @@ their positions. Agent rows with null timestamps enter only the revision index.
 Original person resource creation timestamps are copied to that index. Unknown
 kinds, missing stream heads and revisions beyond a recorded head refuse the
 stage. Checkpointed batches remain in the unpublished loading phase.
+
+A person with no explicit change-log metadata retains FORMAT32's effective
+bounds: the current epoch when messages, conversation entries, bounce settings
+or alert settings exist, otherwise zero. Independent allocation counters do not
+substitute for those retained facts. Explicit metadata always wins. When source
+reconciliation has removed revision rows but kept creation timestamps, the
+projection retains each timestamp with the source stream's effective seed
+revision. It does not create a feed event or advance the head. Dedicated fixtures
+exercise implicit bounds at epochs 1 and 17 and the actual source reconciliation
+path, then compare saved-cursor reads with the PostgreSQL stream reader.
