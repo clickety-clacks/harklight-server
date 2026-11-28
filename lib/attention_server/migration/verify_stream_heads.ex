@@ -1,10 +1,12 @@
 defmodule AttentionServer.Migration.VerifyStreamHeads do
   @moduledoc false
-  alias AttentionServer.Migration.{Bundle, Frames, ImportSession, VerifyFacts}
+  alias AttentionServer.Migration.{Bundle, Frames, ImportSession, Source, VerifyFacts}
   alias AttentionServer.Store.RecordTable
   alias Exqlite.Sqlite3
 
-  def run(db, identity, bundle) do
+  # The query seam permits deterministic isolated source-change tests. The CLI
+  # never accepts a callback; normal callers use the real PostgreSQL connection.
+  def run(db, identity, bundle, query \\ &ImportSession.query/3) do
     with {:ok, _} <- VerifyFacts.run(db, identity, bundle),
          {:ok, manifest, _} <- Bundle.verify(bundle),
          {:ok, source} <- Sqlite3.open(Path.join(bundle, "source.sqlite3"), mode: :readonly) do
@@ -13,10 +15,11 @@ defmodule AttentionServer.Migration.VerifyStreamHeads do
              {:ok, epoch} <- epoch(source, manifest),
              :ok <- explicit(source, bundle, manifest),
              {:ok, values} <- retained(source, bundle, manifest, epoch),
-             :ok <- identity(db, values, epoch),
-             :ok <- pages(db, source, nil),
+             :ok <- identity(db, values, epoch, query),
+             :ok <- pages(db, source, nil, query),
              {:ok, [[count]]} <- RecordTable.select(source, "SELECT count(*) FROM temp.expected_heads"),
-             {:ok, %{rows: [[^count]]}} <- ImportSession.query(db, "SELECT count(*) FROM harklight.stream_heads", []) do
+             {:ok, %{rows: [[^count]]}} <- query.(db, "SELECT count(*) FROM harklight.stream_heads", []),
+             :ok <- source_unchanged(bundle, manifest) do
           {:ok, %{heads: count, epoch: epoch}}
         else
           {:error, _} = error -> error
@@ -25,6 +28,15 @@ defmodule AttentionServer.Migration.VerifyStreamHeads do
       after
         Sqlite3.close(source)
       end
+    end
+  end
+
+  defp source_unchanged(bundle, manifest) do
+    expected = manifest.source
+    case Source.file_observation(Path.join(bundle, "source.sqlite3")) do
+      {:ok, %{size: size, sha256: hash}}
+      when size == expected.source_bytes and hash == expected.source_sha256 -> :ok
+      _ -> {:error, :stream_source_changed}
     end
   end
 
@@ -91,17 +103,17 @@ defmodule AttentionServer.Migration.VerifyStreamHeads do
     end)
   end
 
-  defp identity(db, %{relay_instance_id: instance, agent_cursor_key: key}, epoch) do
-    case ImportSession.query(db,
+  defp identity(db, %{relay_instance_id: instance, agent_cursor_key: key}, epoch, query) do
+    case query.(db,
       "SELECT instance_id,cursor_signing_key,cursor_epoch FROM harklight.server_identity", []) do
       {:ok, %{rows: [[^instance, ^key, ^epoch]]}} -> :ok
       {:error, _} = error -> error
       _ -> {:error, :cursor_identity_mismatch}
     end
   end
-  defp identity(_, _, _), do: {:error, :cursor_identity_missing}
+  defp identity(_, _, _, _), do: {:error, :cursor_identity_missing}
 
-  defp pages(db, source, after_key) do
+  defp pages(db, source, after_key, query) do
     {where, params} = case after_key do
       nil -> {"", []}
       {person, origin} -> {"WHERE (person_id,origin_key)>(?,?)", [person, origin]}
@@ -109,19 +121,19 @@ defmodule AttentionServer.Migration.VerifyStreamHeads do
     with {:ok, rows} <- RecordTable.select(source,
            "SELECT person_id,origin_key,head,floor,seed FROM temp.expected_heads " <> where <>
              " ORDER BY person_id,origin_key LIMIT 256", params),
-         :ok <- compare(db, rows) do
+         :ok <- compare(db, rows, query) do
       case rows do
         [] -> :ok
         _ ->
           [person, origin | _] = List.last(rows)
-          pages(db, source, {person, origin})
+          pages(db, source, {person, origin}, query)
       end
     end
   end
 
-  defp compare(db, rows) do
+  defp compare(db, rows, query) do
     Enum.reduce_while(rows, :ok, fn [person, origin, head, floor, seed], :ok ->
-      case ImportSession.query(db,
+      case query.(db,
         "SELECT head,floor,seed_revision FROM harklight.stream_heads WHERE person_id=$1 AND origin_key=$2", [person, origin]) do
         {:ok, %{rows: [[^head, ^floor, ^seed]]}} -> {:cont, :ok}
         {:error, _} = error -> {:halt, error}
