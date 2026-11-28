@@ -139,7 +139,7 @@ jobs:
           apply_schema migration_explicit_epoch
           docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c 'CREATE DATABASE migration_implicit_roster'
           apply_schema migration_implicit_roster
-          for fixture_db in migration_large_text migration_upload_bytes migration_invalid_ack migration_implicit_1 migration_implicit_17 migration_reset_1 migration_reset_17; do
+          for fixture_db in migration_shared_history migration_large_text migration_upload_bytes migration_invalid_ack migration_implicit_1 migration_implicit_17 migration_reset_1 migration_reset_17; do
             docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c "CREATE DATABASE $fixture_db"
             apply_schema "$fixture_db"
           done
@@ -152,4 +152,4 @@ jobs:
           HARKLIGHT_MIGRATION_TEST_URL: postgres://fixture:fixture-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/migration_fixture
           ATTENTION_SERVER_ENABLE: '0'
           ERL_FLAGS: '+S 2:2'
-        run: mix test test/migration_import_session_test.exs test/migration_bundle_test.exs test/migration_material_identity_test.exs test/migration_large_text_source_test.exs test/migration_large_text_import_test.exs test/migration_recipient_state_test.exs test/migration_subscription_test.exs test/migration_entry_test.exs test/migration_prepare_schema_test.exs
+        run: mix test test/migration_import_session_test.exs test/migration_bundle_test.exs test/migration_material_identity_test.exs test/migration_large_text_source_test.exs test/migration_large_text_import_test.exs test/migration_recipient_state_test.exs test/migration_subscription_test.exs test/migration_entry_test.exs test/migration_prepare_schema_test.exs test/migration_shared_messages_test.exs

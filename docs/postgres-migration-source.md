@@ -574,3 +574,15 @@ schema may advance, retaining its original import digest and rows. An interrupte
 setup resumes from the last committed schema version. Application startup never
 calls this primitive. The complete packaged import command and activation gates
 remain unfinished; capabilities continue to report migration_ready=false.
+
+`ImportSharedMessages.run/3` adopts landed schema 005. It preserves exact shared
+IDs, original historical sender provenance without creating principals, known
+revision timestamps, all retained message bodies, and complete typed source and
+recipient attributes, including frozen state. A deleted group's ID/name remains
+in historical attributes; the live group foreign key is filled only when the
+group still exists. Ordinary sender/message tuple consumers explicitly select
+kind ordinary, so an allowed shared tuple collision cannot redirect them.
+Message and recipient phases resume independently after interruption. The
+record-level frozen-view test reconstructs the same source projection from
+imported attributes; bounded shared reader facts, attachments, answers and actual
+import-to-HTTP parity remain required before activation.

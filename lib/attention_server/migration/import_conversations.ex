@@ -38,7 +38,7 @@ defmodule AttentionServer.Migration.ImportConversations do
     each(rows, fn {{:row, :chat_read_positions, {person, sender, external} = key}, position} ->
       with true <- is_integer(position) and position >= 0,
            {:ok, %{rows: [[id]]}} <- ImportSession.query(db,
-             "SELECT id FROM harklight.messages WHERE person_id=$1 AND sender_id=$2 AND message_id=$3",
+             "SELECT id FROM harklight.messages WHERE kind='ordinary' AND person_id=$1 AND sender_id=$2 AND message_id=$3",
              [person, sender, external]),
            :ok <- source_position(db, key, position) do
         execute(db,

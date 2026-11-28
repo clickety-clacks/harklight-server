@@ -4,7 +4,7 @@ defmodule AttentionServer.Migration.ImportSharedMessages do
   alias AttentionServer.Migration.{Bundle, ImportLargeText, ImportOrganizations, ImportRows, ImportSession}
   alias AttentionServer.Repository.Postgres.Attributes
 
-  # Draft for explicit schema 005. Never creates a principal or resurrects a
+  # Explicit schema 005 mapping. Never creates a principal or resurrects a
   # deleted group to make historical provenance satisfy live authority.
   def run(db, identity, bundle) do
     with {:ok, %{rows: [[version]]}} when is_integer(version) and version >= 5 <- ImportSession.query(db,

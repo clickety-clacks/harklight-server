@@ -1,0 +1,144 @@
+if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
+  Code.require_file("../scripts/compatibility/scenarios.exs", __DIR__)
+
+  defmodule AttentionServer.Migration.SharedMessagesTest do
+    use ExUnit.Case, async: false
+    alias AttentionServer.{CompatibilityScenarios, Engine, Groups, SharedMessages, Store}
+    alias AttentionServer.ClientAPI.SharedCapability
+    alias AttentionServer.Migration.{Bundle, ImportConversations, ImportEntries, ImportMessages, ImportSession, ImportSharedMessages}
+    alias AttentionServer.Repository.Postgres.{Attributes, Schema}
+
+    @sender "a1000000-0000-4000-8000-000000000001"
+    @first "a1000000-0000-4000-8000-000000000002"
+    @second "a1000000-0000-4000-8000-000000000003"
+    @group "a2000000-0000-4000-8000-000000000001"
+    @shared "shared_synthetic-collision"
+
+    test "shared records retain historical authority and frozen revisions beside ordinary collisions" do
+      uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
+      assert uri.host in ["localhost", "127.0.0.1"]
+      [user, password] = String.split(uri.userinfo, ":", parts: 2)
+      db = start_supervised!({Postgrex, [hostname: uri.host, port: uri.port,
+        username: URI.decode(user), password: URI.decode(password), database: "migration_shared_history"]})
+      root = Path.join(System.tmp_dir!(), "shared-import-#{System.unique_integer([:positive])}")
+      File.mkdir!(root)
+      File.chmod!(root, 0o700)
+      on_exit(fn -> File.rm_rf!(root) end)
+      fixture = CompatibilityScenarios.fixture(Path.join(root, "source"))
+      {:ok, relay} = CompatibilityScenarios.start(fixture)
+      CompatibilityScenarios.provision(relay, fixture)
+      GenServer.stop(relay)
+      Agent.stop(fixture.clock)
+      path = Path.join(fixture.root, "relay.sqlite3")
+      source = seed(path)
+      bundle = Path.join(root, "bundle")
+      assert {:ok, summary} = Bundle.export(path, bundle,
+        supervisor: {:operator, "synthetic fixture", "Relay stopped"}, material: %{})
+      identity = %{id: "synthetic-shared-import", source: Base.decode16!(summary.sha256, case: :lower), schema: Schema.digest()}
+      assert :ok = ImportMessages.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db, """
+        CREATE FUNCTION harklight.fail_shared_recipient() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.item_id LIKE 'shared_%' THEN RAISE EXCEPTION 'synthetic interruption'; END IF; RETURN NEW; END $$
+        """, [])
+      assert {:ok, _} = ImportSession.query(db,
+        "CREATE TRIGGER fail_shared_recipient BEFORE INSERT ON harklight.message_recipients FOR EACH ROW EXECUTE FUNCTION harklight.fail_shared_recipient()", [])
+      assert {:error, _} = ImportSharedMessages.run(db, identity, bundle)
+      assert {:ok, %{ordinal: 1}} = ImportSession.checkpoint(db, identity, "shared/shared_messages/v1")
+      assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "shared/shared_recipients/v1")
+      assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_shared_recipient ON harklight.message_recipients", [])
+      assert :ok = ImportSharedMessages.run(db, identity, bundle)
+      assert :ok = ImportSharedMessages.run(db, identity, bundle)
+      # Both ordinary tuple consumers must still resolve the ordinary row.
+      assert :ok = ImportConversations.run(db, identity, bundle)
+      assert :ok = ImportEntries.run(db, identity, bundle)
+      assert {:ok, %{rows: [[2]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.messages WHERE person_id=$1 AND sender_id='app:shared-fixture' AND message_id=$2", [@sender, @shared])
+      assert {:ok, %{rows: [[nil, nil, nil, nil, attrs]]}} = ImportSession.query(db,
+        "SELECT group_id,session_handle,accepted_position,principal_origin_key,attributes FROM harklight.messages WHERE id=$1 AND kind='shared'", [@shared])
+      expected = source.shared_messages[@shared]
+      assert {:ok, ^expected} = Attributes.decode(attrs)
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.principals WHERE key='historical-unenrolled-origin'", [])
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.groups WHERE id=$1", [@group])
+      assert {:ok, %{rows: rows}} = ImportSession.query(db,
+        "SELECT person_id,attributes FROM harklight.message_recipients WHERE message_id=$1 ORDER BY person_id", [@shared])
+      recipients = Map.new(rows, fn [person, body] ->
+        assert {:ok, recipient} = Attributes.decode(body)
+        assert recipient == source.shared_recipients[{@shared, person}]
+        {{@shared, person}, recipient}
+      end)
+      restored = %{source | shared_messages: %{@shared => expected}, shared_recipients: recipients}
+      for person <- Map.keys(source.persons), groups? <- [false, true], revision <- [1, 2, 3] do
+        assert visible_revision(restored, person, groups?, revision) == visible_revision(source, person, groups?, revision)
+      end
+      assert {:ok, %{"request_revision" => 1}} = visible_revision(restored, @first, true, 1)
+      assert :not_found = visible_revision(restored, @first, true, 2)
+      assert {:ok, %{"request_revision" => 2}} = visible_revision(restored, @second, true, 2)
+      assert :not_found = visible_revision(restored, @second, false, 1)
+      for revision <- [1, 2] do
+        historical = SharedMessages.historical_record(expected, revision)
+        assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+          "SELECT body FROM harklight.message_revisions WHERE message_id=$1 AND revision=$2", [@shared, revision])
+        assert {:ok, message} = Attributes.decode(body)
+        assert message == historical.message
+      end
+    end
+
+    defp visible_revision(engine, person, groups?, revision) do
+      with true <- MapSet.size(SharedMessages.organizations(engine, person)) > 0 or SharedMessages.retained_history?(engine, person),
+           %{item_id: item} <- engine.shared_recipients[{@shared, person}],
+           {:ok, record, recipient} <- SharedMessages.recipient_message(engine, person, item),
+           true <- SharedCapability.visible?(record, %{groups?: groups?}),
+           historical = SharedMessages.historical_record(record, get_in(recipient, [:frozen, :revision])),
+           true <- revision <= historical.revision do
+        {:ok, SharedMessages.revision(SharedMessages.historical_record(historical, revision))}
+      else
+        _ -> :not_found
+      end
+    end
+
+    defp seed(path) do
+      {:ok, store} = Store.open_relay(path)
+      {engine, :ok, touched} = Engine.with_touches(store.engine, fn engine ->
+        engine = Enum.reduce(Enum.with_index([@sender, @first, @second]), engine, fn {person, n}, acc ->
+          {:ok, next, _} = Engine.hosted_account_create(acc, "shared-fixture-#{n}", false, person, String.duplicate(Integer.to_string(n + 1), 64))
+          next
+        end)
+        {:ok, engine} = Engine.replace_hosted_organization(engine, "shared-business", [@sender, @first, @second], "a3000000-0000-4000-8000-000000000001")
+        {:ok, engine, _} = Groups.replace_hosted(engine, {"shared-business", "team"}, @group, "Retained group", [@sender, @first, @second], 1)
+        attrs = %{id: @shared, sender_person: @sender, sender_key: "historical-unenrolled-origin",
+          sender_id: "app:shared-fixture", message: %{"title" => "First shared revision"},
+          answer_policy: nil, group_id: @group, group_name: "Retained group"} |> Map.put("created_at_ms", 100)
+        {:ok, engine, record, _} = SharedMessages.create(engine, attrs, [@first, @second], nil)
+        {:ok, engine, _} = Groups.replace_hosted(engine, {"shared-business", "team"}, @group, "Retained group", [@sender, @second], 2)
+        {:ok, engine} = SharedMessages.revise(engine, record, 1, %{"title" => "Second shared revision"}, [], 200)
+        {:ok, engine} = Groups.delete_hosted(engine, {"shared-business", "team"})
+        {:ok, engine} = Engine.delete_hosted_organization(engine, "shared-business")
+        {:ok, engine} = Engine.setup_device(engine, @sender, "ordinary-live-origin")
+        {:ok, engine} = Engine.setup_sender(engine, "ordinary-live-origin", "app:shared-fixture")
+        {:ok, engine} = Engine.setup_device(engine, @sender, "ordinary-viewer")
+        frame = %{"type" => "forward", "op_id" => "a4000000-0000-4000-8000-000000000001",
+          "session_handle" => "a4000000-0000-4000-8000-000000000002",
+          "message" => %{"sender_id" => "app:shared-fixture", "message_id" => @shared,
+            "created_at" => 1, "title" => "Ordinary collision", "message_type" => "fyi",
+            "answer_ui" => AttentionServer.Message.seen_descriptor()}}
+        {engine, {:ok, _}} = Engine.request_command(engine, "ordinary-live-origin", frame, 300)
+        discussion = %{"type" => "discussion", "sender_id" => "app:shared-fixture", "message_id" => @shared,
+          "request_revision" => 1, "text" => "Discussion", "op_id" => "a4000000-0000-4000-8000-000000000003"}
+        {engine, {:ok, turn}} = Engine.request_command(engine, "ordinary-viewer", discussion, 301)
+        reply = %{"type" => "conversation_reply", "sender_id" => "app:shared-fixture", "message_id" => @shared,
+          "request_revision" => 1, "in_reply_to" => String.to_integer(turn["event_id"]), "text" => "Reply",
+          "op_id" => "a4000000-0000-4000-8000-000000000004"}
+        {engine, {:ok, result}} = Engine.request_command(engine, "ordinary-live-origin", reply, 302)
+        read = %{"type" => "conversation_read", "sender_id" => "app:shared-fixture", "message_id" => @shared,
+          "read_through_conversation_seq" => result["seq"], "op_id" => "a4000000-0000-4000-8000-000000000005"}
+        {engine, {:ok, _}} = Engine.request_command(engine, "ordinary-viewer", read, 303)
+        {engine, :ok}
+      end)
+      {:ok, store} = Store.commit(store, {engine, touched}, %{person: @sender, actor: "fixture", action: "shared_history"})
+      source = store.engine
+      :ok = Store.close(store)
+      source
+    end
+  end
+end
