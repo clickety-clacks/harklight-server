@@ -619,3 +619,11 @@ and ACKs, and advisory entries. Each must be covered by its own person/origin/se
 counter. Missing or low counters are refused even when source and destination
 agree; the verifier never repairs them. Checking each retained value gives the
 same lower bound as its scoped maximum without retaining all scopes in memory.
+
+`Migration.VerifyOrganizations.run/3` compares Hosted account bindings,
+organizations, membership, group custody and names, mute state, invitations and
+all typed/default attributes with the sealed source. It derives implicit local
+membership from source owners while excluding the exactly verified Hosted
+accounts, and checks explicit rosters without adding owners. Global counts
+reject extra groups, memberships and invitations. The comparison is read-only
+and does not publish or activate the staged import.
