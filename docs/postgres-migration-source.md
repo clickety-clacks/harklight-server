@@ -277,3 +277,14 @@ projection retains each timestamp with the source stream's effective seed
 revision. It does not create a feed event or advance the head. Dedicated fixtures
 exercise implicit bounds at epochs 1 and 17 and the actual source reconciliation
 path, then compare saved-cursor reads with the PostgreSQL stream reader.
+
+`ImportReceipts.run/3` projects `client_idempotency` and
+`harklight_app_receipts` into distinct namespaces with their original operation
+keys. Person scopes use an empty origin; existing encoded Agent scopes decode
+to their original person and origin. Lowercase digest text becomes the same
+32 bytes, and JSON receipt bodies use the shared typed response codec. Recent
+receipts retain expiry at their original timestamp plus 30 days and have
+`original_response=false`; retained receipts have no expiry and preserve their
+source flag. Already-expired but still-stored rows are copied, leaving retention
+decisions to the reader. Full source bytes remain in SQL facts. Repeated import
+uses checkpoints and does not allocate new receipts or publish the target.
