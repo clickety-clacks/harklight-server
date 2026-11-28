@@ -344,3 +344,13 @@ stage repeatable. Inline file descriptors remain in their original message
 record. Shared-message and conversation-entry links and large-data references
 remain distinct follow-up projections; full closure and retained-history checks
 are still required before database validation and activation.
+
+Upload byte completion means that the exported bytes have been copied and their
+length and digest verified; it does not mean that a staged reservation was linked
+to a message. Staged reservations retain their original expiry. Upload cleanup
+preserves every manifest and chunk while an import is loading or validated, so
+cleanup cannot remove a committed chunk prefix before resume. Once active, the
+ordinary cleanup policy again removes expired, unlinked reservations, including
+those whose bytes have been fully transferred. Linked attachments remain retained.
+`ImportBytes` is an internal chunk primitive; the `ImportUploads` entry point
+binds the verified bundle to the import's source digest before calling it.

@@ -415,7 +415,14 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:error, :postgres_not_active} = Transaction.verify_ready()
         verify_messages(db, bundle, manifest)
         verify_receipt_replay(session_person, {agent_person, agent_key}, receipt_digest)
+        wrong_source = %{identity | source: :crypto.hash(:sha256, "different export")}
+        assert {:error, :import_source_mismatch} = ImportUploads.run(db, wrong_source, bundle)
         assert :ok = ImportUploads.run(db, identity, bundle)
+        assert {:ok, %{rows: upload_people}} = ImportSession.query(db,
+          "SELECT DISTINCT person_id FROM harklight.uploads", [])
+        for [person] <- upload_people do
+          assert {:ok, 0} = AttentionServer.Repository.Postgres.Uploads.cleanup(person, 9_000_000_000_000)
+        end
         assert :ok = ImportUploads.run(db, identity, bundle)
         verify_uploads(db, bundle, manifest)
         stop_supervised!(Repo)
@@ -685,6 +692,14 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:error, _} = ImportBytes.run(db, identity, "synthetic-upload", path, expected)
       assert {:ok, %{rows: [[1]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.upload_chunks", [])
       assert {:ok, %{ordinal: 1}} = ImportSession.checkpoint(db, identity, "upload-bytes/synthetic-upload/v1")
+      # An expired source reservation must survive while import is unpublished,
+      # including a partially transferred file whose checkpoint already exists.
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.uploads SET attributes=jsonb_build_object('reservation_expires_at_ms',1) WHERE id='synthetic-upload'", [])
+      start_supervised!({Repo, config})
+      assert {:ok, 0} = Uploads.cleanup("synthetic-person", 2)
+      stop_supervised!(Repo)
+      assert {:ok, %{rows: [[1]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.upload_chunks", [])
       assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_chunk ON harklight.upload_chunks", [])
       <<_, tail::binary>> = bytes
       File.write!(path, <<?z, tail::binary>>)
