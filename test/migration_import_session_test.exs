@@ -633,6 +633,13 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
 
         verify_revision_files(db, identity, bundle, manifest)
         verify_message_drift(db, identity, bundle)
+        assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
+        extra_hash = :crypto.hash(:sha256, "")
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.large_texts(sha256,size_bytes,verified) VALUES($1,0,true)", [extra_hash])
+        assert {:error, :large_text_hash_count_mismatch} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db, "DELETE FROM harklight.large_texts WHERE sha256=$1", [extra_hash])
+        assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
@@ -1494,6 +1501,14 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:error, {:ordinary_message_mismatch, :message, ^digest}} = VerifyMessages.run(db, identity, bundle)
       assert {:ok, _} = ImportSession.query(db,
         "UPDATE harklight.message_recipients SET item_id=$3 WHERE message_id=$1 AND person_id=$2", [id, person, item])
+      assert {:ok, %{rows: [[group]]}} = ImportSession.query(db,
+        "SELECT id FROM harklight.groups ORDER BY id LIMIT 1", [])
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.messages SET group_id=$2 WHERE id=$1", [id, group])
+      assert {:error, {:ordinary_message_mismatch, :message, ^digest}} = VerifyMessages.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "UPDATE harklight.messages SET group_id=NULL WHERE id=$1", [id])
+      assert {:ok, ^verified} = VerifyMessages.run(db, identity, bundle)
       assert {:ok, %{rows: [[revision, revision_at, body]]}} = ImportSession.query(db,
         "SELECT revision,accepted_at_ms,body FROM harklight.message_revisions WHERE message_id=$1 ORDER BY revision LIMIT 1", [id])
       assert {:ok, _} = ImportSession.query(db,
