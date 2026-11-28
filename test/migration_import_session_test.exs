@@ -1572,7 +1572,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "SELECT id FROM harklight.people WHERE id<>$1 LIMIT 1", [person])
       assert {:error, :synthetic_missing_upload} = Postgrex.transaction(db, fn tx ->
         assert {:ok, _} = ImportSession.query(tx, "DELETE FROM harklight.uploads WHERE id=$1", [@ordinary_entry_upload])
-        assert {:error, :ordinary_entry_upload_scope_mismatch} = ImportEntryUploads.run(tx, identity, bundle)
+        # The prerequisite byte importer rejects the missing manifest before
+        # the entry-link scope query is reached.
+        assert {:error, :upload_manifest_mismatch} = ImportEntryUploads.run(tx, identity, bundle)
         Postgrex.rollback(tx, :synthetic_missing_upload)
       end)
       for {column, bad, good} <- [
@@ -1591,21 +1593,34 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       end
       assert :ok = ImportEntryUploads.run(db, identity, bundle)
       assert :ok = ImportEntryUploads.run(db, identity, bundle)
-      assert {:ok, %{rows: [[1, file, ^person, body]]}} = ImportSession.query(db,
-        "SELECT u.ordinal,u.attributes,m.person_id,e.body FROM harklight.conversation_entry_uploads u JOIN harklight.conversation_entries e ON e.conversation_id=u.conversation_id AND e.id=u.entry_id JOIN harklight.conversations c ON c.id=e.conversation_id JOIN harklight.messages m ON m.id=c.message_id WHERE u.upload_id=$1", [@ordinary_entry_upload])
+      assert {:ok, %{rows: [[conversation_id, entry_id, 1, file, ^person, body]]}} = ImportSession.query(db,
+        "SELECT u.conversation_id,u.entry_id,u.ordinal,u.attributes,m.person_id,e.body FROM harklight.conversation_entry_uploads u JOIN harklight.conversation_entries e ON e.conversation_id=u.conversation_id AND e.id=u.entry_id JOIN harklight.conversations c ON c.id=e.conversation_id JOIN harklight.messages m ON m.id=c.message_id WHERE u.upload_id=$1", [@ordinary_entry_upload])
       assert {:ok, event} = Attributes.decode(body)
       assert {:ok, descriptor} = Attributes.decode(file)
       assert descriptor == Enum.at(event.payload["files"], 1)
       assert hd(event.payload["files"])["tier"] == "inline"
       verifier = AttentionServer.Migration.VerifyEntryUploads
-      assert {:ok, %{ordinary_entry_links: 1} = counts} = verifier.run(db, identity, bundle)
-      for sql <- [
+      assert {:ok, manifest, _} = Bundle.verify(bundle)
+      assert {:ok, expected_total} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, 0, fn
+        {{:row, :conversation_events, _}, source_event}, n ->
+          files = Map.get(source_event.payload, "files", [])
+          {:ok, n + Enum.count(files, &(&1["tier"] != "inline"))}
+        _, n -> {:ok, n}
+      end)
+      # The compatibility history already has a file; the mixed inline/upload
+      # fixture adds another. Count all source links, mutate only the target.
+      assert expected_total >= 2
+      assert {:ok, %{ordinary_entry_links: ^expected_total} = counts} = verifier.run(db, identity, bundle)
+      target = [conversation_id, entry_id, 1]
+      where = " WHERE conversation_id=$1 AND entry_id=$2 AND ordinal=$3"
+      for statement <- [
         "UPDATE harklight.conversation_entry_uploads SET ordinal=0",
         "UPDATE harklight.conversation_entry_uploads SET attributes='{}'::jsonb",
         "DELETE FROM harklight.conversation_entry_uploads"
       ] do
+        sql = statement <> where
         assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
-          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx, sql, [])
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx, sql, target)
           assert {:error, {:ordinary_entry_upload_mismatch, _, _}} = verifier.run(tx, identity, bundle)
           Postgrex.rollback(tx, :synthetic_drift)
         end)
@@ -1613,7 +1628,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       end
       assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
         assert {:ok, %{num_rows: 1}} = ImportSession.query(tx,
-          "INSERT INTO harklight.conversation_entry_uploads SELECT conversation_id,entry_id,ordinal+1,upload_id,attributes FROM harklight.conversation_entry_uploads", [])
+          "INSERT INTO harklight.conversation_entry_uploads SELECT conversation_id,entry_id,ordinal+1,upload_id,attributes FROM harklight.conversation_entry_uploads" <> where, target)
         assert {:error, :ordinary_entry_upload_count_mismatch} = verifier.run(tx, identity, bundle)
         Postgrex.rollback(tx, :synthetic_drift)
       end)
