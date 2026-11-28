@@ -697,8 +697,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
                    end
                  )
 
-        assert {:ok, %{rows: [["loading"]]}} =
-                 ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+        assert {:ok, %{rows: [["validated", true]]}} =
+                 ImportSession.query(db, "SELECT phase,manifest_sha256 IS NOT NULL FROM harklight.import_state", [])
 
         assert {:ok, %{rows: [[^epoch]]}} =
                  ImportSession.query(db, "SELECT cursor_epoch FROM harklight.server_identity", [])
