@@ -376,12 +376,13 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
     @tag :tmp_dir
     test "ordinary PostgreSQL revision preserves historical body, file refs, head and ETag", %{tmp_dir: dir} do
       alias AttentionServer.{JSON, LargeData, Relay}
-      alias AttentionServer.ClientAPI.{Context, Reads, Resources, Router}
+      alias AttentionServer.ClientAPI.{Resources, Router}
       alias AttentionServer.Repository.RecipientItems
       alias AttentionServer.Repository.Postgres.LargeText
 
-      {relay, _browser, backend, cookie, principal} = browser_fixture(dir)
+      {relay, _browser, backend, cookie, principal} = browser_fixture(dir, shared_messages: true, groups: true)
       %{person: person, key: owner} = principal
+      assert :ok = Relay.replace_hosted_organization(relay, "revision-fixture-org", [person])
       origin = "synthetic-revision-origin"
       assert :ok = Relay.setup_device(relay, person, origin)
       assert :ok = Relay.setup_sender(relay, origin, "app:fixture")
@@ -461,36 +462,78 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, _} =
                Transaction.query("INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)", [person, head])
 
-      read = fn conn, n ->
-        Reads.get_postgres_revision(conn, %Context{
-          principal: nil, relay: nil, request_id: nil, params: %{item_id: "i1", n: n}
-        })
-      end
+      postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, nil, nil})
+      read = &Router.call(&1, postgres)
+      enabled = Router.init(relay: nil, repository: :postgres, auth: {:browser, nil, nil},
+        shared_messages: true, groups: true)
+      group_disabled = Router.init(relay: nil, repository: :postgres, auth: {:browser, nil, nil},
+        shared_messages: true)
 
-      assert %{status: 503} = read.(request, "1")
+      assert %{status: 503} = read.(request)
       address = Attributes.key({person, "i1", 1})
       assert {:ok, _} =
                Transaction.query("INSERT INTO harklight.compatibility_facts VALUES ('ordinary_revision_files', $1, $2)", [
                  address, Attributes.encode(files)
                ])
 
-      assert %{status: 200, resp_body: actual} = response = read.(request, "1")
+      assert %{status: 200, resp_body: actual} = response = read.(request)
       assert :crypto.hash(:sha256, actual) == :crypto.hash(:sha256, expected)
       assert [^etag] = Plug.Conn.get_resp_header(response, "etag")
       assert ["private, no-cache"] = Plug.Conn.get_resp_header(response, "cache-control")
       conditional = Plug.Conn.put_req_header(request, "if-none-match", "W/" <> etag)
-      assert %{status: 304, resp_body: ""} = read.(conditional, "1")
-      for n <- ["x", "0", "3", "9223372036854775808"], do: assert(%{status: 404} = read.(request, n))
+      assert %{status: 304, resp_body: ""} = read.(conditional)
+      for n <- ["x", "0", "3", "9223372036854775808"] do
+        assert %{status: 404} = read.(browser_request(:get, "/v2/items/i1/revisions/#{n}", cookie))
+      end
       assert {:error, :not_found} = RecipientItems.revision(:postgres, "other-person", "i1", 1)
-      assert %{status: 503} = read.(request, "2")
+      assert %{status: 503} = read.(browser_request(:get, "/v2/items/i1/revisions/2", cookie))
+      assert %{status: 404} = read.(browser_request(:get, "/v2/items/i1", cookie))
+      assert %{status: 404} = read.(browser_request(:get, "/v2/items/shared_fixture/revisions/1", cookie))
+      assert %{status: 400, assigns: %{client_api_error: "invalid_field"}} =
+               read.(Plug.Conn.put_req_header(request, "harklight-features", "invalid"))
+      assert %{status: 400, assigns: %{client_api_error: "unsupported"}} =
+               read.(Plug.Conn.put_req_header(request, "harklight-features", "shared_messages"))
+
+      shared = Plug.Conn.put_req_header(request, "harklight-features", "shared_messages")
+      groups = Plug.Conn.put_req_header(request, "harklight-features", "shared_messages, groups")
+      assert %{status: 400, assigns: %{client_api_error: "unsupported"}} = Router.call(groups, group_disabled)
+      assert %{status: 503} = Router.call(shared, enabled)
+      put_certificate_fact("shared_read_access", person, false)
+      assert %{status: 400, assigns: %{client_api_error: "unsupported"}} = Router.call(shared, enabled)
+      put_certificate_fact("shared_read_access", person, true)
+
+      for conn <- [request, shared, groups] do
+        assert %{status: 200, resp_body: ^expected} = source = Router.call(conn, opts)
+        assert %{status: 200, resp_body: ^expected} = target = Router.call(conn, enabled)
+        assert [^etag] = Plug.Conn.get_resp_header(source, "etag")
+        assert [^etag] = Plug.Conn.get_resp_header(target, "etag")
+        cached = Plug.Conn.put_req_header(conn, "if-none-match", etag)
+        assert %{status: 304, resp_body: ""} = Router.call(cached, opts)
+        assert %{status: 304, resp_body: ""} = Router.call(cached, enabled)
+      end
+
+      assert {:ok, _} = Transaction.query(
+        """
+        INSERT INTO harklight.messages (id, person_id, origin_key, sender_id, message_id, kind, revision, accepted_at_ms)
+        VALUES ('history', $1, $2, 'app:fixture', 'history', 'shared', 1, 1)
+        """, [person, origin])
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.message_revisions VALUES ('history', 1, 1, $1)",
+        [Attributes.encode(%{"title" => "Shared history"})])
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.message_recipients VALUES ('history', $1, 'i99', NULL, $2)",
+        [person, Attributes.encode(%{visible: true})])
+      assert {:error, :not_found} = RecipientItems.fetch(:postgres, person, "i99")
+      assert {:error, :not_found} = RecipientItems.revision(:postgres, person, "i99", 1)
+      assert %{status: 404} = read.(browser_request(:get, "/v2/items/i99/revisions/1", cookie))
 
       assert {:ok, _} =
                Transaction.query("UPDATE harklight.message_recipients SET attributes = $2 WHERE person_id = $1", [
                  person, Attributes.encode(%{visible: false})
                ])
-      assert %{status: 404} = read.(conditional, "1")
+      assert %{status: 404} = read.(conditional)
       assert {:ok, _} = Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [owner])
-      assert %{status: 401} = read.(conditional, "1")
+      assert %{status: 401} = read.(conditional)
     end
 
     @tag :tmp_dir
@@ -1210,17 +1253,17 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       if key, do: Plug.Conn.put_req_header(conn, "idempotency-key", key), else: conn
     end
 
-    defp browser_fixture(dir) do
+    defp browser_fixture(dir, extra \\ []) do
       alias AttentionServer.{DashboardBackend, DashboardBrowserSession, Relay, Store.AuthSchema}
       alias AttentionServer.ClientAPI.Auth
       alias Exqlite.Sqlite3
 
       path = Path.join(dir, "relay.sqlite3")
-      opts = [
+      opts = Keyword.merge([
         store_path: path,
         deployment_mode: :saas,
         dashboard_origin: "https://account.example.test"
-      ]
+      ], extra)
 
       {:ok, relay} = Relay.start_link(opts)
       {:ok, person} = Relay.hosted_account_create(relay, "browser-fixture")
@@ -2171,6 +2214,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       owner = "synthetic-upload-writer"
       target = {person, owner, "linked-upload"}
       orphan = {person, owner, "orphan-upload"}
+      entry_only = {person, owner, "entry-only-upload"}
       message = "synthetic-attachment-message"
       observer = self()
       assert {:ok, _} = Transaction.query("INSERT INTO harklight.people VALUES ($1)", [person])
@@ -2194,7 +2238,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                  [message]
                )
 
-      for {_person, _owner, id} <- [target, orphan] do
+      for {_person, _owner, id} <- [target, orphan, entry_only] do
         assert {:ok, ^id} =
                  Uploads.begin_upload(
                    person, owner, id, 0, :crypto.hash(:sha256, <<>>), %{}, upload_limits(0, 0)
@@ -2205,6 +2249,22 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:error, :incomplete_upload} =
                Transaction.run([], fn _ -> Uploads.link(target, message, 1, 0, %{}) end)
       assert {:ok, "linked-upload"} = Uploads.complete(target, 10)
+      assert {:ok, "entry-only-upload"} = Uploads.complete(entry_only, 10)
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.conversations (id, message_id) VALUES ($1, $1)", [message]
+      )
+      assert {:ok, _} = Transaction.query(
+        """
+        INSERT INTO harklight.conversation_entries (id, conversation_id, position, request_revision, kind, body)
+        VALUES ('first', $1, 1, 1, 'reply', '{}'), ('second', $1, 2, 1, 'reply', '{}')
+        """, [message]
+      )
+      assert {:ok, _} = Transaction.query(
+        """
+        INSERT INTO harklight.conversation_entry_uploads (conversation_id, entry_id, ordinal, upload_id)
+        VALUES ($1, 'first', 0, 'entry-only-upload'), ($1, 'second', 0, 'entry-only-upload')
+        """, [message]
+      )
 
       linker =
         Task.async(fn ->
@@ -2224,6 +2284,14 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                Transaction.run([], fn _ -> Uploads.link(orphan, message, 1, 1, %{}) end)
       assert {:ok, %{rows: [["linked-upload"]]}} =
                Transaction.query("SELECT upload_id FROM harklight.message_uploads WHERE message_id = $1", [message])
+      assert {:ok, %{num_rows: 1}} = Transaction.query(
+        "DELETE FROM harklight.conversation_entry_uploads WHERE conversation_id = $1 AND entry_id = 'first'", [message]
+      )
+      assert {:ok, 0} = Uploads.cleanup(person, 100)
+      assert {:ok, %{num_rows: 1}} = Transaction.query(
+        "DELETE FROM harklight.conversation_entry_uploads WHERE conversation_id = $1 AND entry_id = 'second'", [message]
+      )
+      assert {:ok, 1} = Uploads.cleanup(person, 100)
     end
 
     defp upload_limits(file, account) do

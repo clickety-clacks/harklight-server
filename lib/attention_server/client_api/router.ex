@@ -57,12 +57,13 @@ defmodule AttentionServer.ClientAPI.Context do
   @moduledoc "What a client API handler receives besides the connection."
 
   @enforce_keys [:principal, :relay, :request_id]
-  defstruct [:principal, :relay, :request_id, params: %{}]
+  defstruct [:principal, :relay, :request_id, :shared_features, params: %{}]
 
   @type t :: %__MODULE__{
           principal: AttentionServer.ClientAPI.Principal.t() | nil,
           relay: GenServer.server() | nil,
           request_id: String.t(),
+          shared_features: %{shared_messages: boolean(), groups: boolean()} | nil,
           params: %{optional(atom()) => String.t()}
         }
 end
@@ -127,6 +128,10 @@ defmodule AttentionServer.ClientAPI.Router do
       relay: Keyword.fetch!(opts, :relay),
       repository: Keyword.get(opts, :repository, :format32),
       auth: auth_option(Keyword.get(opts, :auth, :device)),
+      shared_features: %{
+        shared_messages: Keyword.get(opts, :shared_messages) == true,
+        groups: Keyword.get(opts, :groups) == true
+      },
       routes: compile_routes(modules),
       max_in_flight: Keyword.get(opts, :max_in_flight, @default_max_in_flight),
       in_flight: :atomics.new(1, signed: true)
@@ -177,6 +182,19 @@ defmodule AttentionServer.ClientAPI.Router do
        ) do
     ctx = %Context{principal: nil, relay: nil, request_id: request_id}
     run(conn, Reads, :get_postgres_settings, ctx, opts)
+  end
+
+  defp authenticated(
+         %{method: "GET"} = conn,
+         %{repository: :postgres, auth: {:browser, _, _}} = opts,
+         ["items", "i" <> _, "revisions", _],
+         {:ok, Reads, :get_revision, params, _},
+         request_id
+       ) do
+    ctx = %Context{
+      principal: nil, relay: nil, request_id: request_id, params: params, shared_features: opts.shared_features
+    }
+    run(conn, Reads, :get_postgres_revision, ctx, opts)
   end
 
   defp authenticated(
