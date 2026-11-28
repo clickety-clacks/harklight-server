@@ -132,8 +132,8 @@ migration release is accepted.
 Stop the Server and all provisioning/background writers first. Preserve the
 complete original backup. Create a private JSON material map naming every
 configuration and identity file needed to restore this installation. Its keys
-are destination basenames and values are absolute source paths, for example
-`{"server.env":"/private/backup/server.env","identity.pem":"/private/backup/identity.pem"}`.
+are relative destination paths and values are absolute source paths, for example
+`{"server.env":"/private/backup/server.env","owner/identity.pem":"/private/backup/owner/identity.pem"}`.
 The command does not discover credentials, execute configuration, or print
 material values. The deployment-specific inventory remains the operator's
 responsibility; `{}` is explicit confirmation that there are no external
@@ -166,3 +166,8 @@ the refusal. Do not delete or overwrite the original backup. The later import
 will own restart checkpoints and require relational closure, target readback
 and history comparison before activation. `verify` here establishes export
 integrity, not that final activation gate.
+
+For the standard self-host state directory, inventory `server.env`, `person-id`,
+and all regular files under `tls/` and `owner/`, preserving their relative
+paths. Include external files referenced by configuration explicitly. Do not
+include the new PostgreSQL cluster or its passwords in the source material map.

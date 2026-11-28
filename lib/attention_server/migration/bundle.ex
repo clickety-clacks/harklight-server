@@ -203,7 +203,7 @@ defmodule AttentionServer.Migration.Bundle do
 
   defp copy_material(files, destination) when is_map(files) do
     Enum.reduce_while(Enum.sort(files), {:ok, %{}}, fn {name, source}, {:ok, acc} ->
-      relative = "material/" <> component!(name)
+      relative = "material/" <> relative_name!(name)
 
       case copy_file(source, Path.join(destination, relative), nil) do
         {:ok, info} -> {:cont, {:ok, Map.put(acc, relative, info)}}
@@ -232,6 +232,14 @@ defmodule AttentionServer.Migration.Bundle do
   defp private_directory(path) do
     with :ok <- File.mkdir_p(path), do: File.chmod(path, 0o700)
   end
+
+  defp relative_name!(name) when is_binary(name) do
+    parts = String.split(name, "/")
+    Enum.each(parts, &component!/1)
+    Enum.join(parts, "/")
+  end
+
+  defp relative_name!(_), do: throw({:export_error, :invalid_file_name})
 
   defp component!(name) when is_binary(name) do
     if name not in ["", ".", ".."] and Path.basename(name) == name and

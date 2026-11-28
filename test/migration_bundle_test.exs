@@ -46,7 +46,7 @@ defmodule AttentionServer.Migration.BundleTest do
     opts = [
       supervisor:
         {:operator, "synthetic test supervisor", "GenServer.stop returned; fixture stopped"},
-      material: %{"identity" => secret}
+      material: %{"owner/identity" => secret}
     ]
 
     assert {:ok, summary} = Bundle.export(path, destination, opts)
@@ -63,7 +63,7 @@ defmodule AttentionServer.Migration.BundleTest do
     assert {:ok, %{"result" => "verified_export"}} = CLI.run(["verify", destination])
     assert manifest.data.records.count == manifest.source.records.count
     assert map_size(manifest.data.files) > 0
-    assert File.read!(Path.join(destination, "material/identity")) == File.read!(secret)
+    assert File.read!(Path.join(destination, "material/owner/identity")) == File.read!(secret)
 
     for {relative, expected} <- manifest.data.files do
       bytes = File.read!(Path.join(destination, relative))
