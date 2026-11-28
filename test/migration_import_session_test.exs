@@ -509,6 +509,33 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
         assert :ok = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
         verify_conversation_positions(db, bundle, manifest)
+        assert {:ok, _} = ImportSession.query(db, """
+          CREATE FUNCTION harklight.fail_entry() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN RAISE EXCEPTION 'synthetic entry interruption'; END $$
+          """, [])
+        assert {:ok, _} = ImportSession.query(db,
+          "CREATE TRIGGER fail_entry BEFORE INSERT ON harklight.conversation_entries FOR EACH ROW EXECUTE FUNCTION harklight.fail_entry()", [])
+        assert {:error, _} = AttentionServer.Migration.ImportEntries.run(db, identity, bundle)
+        assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "conversations/entries/v1")
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.conversation_entries", [])
+        assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_entry ON harklight.conversation_entries", [])
+        assert :ok = AttentionServer.Migration.ImportEntries.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportEntries.run(db, identity, bundle)
+        assert {:ok, entry_count} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, 0, fn
+          {{:row, :conversation_events, {person, position}}, %{key: {person, sender, external}, payload: payload} = event}, count ->
+            assert {:ok, %{rows: [[id, ^position, revision, kind, body]]}} = ImportSession.query(db,
+              "SELECT e.id,e.position,e.request_revision,e.kind,e.body FROM harklight.conversation_entries e JOIN harklight.conversations c ON c.id=e.conversation_id JOIN harklight.messages m ON m.id=c.message_id WHERE m.person_id=$1 AND m.sender_id=$2 AND m.message_id=$3 AND e.position=$4",
+              [person, sender, external, position])
+            assert id == Integer.to_string(position)
+            assert revision == payload["request_revision"]
+            assert kind == payload["kind"]
+            assert {:ok, ^event} = Attributes.decode(body)
+            {:ok, count + 1}
+          _, count -> {:ok, count}
+        end)
+        assert entry_count > 0
+        assert {:ok, %{rows: [[^entry_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.conversation_entries", [])
+
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
