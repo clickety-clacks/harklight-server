@@ -1,7 +1,7 @@
 defmodule AttentionServer.Repository.Postgres.Transaction do
   @moduledoc false
 
-  alias AttentionServer.Repository.Postgres.Repo
+  alias AttentionServer.Repository.Postgres.{Repo, Schema}
   alias Ecto.Adapters.SQL
 
   @max_attempts 3
@@ -12,8 +12,10 @@ defmodule AttentionServer.Repository.Postgres.Transaction do
   # Schema inspection is read-only. The installer and explicit migrations
   # own DDL independently of application startup.
   def verify_schema do
+    version = Schema.version()
+
     case SQL.query(Repo, "SELECT max(version) FROM harklight.schema_migrations", [], @sql_opts) do
-      {:ok, %{rows: [[1]]}} -> :ok
+      {:ok, %{rows: [[^version]]}} -> :ok
       {:ok, _} -> {:error, :unsupported_schema}
       {:error, _} -> {:error, :schema_unavailable}
     end

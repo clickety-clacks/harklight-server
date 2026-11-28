@@ -179,7 +179,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         identity = %{
           id: "synthetic-import",
           source: Base.decode16!(summary.sha256, case: :lower),
-          schema: :crypto.hash(:sha256, File.read!("priv/postgres/001_initial.sql"))
+          schema: AttentionServer.Repository.Postgres.Schema.digest()
         }
 
         # Refuse an already populated target rather than claiming it.
@@ -430,7 +430,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, summary} = Bundle.export(Path.join(fixture.root, "relay.sqlite3"), bundle,
         supervisor: {:operator, "synthetic fixture", "seed Relay stopped"}, material: %{})
       identity = %{id: "synthetic-legacy", source: Base.decode16!(summary.sha256, case: :lower),
-        schema: :crypto.hash(:sha256, File.read!("priv/postgres/001_initial.sql"))}
+        schema: AttentionServer.Repository.Postgres.Schema.digest()}
       assert :ok = ImportOrganizations.run(db, identity, bundle)
       assert :ok = ImportOrganizations.run(db, identity, bundle)
       assert :ok = ImportAuth.run(db, identity, bundle)

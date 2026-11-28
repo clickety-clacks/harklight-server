@@ -1,4 +1,4 @@
-# Harklight PostgreSQL schema v1
+# Harklight PostgreSQL schema
 
 The schema is for isolated PostgreSQL opt-in development. FORMAT32 SQLite is
 the default. Applying this migration alone exposes no HTTP routes and selects
@@ -8,8 +8,12 @@ transaction-scoped advisory lock `(1212240455, 1)`. A failed run rolls back.
 A second bootstrap fails without modifying the installed schema. Application
 startup must check the installed version and performs no DDL.
 
-The authoritative columns and constraints live in
-[`priv/postgres/001_initial.sql`](../priv/postgres/001_initial.sql).
+The explicit migration job applies
+[`001_initial.sql`](../priv/postgres/001_initial.sql) followed by
+[`002_message_history.sql`](../priv/postgres/002_message_history.sql)
+before claiming a fresh import. Both use the same advisory lock. The import
+schema digest is SHA-256 over the two files' bytes concatenated in order.
+Version 2 adds the complete message history representation.
 
 - Keep person IDs and principal keys as opaque text. Preserve the server
   instance ID, cursor signing bytes and integer epoch exactly. Preserve
@@ -24,6 +28,13 @@ The authoritative columns and constraints live in
   import. Use the empty origin key for person-scoped receipts and streams.
   Keep the operation receipt namespace distinct for recent, retained, and
   domain-level receipts.
+- Keep the recorded first and latest message revision acceptance times.
+  Store null for intermediate revision acceptance times absent from FORMAT32.
+  Hosted notices retain `app:harklight/notices` for both origin and sender.
+  They belong to a person and have no origin session. Their generated
+  `principal_origin_key` is null. Other messages keep the scoped origin
+  principal foreign key through that generated column. Importers supply the
+  original origin key. The database generates the credential reference.
 - A person/Agent stream is keyed by `(person_id, origin_key)`. Preserve head,
   retained floor, seed revision, first-seen timestamps and the original
   revisions of retained changes and live resources. Gaps are valid. Allocate
@@ -79,7 +90,7 @@ to begin in `loading`, rejects skipped or reversed phase transitions, and
 prevents replacing the source, schema, import identity or validated manifest.
 Restarting from scratch requires a new unpublished destination. An opted-in
 runtime must require both
-schema version 1 and `phase = 'active'` plus the server identity row. The
+schema version 2 and `phase = 'active'` plus the server identity row. The
 identity row alone cannot publish partial imports. An isolated fresh database
 uses the same lifecycle with a manifest describing the newly provisioned
 synthetic data.

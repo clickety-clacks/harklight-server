@@ -1,0 +1,14 @@
+defmodule AttentionServer.Repository.Postgres.Schema do
+  @moduledoc false
+
+  @migration_files ["001_initial.sql", "002_message_history.sql"]
+  @version 2
+
+  def version, do: @version
+
+  def digest do
+    root = Application.app_dir(:attention_server, "priv/postgres")
+    contents = Enum.map(@migration_files, &File.read!(Path.join(root, &1)))
+    :crypto.hash(:sha256, contents)
+  end
+end
