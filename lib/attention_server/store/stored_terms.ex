@@ -31,4 +31,20 @@ defmodule AttentionServer.Store.StoredTerms do
 
     :ok
   end
+
+  def load_keyed_atoms do
+    for module <- [
+          AttentionServer.Groups,
+          AttentionServer.SharedMessages,
+          AttentionServer.SharedAnswers,
+          AttentionServer.SharedPush,
+          AttentionServer.SharedReminders,
+          AttentionServer.LargeData.Ref
+        ] do
+      Code.ensure_loaded!(module)
+    end
+
+    load_atoms()
+  end
+
 end
