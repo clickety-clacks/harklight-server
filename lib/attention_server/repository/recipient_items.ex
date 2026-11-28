@@ -12,6 +12,12 @@ defmodule AttentionServer.Repository.RecipientItems do
     end
   end
 
+  def revision(:postgres, person, item_id, revision),
+    do: AttentionServer.Repository.Postgres.Items.recipient_revision(person, item_id, revision)
+
+  def summary_facts(:postgres, person, item_id),
+    do: AttentionServer.Repository.Postgres.ItemSummaryFacts.read(person, item_id)
+
   def read_through(engine, {person, _, _} = key, entry_id) do
     with {:ok, seq} <- item_entry_seq(engine, person, key, entry_id) do
       current = Map.get(engine.chat_read_positions, key, 0)

@@ -4,6 +4,8 @@ defmodule AttentionServer.Repository.Postgres.Items do
   alias AttentionServer.BounceDecision
   alias AttentionServer.Repository.Postgres.{Attributes, Transaction}
 
+  @max_revision 9_223_372_036_854_775_807
+
   def recipient_item(person, item_id) do
     with {:ok, key, record} <- fetch(person, item_id, nil),
          true <- BounceDecision.person_visible?(record) do
@@ -19,6 +21,67 @@ defmodule AttentionServer.Repository.Postgres.Items do
   end
 
   def agent_item(_scope, _item_id), do: {:error, :not_found}
+
+  # The caller rechecks authority and keeps both indexed reads in the same
+  # committed snapshot. A revision never needs the current message's history.
+  def recipient_revision(person, "i" <> _ = item, revision) when revision in 1..@max_revision do
+    case Transaction.query(
+           """
+           SELECT recipient.attributes, revision.body, coalesce(stream.head, identity.cursor_epoch)
+           FROM harklight.message_recipients AS recipient
+           JOIN harklight.messages AS message
+             ON message.id = recipient.message_id AND message.person_id = recipient.person_id
+           JOIN harklight.message_revisions AS revision
+             ON revision.message_id = message.id AND revision.revision = $3
+             AND revision.revision <= message.revision
+           CROSS JOIN harklight.server_identity AS identity
+           LEFT JOIN harklight.stream_heads AS stream
+             ON stream.person_id = recipient.person_id AND stream.origin_key = ''
+           WHERE recipient.person_id = $1 AND recipient.item_id = $2
+           """,
+           [person, item, revision]
+         ) do
+      {:ok, %{rows: [[attributes, body, head]]}} ->
+        with {:ok, _visibility} <- recipient_attributes(attributes),
+             {:ok, message} when is_map(message) and not is_struct(message) <- Attributes.decode(body),
+             {:ok, files} <- revision_files(person, item, revision) do
+          {:ok, %{"rev" => head, "revision" => %{
+            "request_revision" => revision, "message" => message, "files" => files
+          }}}
+        else
+          {:error, :not_found} = error -> error
+          _ -> {:error, :storage_unavailable}
+        end
+
+      {:ok, %{rows: []}} -> {:error, :not_found}
+      {:error, _} -> {:error, :storage_unavailable}
+    end
+  end
+
+  def recipient_revision(_person, _item, _revision), do: {:error, :not_found}
+
+  def recipient_attributes(attributes) do
+    case Attributes.decode(attributes) do
+      {:ok, %{visible: true} = attributes} -> {:ok, attributes}
+      {:ok, %{visible: false}} -> {:error, :not_found}
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
+  defp revision_files(person, item, revision) do
+    address = Attributes.key({person, item, revision})
+
+    with {:ok, %{rows: [[stored]]}} <-
+           Transaction.query(
+             "SELECT body FROM harklight.compatibility_facts WHERE family = 'ordinary_revision_files' AND address = $1",
+             [address]
+           ),
+         {:ok, files} when is_list(files) <- Attributes.decode(stored) do
+      {:ok, files}
+    else
+      _ -> {:error, :storage_unavailable}
+    end
+  end
 
   defp fetch(person, "i" <> _ = item_id, origin) do
     case Transaction.query(
