@@ -126,7 +126,10 @@ fact. No record contains a whole Engine or unbounded feed.
   `harklight_passkey_challenges`, `harklight_owner_codes`,
   `harklight_native_transactions` and `harklight_device_sessions`.
   Index currently actionable sessions in `auth_sessions` where the principal
-  already exists. Pending challenges do not need an invented principal.
+  already exists. For a browser session, copy the raw 32-byte session hash
+  into `token_hash` with kind `browser`, the owner key and its pinned revision.
+  FORMAT32 browser sessions have no server expiry, so import a null expiry.
+  Pending challenges do not need an invented principal.
 - Stream `client_staged_files` into upload manifests and chunks, preserving
   associated `client_staged_file_owners` and `client_discarded_files` facts.
 - Keep the exact typed records from `relay_inbox_snapshots`,
