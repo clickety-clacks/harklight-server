@@ -426,6 +426,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         end
         assert :ok = ImportUploads.run(db, identity, bundle)
         verify_uploads(db, bundle, manifest)
+        assert :ok = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
+        verify_conversation_positions(db, bundle, manifest)
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
@@ -780,6 +783,29 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.origin_delivery_acks", [])
       assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
       Agent.stop(fixture.clock)
+    end
+
+    defp verify_conversation_positions(db, root, manifest) do
+      assert {:ok, {containers, positions}} = Frames.fold(Path.join(root, "records.frames"),
+        manifest.data.records, {0, 0}, fn
+          {{:row, :messages, key}, record}, {containers, positions} ->
+            id = ImportMessages.id(key, record)
+            assert {:ok, %{rows: [[^id, text]]}} = ImportSession.query(db,
+              "SELECT message_id,attributes::text FROM harklight.conversations WHERE id=$1", [id])
+            assert_typed(text, %{source_key: key})
+            {:ok, {containers + 1, positions}}
+          {{:row, :chat_read_positions, {person, sender, external}}, position}, {containers, positions} ->
+            assert {:ok, %{rows: [[^position]]}} = ImportSession.query(db,
+              "SELECT r.position FROM harklight.read_positions r JOIN harklight.messages m ON m.id=r.conversation_id WHERE r.person_id=$1 AND m.person_id=$1 AND m.sender_id=$2 AND m.message_id=$3",
+              [person, sender, external])
+            {:ok, {containers, positions + 1}}
+          _, counts -> {:ok, counts}
+        end)
+      assert containers > 0 and positions > 0
+      assert {:ok, %{rows: [[^containers]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.conversations", [])
+      assert {:ok, %{rows: [[^positions]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.read_positions", [])
     end
 
     defp verify_uploads(db, root, manifest) do
