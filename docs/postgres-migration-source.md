@@ -527,3 +527,11 @@ extra source-family rows refuse verification. Derived/source-only SQL tables
 retain their catalog dispositions. This result is source-fact evidence only:
 it neither changes lifecycle state nor substitutes for normalized resource,
 material, index, attachment or client-manifest validation.
+
+`VerifyUploads.run/3` first verifies raw source facts, then compares every
+imported upload's ownership, source metadata, completion clock, digest and size
+with the bundle. It streams the source bytes in bounded chunks and compares each
+stored chunk byte for byte, rejecting missing, changed or extra chunks and
+extra upload manifests even after an import checkpoint completed. Staged source
+retention metadata remains exact. This is read-only evidence for upload content;
+attachment references and authorized resource rendering have separate gates.

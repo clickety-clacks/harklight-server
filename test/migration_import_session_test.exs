@@ -605,6 +605,20 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:ok, _} = ImportSession.query(db,
           "DELETE FROM harklight.compatibility_facts WHERE family='persons' AND address=$1", [extra])
         assert {:ok, ^verified} = AttentionServer.Migration.VerifyFacts.run(db, identity, bundle)
+        assert {:ok, uploads_verified} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+        assert uploads_verified.uploads > 0
+        assert {:ok, %{rows: [[upload_id, ordinal, bytes]]}} = ImportSession.query(db,
+          "SELECT upload_id,chunk_number,bytes FROM harklight.upload_chunks LIMIT 1", [])
+        assert {:ok, _} = ImportSession.query(db,
+          "DELETE FROM harklight.upload_chunks WHERE upload_id=$1 AND chunk_number=$2", [upload_id, ordinal])
+        assert {:error, :upload_chunk_source_mismatch} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.upload_chunks(upload_id,chunk_number,bytes) VALUES($1,$2,$3)", [upload_id, ordinal, "wrong bytes"])
+        assert {:error, :upload_chunk_source_mismatch} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+        assert {:ok, _} = ImportSession.query(db,
+          "UPDATE harklight.upload_chunks SET bytes=$3 WHERE upload_id=$1 AND chunk_number=$2", [upload_id, ordinal, bytes])
+        assert {:ok, ^uploads_verified} = AttentionServer.Migration.VerifyUploads.run(db, identity, bundle)
+
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
