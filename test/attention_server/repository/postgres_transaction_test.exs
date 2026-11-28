@@ -737,6 +737,91 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       end
     end
 
+    @tag :tmp_dir
+    test "FORMAT32 native bearers retain pending state and device authority in PostgreSQL", %{tmp_dir: dir} do
+      alias AttentionServer.{BrowserAuth, DeviceProof, NativeSignIn, Relay, Store.AuthSchema}
+      alias AttentionServer.ClientAPI.{Auth, Router}
+      alias AttentionServer.Repository.Postgres.Attributes
+      alias Exqlite.Sqlite3
+
+      person = "synthetic-native-account"
+      active = "synthetic-active-device"
+      pending = "synthetic-pending-device"
+      path = Path.join(dir, "native.sqlite3")
+      opts = [store_path: path]
+      relay = start_supervised!({Relay, opts})
+      assert :ok = Relay.setup_person(relay, person)
+      assert :ok = Relay.setup_device(relay, person, active)
+      assert :ok = Relay.setup_device(relay, person, pending)
+      stop_supervised!(Relay)
+
+      {:ok, db} = Sqlite3.open(path)
+      assert {:ok, _} = AuthSchema.initialize(db)
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+
+      requests =
+        for {device, pending?} <- [{active, false}, {pending, true}], into: %{} do
+          bearer = BrowserAuth.new_secret()
+          hash = DeviceProof.digest(bearer)
+          assert :ok = NativeSignIn.add_session(db, hash, device, person, "synthetic-proof-key", 10, pending?)
+          assert {:ok, _} =
+                   Transaction.query(
+                     "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 2)",
+                     [device, person]
+                   )
+          assert {:ok, _} =
+                   Transaction.query(
+                     """
+                     INSERT INTO harklight.auth_sessions
+                       (token_hash, person_id, principal_key, kind, principal_revision, attributes)
+                     VALUES ($1, $2, $3, 'native', 1, $4)
+                     """,
+                     [Base.decode16!(hash, case: :lower), person, device, Attributes.encode(%{pending: pending?})]
+                   )
+
+          {device, {"Bearer " <> bearer, hash, pending?}}
+        end
+
+      :ok = Sqlite3.close(db)
+      relay = start_supervised!({Relay, opts})
+      router = Router.init(relay: relay, auth: {:browser, nil, nil})
+
+      for {device, {header, hash, pending?}} <- requests do
+        conn = Plug.Test.conn(:get, "/v2/me") |> Plug.Conn.put_req_header("authorization", header)
+        assert {:ok, %{person: ^person, key: ^device, session_id: ^hash, pending: ^pending?} = principal} =
+                 Auth.web(conn, nil, relay)
+        assert {:ok, ^principal} = Auth.web(conn, nil, :postgres)
+        assert %{status: 200} = Router.call(conn, router)
+
+        both = Plug.Test.put_req_cookie(conn, "__Host-harklight", "fixture-cookie")
+        assert {:error, :unauthorized} = Auth.web(both, nil, relay)
+        assert {:error, :unauthorized} = Auth.web(both, nil, :postgres)
+      end
+
+      {pending_header, _, _} = Map.fetch!(requests, pending)
+      pending_write =
+        Plug.Test.conn(:put, "/v2/settings/alerts")
+        |> Plug.Conn.put_req_header("authorization", pending_header)
+      assert %{status: 403, assigns: %{client_api_error: "forbidden"}} = Router.call(pending_write, router)
+
+      {active_header, old_hash, _} = Map.fetch!(requests, active)
+      old = Plug.Test.conn(:get, "/v2/me") |> Plug.Conn.put_req_header("authorization", active_header)
+      assert :ok = Relay.revoke_device(relay, active)
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [active])
+      assert {:error, :unauthorized} = Auth.web(old, nil, relay)
+      assert {:error, :unauthorized} = Auth.web(old, nil, :postgres)
+
+      assert {:ok, _} =
+               Transaction.query(
+                 "UPDATE harklight.auth_sessions SET kind = 'browser' WHERE token_hash = $1",
+                 [Base.decode16!(old_hash, case: :lower)]
+               )
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revoked = false WHERE key = $1", [active])
+      assert {:error, :unauthorized} = Auth.web(old, nil, :postgres)
+    end
+
     test "known transaction aborts retry without carrying previous writes forward" do
       scope = {"retry-person", ""}
       attempt = make_ref()

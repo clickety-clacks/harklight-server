@@ -2,8 +2,10 @@ defmodule AttentionServer.ClientAPI.Principal do
   @moduledoc """
   Who a client API request is from: one person and one client.
 
-  - `kind: :device` — an enrolled device on the device listener. `key` is the
-    device key (the SHA-256 of its certificate's public key).
+  - `kind: :device` — an enrolled device authenticated by certificate or
+    native bearer. For a bearer, `session_id` is the lowercase hexadecimal
+    session hash, and `pending` records whether certificate migration is
+    awaiting activation.
   - `kind: :agent` — an owner-registered agent on the device listener.
     `key` is the enrolled agent key.
   - `kind: :browser` — a signed-in browser session on the web origin. `key` is
@@ -24,7 +26,8 @@ defmodule AttentionServer.ClientAPI.Principal do
           kind: :device | :browser | :agent,
           key: String.t(),
           session_id: binary() | nil,
-          owner_revision: term()
+          owner_revision: term(),
+          pending: boolean()
         }
 end
 
@@ -41,6 +44,7 @@ defmodule AttentionServer.ClientAPI.Auth do
 
   alias AttentionServer.{BrowserOrigin, DeviceIdentity, Relay}
   alias AttentionServer.ClientAPI.Principal
+  alias AttentionServer.Repository.Postgres.NativeSessions
 
   @cookie "__Host-harklight"
   @write_methods ~w(POST PUT PATCH DELETE)
@@ -110,7 +114,7 @@ defmodule AttentionServer.ClientAPI.Auth do
 
       {nil, ["Bearer " <> secret]} ->
         with {:ok, %{device_id: device, person_id: person, hash: hash, pending: pending}} <-
-               Relay.native_session(relay, secret) do
+               native_session(relay, secret) do
           {:ok, %Principal{kind: :device, key: device, person: person, session_id: hash, pending: pending}}
         else
           {:error, :storage_unavailable} -> {:error, :unavailable}
@@ -136,6 +140,9 @@ defmodule AttentionServer.ClientAPI.Auth do
       do: BrowserOrigin.exact?(conn, %{expected_origin: expected_origin})
 
   def browser_origin_ok?(_conn, _expected_origin), do: true
+
+  defp native_session(:postgres, secret), do: NativeSessions.resolve(secret)
+  defp native_session(relay, secret), do: Relay.native_session(relay, secret)
 
   defp backend_call({module, context}, operation, value),
     do: apply(module, operation, [context, value])
