@@ -10,7 +10,7 @@ mode = System.fetch_env!("HARKLIGHT_FIXTURE_MODE")
   if mode == "seed" do
     {CompatibilityScenarios.fixture(root), nil}
   else
-    {:ok, %{"schema" => 1, "seed" => "compatibility-v1"} = manifest} =
+    {:ok, %{"schema" => 2, "seed" => "compatibility-v2"} = manifest} =
       JSON.decode_line(File.read!(Path.join(root, "manifest.json")) <> "\n")
 
     {CompatibilityScenarios.open_fixture(root, manifest["clock_ms"]), manifest}
@@ -32,7 +32,7 @@ try do
       :ok = CompatibilityScenarios.expire(relay, fixture, manifest)
   end
 
-  IO.puts(JSON.encode!(%{"scenario" => "compatibility-v1", "mode" => mode, "result" => "pass"}))
+  IO.puts(JSON.encode!(%{"scenario" => "compatibility-v2", "mode" => mode, "result" => "pass"}))
 after
   GenServer.stop(relay)
   Agent.stop(fixture.clock)

@@ -73,10 +73,14 @@ fixture=/absolute/new-synthetic-fixture
 `seed` requires a new directory and creates synthetic certificates, two people,
 a local organization, a group/invitation, four messages, a revision, conversation
 replies, an answer, a shared read position, an attachment, an Agent session and
-handoff receipt. It writes `manifest.json`. `verify` reopens that history and
-compares every recorded resource field, cursor result and attachment byte, then
-retries the handoff receipt. The ExUnit entry also verifies rejection of an
-intentionally corrupted manifest and exercises 410 after real retention cleanup.
+handoff receipt. It writes schema 2 `manifest.json`. `verify` reopens that history and
+compares every recorded resource field, cursor result and attachment byte. It
+then walks the candidate’s paginated baseline, tests Last-Event-ID precedence,
+and retries both the original send and handoff with their saved keys and bodies.
+Full retry responses are compared, including item and entry correlation and all
+nested fields. Only the top-level current feed revision may advance; it cannot
+regress. Seed-only behavior checks cannot substitute for these candidate checks. The ExUnit entry also verifies rejection of an
+intentionally corrupted manifest, seven simulated candidate regressions, and exercises 410 after real retention cleanup.
 
 The scenario checks fixed expected content independently before recording the
 manifest. Operation IDs, session ID and content are fixed; Server-assigned IDs,
@@ -110,3 +114,9 @@ points, supply their Relay options to `start/2`, or own startup/provisioning aro
 the same public API calls. The package needs OpenSSL for synthetic certificates.
 No listener or external provider is started. Remove the synthetic directory when
 finished; retain manifests and reports without its private certificate keys.
+
+Schema 1 development manifests lack the request/response evidence needed for
+these candidate checks and are rejected. Seed a fresh baseline with schema 2
+using the same scenario code on both versions. The negative tests filter only
+synthetic API responses to simulate broken pagination, header resume, replay
+flags, send identity and receipt identity/content; they do not change the server.

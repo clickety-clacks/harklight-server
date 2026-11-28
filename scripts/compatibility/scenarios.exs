@@ -288,9 +288,14 @@ defmodule AttentionServer.CompatibilityScenarios do
         }
       end
 
+    # Capture retry projections only after the history reaches its final state.
+    # The original requests/keys are retained and must remain replayable by a candidate.
+    send_replay = write(ctx, :agent, :post, "/v2/agent/messages", send_body, 11)
+    receipt_replay = write(ctx, :agent, :post, receipt_path, receipt_body, 22)
+
     %{
-      "schema" => 1,
-      "seed" => "compatibility-v1",
+      "schema" => 2,
+      "seed" => "compatibility-v2",
       "clock_ms" => Agent.get(fixture.clock, & &1),
       "people" => [person, other],
       "organization_id" => group["organization_id"],
@@ -300,6 +305,7 @@ defmodule AttentionServer.CompatibilityScenarios do
       "entry_id" => entry,
       "saved_cursor" => saved_cursor,
       "baseline_before" => baseline,
+      "baseline_final" => final,
       "catchup" => catchup,
       "expected" => %{
         "title" => "Revised question",
@@ -314,16 +320,28 @@ defmodule AttentionServer.CompatibilityScenarios do
         "bytes" => @attachment,
         "sha256" => Base.encode16(:crypto.hash(:sha256, @attachment), case: :lower)
       },
+      "send_retry" => %{
+        "path" => "/v2/agent/messages",
+        "body" => send_body,
+        "key" => op(11),
+        "response" => send_replay
+      },
       "retry" => %{
         "path" => receipt_path,
         "body" => receipt_body,
         "key" => op(22),
-        "outcome" => Map.take(receipt, ["status", "stage_outcome", "rev"])
+        "committed_response" => receipt,
+        "response" => receipt_replay
       }
     }
   end
 
   def verify(relay, fixture, manifest) do
+    check!(
+      manifest["schema"] == 2,
+      "verification requires schema 2; seed a fresh baseline with this fixture version"
+    )
+
     ctx = {relay, fixture}
 
     for row <- manifest["observations"] do
@@ -340,32 +358,48 @@ defmodule AttentionServer.CompatibilityScenarios do
     file = manifest["attachment"]
     conn = request(ctx, :tablet, :get, "/v2/files/#{file["file_id"]}", "", [])
     check!(conn.status == 200 and conn.resp_body == file["bytes"], "manifest attachment differs")
-    retry = manifest["retry"]
+    # All behavior gates run on the candidate, not just on the seeding version.
+    ordered = pages(ctx, "/v2/inbox?limit=1", [], 0)
+    check!(ordered == manifest["baseline_final"]["items"], "candidate paginated baseline differs")
 
+    resumed =
+      get(ctx, :phone, "/v2/changes?after=0&limit=1000", [
+        {"last-event-id", to_string(manifest["saved_cursor"])}
+      ])
+
+    check!(resumed == manifest["catchup"], "candidate Last-Event-ID resume differs")
+
+    for {name, retry} <- [{"send", manifest["send_retry"]}, {"receipt", manifest["retry"]}] do
+      verify_retry(ctx, name, retry)
+    end
+
+    :ok
+  end
+
+  defp verify_retry(ctx, name, retry) do
     conn =
       request(ctx, :agent, :post, retry["path"], JSON.encode!(retry["body"]), [
         {"content-type", "application/json"},
         {"idempotency-key", retry["key"]}
       ])
 
-    replayed = body!(conn, 200)
+    actual = body!(conn, 200)
+    expected = retry["response"]
+    # Only the envelope feed position is a current projection. The full nested
+    # message/entry identity, content, resource revision and receipt outcome must
+    # match the recorded final history. No recursive field filtering is allowed.
+    changes = differences(Map.delete(expected, "rev"), Map.delete(actual, "rev"))
+    check!(changes == [], "#{name} retry response differs: #{inspect(changes)}")
 
     check!(
-      Map.take(replayed, ["status", "stage_outcome"]) ==
-        Map.take(retry["outcome"], ["status", "stage_outcome"]),
-      "receipt outcome changed on retry"
+      is_integer(actual["rev"]) and actual["rev"] >= expected["rev"],
+      "#{name} retry cursor regressed"
     )
-
-    # The API projects current resources on replay, preserving the committed
-    # outcome while returning the current feed position.
-    check!(replayed["rev"] >= retry["outcome"]["rev"], "receipt replay cursor regressed")
 
     check!(
       Plug.Conn.get_resp_header(conn, "idempotent-replayed") == ["true"],
-      "receipt replay lost"
+      "#{name} replay lost"
     )
-
-    :ok
   end
 
   # Invoke after continuity verification, on disposable synthetic history only.
@@ -445,7 +479,13 @@ defmodule AttentionServer.CompatibilityScenarios do
       ssl_cert: Map.fetch!(fixture.ders, role)
     })
     |> Router.call(Router.init(relay: relay))
+    |> filter_response(fixture)
   end
+
+  # A fixture-only response filter lets negative tests simulate a broken
+  # candidate route without altering production code or persisted synthetic data.
+  defp filter_response(conn, %{response_filter: filter}), do: filter.(conn)
+  defp filter_response(conn, _fixture), do: conn
 
   defp body!(conn, status) do
     check!(
