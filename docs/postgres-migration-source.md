@@ -1,7 +1,7 @@
 # FORMAT32 migration source inventory
 
 The PostgreSQL migration is under development and is not an upgrade route yet.
-FORMAT32 remains the default backend. This first slice supplies an internal,
+FORMAT32 remains the default backend. The internal migration helpers supply stopped-source capture and a
 read-only source inventory; it does not import, activate PostgreSQL, change
 configuration, or start a listener.
 
@@ -10,16 +10,16 @@ scratch_root: root)` accepts only a **copy carrying a trusted stopped-source
 export receipt**. A bare `stopped: true` acknowledgement is refused. The
 source-facing exporter must collect supervisor and process-marker observations
 before and after copying, plus size, modification time and SHA-256 of the main
-file and WAL/SHM/journal files. The supervisor must report the same inactive
+file and WAL/SHM/journal files. The supervisor must report the same inactive or failed
 unit with MainPID zero; the process marker must be absent or confirmed stale;
 the file observations must be unchanged and WAL/journal must be absent or
 empty. The consumer binds the receipt's main-file hash and size to this copy.
 Missing, incomplete, inconsistent or mismatched receipts are refused.
 
 The receipt is trusted output from the operator's export step, not an
-independent proof manufactured by this copy reader. This slice does not gather
-supervisor evidence. The source-facing export command follows separately and
-must not open, lock-probe or checkpoint the original through SQLite. The caller
+independent proof manufactured by this copy reader. `AttentionServer.Migration.Source.capture/3` gathers
+that evidence without opening, lock-probing or checkpointing the original
+through SQLite. The packaged export command follows separately. The caller
 must stop all Server writers, background work and provisioning, and retain the
 original backup offline. Synthetic consumer tests use explicit producer
 fixtures; they are not evidence that a real service was inspected.
@@ -83,3 +83,41 @@ package using the source codec's OTP major. If that package is unavailable,
 obtain a supported rekey/bridge procedure against a separate copy; do not edit
 the anchor or downgrade the running binary to force admission. No cross-OTP
 migration compatibility is claimed by this inventory.
+
+## Stopped-source capture
+
+The internal `Source.capture(path, new_directory, options)` helper creates a
+mode-0700 directory with a mode-0600 byte copy and a typed provenance receipt.
+It refuses an existing destination. Use `supervisor: {:systemd, unit}` for the
+self-host install's user service. Admission requires a loaded unit whose
+ActiveState is inactive or failed and MainPID is zero, before and after copying.
+An optional `pidfile: path` must be absent or name a process confirmed absent
+through Linux procfs. The installer lock is not a Server activity marker.
+
+For a deployment managed by another supervisor, the explicit option is
+`supervisor: {:operator, supervisor_name, stopped_evidence}`. Both strings must
+be nonempty and the operator must provide the actual stop evidence; this mode
+is never the default. Keep secrets out of the evidence string. The receipt
+records these observations, not a claim that systemd was queried.
+
+When available, `fuser` or `lsof` checks that no process holds the main, WAL or
+SHM files open. An unavailable tool is recorded; an open file or failed
+observation refuses capture. Main, WAL, SHM and journal size, modification time
+and SHA-256 must remain unchanged throughout the copy. Nonempty WAL or journal
+files are refused. Stop the original Server normally so it checkpoints its own
+store; the migration helper never checkpoints it.
+
+A failed capture can leave a private incomplete directory, but never publishes
+a successful receipt. Keep it separate from the immutable original backup.
+`Source.confirm/3` repeats the observations after subsequent export work.
+A capture alone is not an importable or activated PostgreSQL store.
+
+Typed intermediate files use length-delimited deterministic terms with a
+checksum per record and a whole-file count, size and checksum. `Frames.fold/4`
+validates the complete expected stream before calling its consumer, so a
+truncated file cannot be accepted as a shorter export. These files can contain
+identity and cursor material: keep their enclosing directory private and do
+not attach them to public reports.
+
+Capture uses ordinary file reads, which may update source access times; content,
+size and modification time are verified unchanged.
