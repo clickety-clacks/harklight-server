@@ -32,6 +32,30 @@ defmodule AttentionServer.JevClient do
     valid_endpoint?(endpoint) and valid_model?(model) and key_status() == "readable"
   end
 
+  def normalize_endpoint(value) when is_binary(value) do
+    value = String.trim(value)
+
+    cond do
+      value == "" -> {:ok, nil}
+      valid_endpoint?(value) -> {:ok, value}
+      true -> {:error, :invalid_endpoint}
+    end
+  end
+
+  def normalize_endpoint(_), do: {:error, :invalid_endpoint}
+
+  def normalize_model(value) when is_binary(value) do
+    value = String.trim(value)
+
+    cond do
+      value == "" -> {:ok, nil}
+      valid_model?(value) -> {:ok, value}
+      true -> {:error, :invalid_model}
+    end
+  end
+
+  def normalize_model(_), do: {:error, :invalid_model}
+
   def valid_endpoint?(endpoint) when is_binary(endpoint) and byte_size(endpoint) in 1..2_048 do
     uri = URI.parse(String.trim(endpoint))
 
