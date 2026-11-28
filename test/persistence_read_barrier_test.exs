@@ -23,9 +23,6 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
 
   defp audit, do: %{person: "person", actor: "test", action: "barrier"}
 
-  defp read(store, {:cursor, key}, _from),
-    do: Engine.acknowledged_cursor(store.engine, key)
-
   defp revoked?(engine, key), do: match?(%{revoked: true}, Map.get(engine.devices, key))
 
   # Disk work and worker scheduling are not subject to a 100 ms contract.
@@ -58,7 +55,7 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
         {:ok, next} = Engine.revoke_device(store.engine, "device")
 
         {:ok, committed} =
-          Persistence.with_reads(store, &read/3, fn ->
+          Persistence.with_reads(store.engine, fn ->
             result =
               Persistence.run(fn ->
                 send(parent, {:writing, self()})
@@ -66,7 +63,7 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
               end)
 
             {:ok, committed} = result
-            Persistence.committed(committed)
+            Persistence.committed(committed.engine)
             send(parent, {:first_committed, self()})
 
             # A second commit in the same Relay callback must read the first
@@ -115,7 +112,7 @@ defmodule AttentionServer.PersistenceReadBarrierTest do
       spawn_monitor(fn ->
         store = seed(path)
 
-        Persistence.with_reads(store, &read/3, fn ->
+        Persistence.with_reads(store.engine, fn ->
           Persistence.run(fn ->
             send(parent, {:writing, self()})
             receive do: (:fail -> exit(:persistence_failed))

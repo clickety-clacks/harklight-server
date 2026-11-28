@@ -1,13 +1,16 @@
 defmodule AttentionServer.Store.Persistence do
   @moduledoc false
 
+  alias AttentionServer.Repository.CommittedRead
+  require CommittedRead
+
   @snapshot {__MODULE__, :committed}
 
   # Only Relay installs this scope. Standalone Store users retain their blocking
   # API. It is deliberately not a second reader of SQLite: these replies use the
   # last committed in-memory engine, never the worker's proposed state.
-  def with_reads(store, reader, fun) do
-    previous = Process.put(@snapshot, {store, reader})
+  def with_reads(engine, fun) do
+    previous = Process.put(@snapshot, engine)
 
     try do
       fun.()
@@ -16,12 +19,8 @@ defmodule AttentionServer.Store.Persistence do
     end
   end
 
-  def committed(store) do
-    case Process.get(@snapshot) do
-      {_previous, reader} -> Process.put(@snapshot, {store, reader})
-      nil -> :ok
-    end
-
+  def committed(engine) do
+    if Process.get(@snapshot), do: Process.put(@snapshot, engine)
     :ok
   end
 
@@ -49,19 +48,8 @@ defmodule AttentionServer.Store.Persistence do
       {:DOWN, ^ref, :process, ^pid, reason} ->
         exit({reason, {__MODULE__, :await}})
 
-      {:"$gen_call", from, request}
-      when is_tuple(request) and
-             elem(request, 0) in [
-               :cursor,
-               :owner_identity,
-               :agent_identity,
-               :owner_revision,
-               :owner_list_agents,
-               :dashboard_inventory,
-               :dashboard_levels
-             ] ->
-        {store, reader} = Process.get(@snapshot)
-        GenServer.reply(from, reader.(store, request, from))
+      {:"$gen_call", from, request} when CommittedRead.supported?(request) ->
+        GenServer.reply(from, CommittedRead.execute(Process.get(@snapshot), request))
         await(task)
     end
   end

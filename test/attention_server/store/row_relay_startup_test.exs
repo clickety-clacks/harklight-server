@@ -305,6 +305,31 @@ defmodule AttentionServer.Store.RowRelayStartupTest do
     assert :ok = Store.close(cold)
   end
 
+  test "a keyed commit publishes its reads only after the worker returns", %{tmp_dir: dir} do
+    assert {:ok, relay} = Relay.start_link(store_path: Path.join(dir, "relay.sqlite3"))
+    assert :ok = Relay.setup_person(relay, "person")
+    assert :ok = Relay.setup_device(relay, "person", "device")
+
+    handler = {__MODULE__, make_ref()}
+    event = [:harklight, :store, :commit, :committed]
+    assert :ok = :telemetry.attach(handler, event, &__MODULE__.pause_worker/4, {relay, self()})
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    revoke = :gen_server.send_request(relay, {:revoke_device, "device"})
+    assert_receive {:committed, worker}, 5_000
+
+    inbox = :gen_server.send_request(relay, {:client_api, Reads, {:inbox, "device", %{}}})
+    assert {:ok, 0} = Relay.acknowledged_cursor(relay, "device")
+    assert :timeout = :gen_server.wait_response(inbox, 0)
+    assert :timeout = :gen_server.wait_response(revoke, 0)
+
+    send(worker, :continue)
+    assert {:reply, :ok} = :gen_server.receive_response(revoke, 5_000)
+    assert {:reply, {:error, _}} = :gen_server.receive_response(inbox, 5_000)
+    assert {:error, :forbidden} = Relay.acknowledged_cursor(relay, "device")
+    assert :ok = GenServer.stop(relay)
+  end
+
   def pause_worker(_event, _measurement, _metadata, {relay, observer}) do
     {:links, links} = Process.info(self(), :links)
 
