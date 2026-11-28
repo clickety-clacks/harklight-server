@@ -426,6 +426,26 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         end
         assert :ok = ImportUploads.run(db, identity, bundle)
         verify_uploads(db, bundle, manifest)
+        # The relation test below selects the exact source row referenced by a
+        # stored read position, rather than relying on arbitrary event order.
+        assert {:ok, reference} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, nil, fn
+          {{:row, :chat_read_positions, {person, _, _}}, position}, nil when position > 0 ->
+            {:ok, Attributes.key({:row, :conversation_events, {person, position}})}
+          _, found -> {:ok, found}
+        end)
+        assert is_binary(reference)
+        assert {:ok, %{rows: [[saved_body]]}} = ImportSession.query(db,
+          "SELECT body::text FROM harklight.compatibility_facts WHERE family='conversation_events' AND address=$1", [reference])
+        assert {:ok, _} = ImportSession.query(db,
+          "DELETE FROM harklight.compatibility_facts WHERE family='conversation_events' AND address=$1", [reference])
+        assert {:error, :read_position_reference_mismatch} = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
+        assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "conversations/read-positions/v1")
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.read_positions", [])
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES('conversation_events',$1,$2::text::jsonb)", [reference, saved_body])
+        assert :ok = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
+        assert :ok = AttentionServer.Migration.ImportConversations.run(db, identity, bundle)
+        verify_conversation_positions(db, bundle, manifest)
         stop_supervised!(Repo)
 
         assert {:ok, :ok} =
@@ -780,6 +800,29 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.origin_delivery_acks", [])
       assert {:ok, %{rows: [["loading"]]}} = ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
       Agent.stop(fixture.clock)
+    end
+
+    defp verify_conversation_positions(db, root, manifest) do
+      assert {:ok, {containers, positions}} = Frames.fold(Path.join(root, "records.frames"),
+        manifest.data.records, {0, 0}, fn
+          {{:row, :messages, key}, record}, {containers, positions} ->
+            id = ImportMessages.id(key, record)
+            assert {:ok, %{rows: [[^id, text]]}} = ImportSession.query(db,
+              "SELECT message_id,attributes::text FROM harklight.conversations WHERE id=$1", [id])
+            assert_typed(text, %{source_key: key})
+            {:ok, {containers + 1, positions}}
+          {{:row, :chat_read_positions, {person, sender, external}}, position}, {containers, positions} ->
+            assert {:ok, %{rows: [[^position]]}} = ImportSession.query(db,
+              "SELECT r.position FROM harklight.read_positions r JOIN harklight.messages m ON m.id=r.conversation_id WHERE r.person_id=$1 AND m.person_id=$1 AND m.sender_id=$2 AND m.message_id=$3",
+              [person, sender, external])
+            {:ok, {containers, positions + 1}}
+          _, counts -> {:ok, counts}
+        end)
+      assert containers > 0 and positions > 0
+      assert {:ok, %{rows: [[^containers]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.conversations", [])
+      assert {:ok, %{rows: [[^positions]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.read_positions", [])
     end
 
     defp verify_uploads(db, root, manifest) do

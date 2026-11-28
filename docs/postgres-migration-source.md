@@ -361,3 +361,9 @@ The import still stays in `loading`; these record projections do not validate or
 activate a destination. Fresh imports pin the digest of migrations 001 and 002 in
 order. Resuming an already claimed import requires its original identity and
 schema digest, even after the destination applies migration 002.
+
+`ImportConversations.run/3` creates ordinary conversation containers using the
+message's internal ID and copies exact per-person read positions. Positive read
+positions must resolve to the same source conversation's origin reply. This phase
+does not yet project conversation entries, seen revisions, answers or shared
+conversation history, and cannot validate or activate a destination.
