@@ -387,3 +387,12 @@ inventory and bytes before installing them. `server.env` remains source material
 the installer applies the explicit backend configuration change separately after
 successful activation. Export and verify include additive `contract_version: 1`
 and `command` fields; their existing result and digest fields remain unchanged.
+
+Material staging now refuses permission drift on resumed roots, intermediate
+directories, files and owner/completion markers. Standard owner material requires
+`person-id`, `owner/identity.pem` and `owner/identity.key`: the private key's public
+SPKI fingerprint must match the certificate and the selected person's current
+owner fingerprint in the decoded source records. A valid certificate/key pair
+from another identity is refused. Other identity kinds, including TLS material,
+remain refused until their source continuity mapping is implemented; this is not
+yet a complete self-hosted migration route.
