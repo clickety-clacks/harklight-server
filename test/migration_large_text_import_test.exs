@@ -4,16 +4,17 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
   defmodule AttentionServer.Migration.LargeTextImportTest do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, JSON, Relay}
-    alias AttentionServer.Migration.{Bundle, Frames, ImportLargeText, ImportSession}
-    alias AttentionServer.Repository.Postgres.{LargeText, Schema}
+    alias AttentionServer.Migration.{Bundle, Frames, ImportLargeText, ImportMessages, ImportSession}
+    alias AttentionServer.Repository.Postgres.{Items, LargeText, Repo, Schema}
 
     @tag timeout: 120_000
     test "real stopped large-text export resumes committed chunks and projects exact paths" do
       uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
       assert uri.host in ["localhost", "127.0.0.1"]
       [user, password] = String.split(uri.userinfo, ":", parts: 2)
-      db = start_supervised!({Postgrex, hostname: uri.host, port: uri.port,
-        username: URI.decode(user), password: URI.decode(password), database: "migration_large_text"})
+      config = [hostname: uri.host, port: uri.port,
+        username: URI.decode(user), password: URI.decode(password), database: "migration_large_text"]
+      db = start_supervised!({Postgrex, config})
       root = Path.join(System.tmp_dir!(), "large-import-#{System.unique_integer([:positive])}")
       File.mkdir!(root)
       File.chmod!(root, 0o700)
@@ -74,11 +75,32 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, %{rows: [[1, true]]}} = ImportSession.query(db,
         "SELECT count(*),bool_and(verified) FROM harklight.large_texts", [])
       assert {:ok, %{rows: [[3]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.large_text_chunks", [])
+      # A committed ordinary phase from an earlier importer must resume into
+      # the new reference phase, without resetting its source checkpoint.
+      assert {:ok, _} = ImportSession.query(db, """
+        CREATE FUNCTION harklight.interrupt_text_projection() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'synthetic projection interruption'; END $$
+        """, [])
+      assert {:ok, _} = ImportSession.query(db,
+        "CREATE TRIGGER interrupt_text_projection BEFORE UPDATE ON harklight.message_revisions FOR EACH ROW EXECUTE FUNCTION harklight.interrupt_text_projection()", [])
+      assert {:error, _} = ImportMessages.run(db, identity, bundle)
+      assert {:ok, %{ordinal: 2}} = ImportSession.checkpoint(db, identity, "messages/ordinary/v1")
+      assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "messages/large-text/v1")
+      assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER interrupt_text_projection ON harklight.message_revisions", [])
+      assert :ok = ImportMessages.run(db, identity, bundle)
+      assert :ok = ImportMessages.run(db, identity, bundle)
+      assert {:ok, %{ordinal: 2}} = ImportSession.checkpoint(db, identity, "messages/large-text/v1")
+      start_supervised!({Repo, config})
       query = &ImportSession.query(db, &1, &2)
       assert {:ok, 2} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, 0, fn
         {{:row, :messages, _} = address, record}, found ->
           assert {:ok, projected} = ImportLargeText.project(db, address, record)
           assert %LargeText.Ref{} = ref = projected.message["body"]
+          {:row, :messages, {person, _, _} = key} = address
+          item = AttentionServer.ClientAPI.Resources.item_id(record)
+          assert {:ok, ^key, ^projected} = Items.recipient_item(person, item)
+          assert {:error, :not_found} = Items.recipient_item("different-person", item)
+          assert {:error, :not_found} = Items.agent_item({person, "different-origin"}, item)
           bytes = Enum.map_join(0..2, fn ordinal ->
             assert {:ok, chunk} = LargeText.read_chunk(ref, ordinal, query)
             chunk
@@ -90,6 +112,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           {:ok, found + 1}
         _, found -> {:ok, found}
       end)
+      stop_supervised!(Repo)
       file = Path.join(bundle, "files/uploads/" <> hash)
       File.rename!(file, file <> ".saved")
       assert {:error, _} = ImportLargeText.run(db, identity, bundle)

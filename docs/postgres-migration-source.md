@@ -467,3 +467,12 @@ with typed PostgreSQL references; marker-looking literal text is unchanged.
 Raw FORMAT32 facts are retained. This does not activate the target or yet wire
 all normalized history projections. Ordinary/shared authorized HTTP parity and
 complete migration validation remain required before activation.
+
+Ordinary message import now runs verified LargeText publication before its
+separate `messages/large-text/v1` projection checkpoint. This additive phase also
+handles a loading destination whose ordinary records were already staged by an
+earlier importer. It replaces exact source markers in normalized revision bodies,
+terminal and supplemental attributes, without altering recorded timestamps or
+raw source facts. Its writes and checkpoint roll back together. Scoped ordinary
+item-reader parity is checked after interruption and resume; shared history and
+full authorized HTTP parity remain separate required gates.
