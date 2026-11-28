@@ -1542,10 +1542,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_item_facts ON harklight.compatibility_facts", [])
       assert :ok = ImportItemFacts.run(db, identity, bundle)
       assert :ok = ImportItemFacts.run(db, identity, bundle)
-      assert {:ok, source} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, %Engine{}, fn
-        {{:field, field}, value}, engine -> {:ok, Map.put(engine, field, value)}
-        {{:row, field, key}, value}, engine -> {:ok, Map.update!(engine, field, &Map.put(&1, key, value))}
-      end)
+      assert {:ok, records} = Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records, [],
+        fn entry, entries -> {:ok, [entry | entries]} end)
+      assert {:ok, source} = AttentionServer.Store.RecordCodec.decode(Enum.reverse(records))
       source = Engine.rebuild_route_b_index(source)
       assert Enum.any?(source.messages, fn {_, record} -> is_binary(Map.get(record, :session_handle)) end)
       for {{person, _, _} = key, record} <- source.messages do
