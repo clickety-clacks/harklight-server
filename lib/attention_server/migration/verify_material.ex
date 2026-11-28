@@ -14,10 +14,11 @@ defmodule AttentionServer.Migration.VerifyMaterial do
            %{"path" => path, "size" => info.size, "sha256" => info.sha256}
          end),
          bytes = JSON.encode!(ImportMaterial.inventory(id, summary.sha256, schema, files)),
-         :ok <- private_mode(destination, :directory, 0o700),
-         :ok <- marker(destination, "OWNER.json", bytes),
-         :ok <- marker(destination, "COMPLETE.json", bytes),
-         {:ok, actual} <- tree(destination, "", MapSet.new()),
+         {:ok, owner} <- service_owner(),
+         :ok <- private_mode(destination, :directory, 0o700, owner),
+         :ok <- marker(destination, "OWNER.json", bytes, owner),
+         :ok <- marker(destination, "COMPLETE.json", bytes, owner),
+         {:ok, actual} <- tree(destination, "", MapSet.new(), owner),
          true <- actual == expected_tree(files),
          :ok <- each(files, fn file -> content(Path.join([destination, "files", file["path"]]), file) end),
          {:ok, ^manifest, ^summary} <- Bundle.verify(bundle) do
@@ -31,9 +32,9 @@ defmodule AttentionServer.Migration.VerifyMaterial do
     end
   end
 
-  defp marker(root, name, expected) do
+  defp marker(root, name, expected, owner) do
     path = Path.join(root, name)
-    with :ok <- private_mode(path, :regular, 0o600),
+    with :ok <- private_mode(path, :regular, 0o600, owner),
          {:ok, ^expected} <- File.read(path) do
       :ok
     else
@@ -54,17 +55,17 @@ defmodule AttentionServer.Migration.VerifyMaterial do
     parents(parent, MapSet.put(acc, parent))
   end
 
-  defp tree(root, relative, found) do
+  defp tree(root, relative, found, owner) do
     with {:ok, names} <- File.ls(Path.join(root, relative)) do
       Enum.reduce_while(names, {:ok, found}, fn name, {:ok, acc} ->
         relative_path = Path.join(relative, name)
         path = Path.join(root, relative_path)
         result = case File.lstat(path) do
           {:ok, %{type: :directory}} ->
-            with :ok <- private_mode(path, :directory, 0o700),
-              do: tree(root, relative_path, MapSet.put(acc, relative_path))
+            with :ok <- private_mode(path, :directory, 0o700, owner),
+              do: tree(root, relative_path, MapSet.put(acc, relative_path), owner)
           {:ok, %{type: :regular}} ->
-            with :ok <- private_mode(path, :regular, 0o600),
+            with :ok <- private_mode(path, :regular, 0o600, owner),
               do: {:ok, MapSet.put(acc, relative_path)}
           _ -> {:error, :material_permissions_mismatch}
         end
@@ -83,13 +84,32 @@ defmodule AttentionServer.Migration.VerifyMaterial do
       _ -> {:error, :material_content_mismatch}
     end
   end
-  defp private_mode(path, type, mode) do
+  defp private_mode(path, type, mode, {uid, gid}) do
     case File.lstat(path) do
       {:ok, stat} when stat.type == type ->
-        if (stat.mode &&& 0o777) == mode, do: :ok, else: {:error, :material_permissions_mismatch}
+        cond do
+          stat.uid != uid or stat.gid != gid -> {:error, :material_ownership_mismatch}
+          (stat.mode &&& 0o777) != mode -> {:error, :material_permissions_mismatch}
+          true -> :ok
+        end
       _ -> {:error, :material_permissions_mismatch}
     end
   end
+  # The command runs as the intended service account. Read effective IDs from
+  # the OS, not environment labels or the ownership of a potentially wrong stage.
+  defp service_owner do
+    with {uid_text, 0} <- System.cmd("id", ["-u"], stderr_to_stdout: true),
+         {gid_text, 0} <- System.cmd("id", ["-g"], stderr_to_stdout: true),
+         {uid, ""} when uid >= 0 <- Integer.parse(String.trim(uid_text)),
+         {gid, ""} when gid >= 0 <- Integer.parse(String.trim(gid_text)) do
+      {:ok, {uid, gid}}
+    else
+      _ -> {:error, :material_service_owner_unavailable}
+    end
+  rescue
+    ErlangError -> {:error, :material_service_owner_unavailable}
+  end
+
   defp each(rows, fun), do: Enum.reduce_while(rows, :ok, fn row, :ok ->
     case fun.(row) do
       :ok -> {:cont, :ok}

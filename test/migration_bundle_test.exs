@@ -14,6 +14,7 @@ defmodule AttentionServer.Migration.BundleTest do
       {relative, {:crypto.hash(:sha256, File.read!(path)), stat.size, stat.mtime, stat.mode}}
     end) end
     before = snapshot.()
+    verify_material_owner_drift(bundle, identity, staging, expected)
     assert {:ok, ^expected} = VerifyMaterial.run(bundle, identity, staging)
     assert snapshot.() == before
     for relative <- ["OWNER.json", "COMPLETE.json", "files/person-id"] do
@@ -62,6 +63,29 @@ defmodule AttentionServer.Migration.BundleTest do
     missing = staging <> "-missing"
     assert {:error, _} = VerifyMaterial.run(bundle, identity, missing)
     refute File.exists?(missing)
+  end
+
+  defp verify_material_owner_drift(bundle, identity, staging, expected) do
+    # The disposable PostgreSQL CI job runs on a fresh Linux runner with sudo.
+    # Never require chown privileges for ordinary local unit-test runs.
+    if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
+      alias AttentionServer.Migration.VerifyMaterial
+      original = File.stat!(staging)
+      for relative <- ["", "files", "files/owner", "OWNER.json", "COMPLETE.json", "files/owner/identity.key"],
+          {uid, gid} <- [{original.uid + 10_000, original.gid}, {original.uid, original.gid + 10_000}] do
+        path = Path.join(staging, relative)
+        args = ["#{uid}:#{gid}", path]
+        {_, 0} = System.cmd("sudo", ["-n", "chown" | args], stderr_to_stdout: true)
+        try do
+          assert {:error, :material_ownership_mismatch} = VerifyMaterial.run(bundle, identity, staging)
+          stat = File.lstat!(path)
+          assert {stat.uid, stat.gid} == {uid, gid}
+        after
+          {_, 0} = System.cmd("sudo", ["-n", "chown", "#{original.uid}:#{original.gid}", path], stderr_to_stdout: true)
+        end
+        assert {:ok, ^expected} = VerifyMaterial.run(bundle, identity, staging)
+      end
+    end
   end
 
   test "command requires explicit source, supervision and material inventory" do

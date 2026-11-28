@@ -671,3 +671,9 @@ rollback journal before and after reading bundle contents. Sidecars must be
 absent or empty; a nonempty sidecar refuses even if the main database hash is
 unchanged. All verifiers share this check. It never opens, checkpoints, clears
 or otherwise modifies the copied source to make validation pass.
+
+Material validation must run as the intended Server service account. The staged
+root, every directory, both markers and every file must have that process's
+effective UID and GID, as well as private modes. A foreign owner refuses without
+repair: otherwise a correctly hashed 0600 key could be unreadable after cutover.
+Changing the runtime account is not part of migration validation.
