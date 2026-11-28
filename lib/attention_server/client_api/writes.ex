@@ -856,7 +856,11 @@ defmodule AttentionServer.ClientAPI.Writes do
       {:ok, %{digest: ^digest, status: status, body: encoded, original_response: original?}} ->
         case JSON.decode_line(encoded <> "\n") do
           {:ok, body} when is_map(body) ->
-            if original?, do: {:replay, status, body}, else: retained_replay(body, status, who, person, from, state)
+            if original? do
+              {:replay, status, body}
+            else
+              render_receipt(body, status, :retained, &replay(&1, who, person, from, state))
+            end
 
           _ ->
             {:error, :storage_unavailable}
@@ -873,13 +877,19 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp stored(state, person, key, digest, who, from),
     do: stored_recent(state, person, key, digest, who, from)
 
-  defp retained_replay(receipt, status, who, person, from, state) do
-    case Projection.capture(fn -> replay(receipt, who, person, from, state) end) do
+  @doc false
+  def render_receipt(receipt, status, retention, project) do
+    case Projection.capture(fn -> project_receipt(receipt, project) end) do
       {:ok, body} -> {:replay, status, body}
       {:error, :idempotency_conflict} = error -> error
-      _ -> {:replay, 202, %{"code" => "accepted_reconcile"}}
+      _ when retention == :retained -> {:replay, 202, %{"code" => "accepted_reconcile"}}
+      error -> error
     end
   end
+
+  defp project_receipt(%{"file" => body}, _project), do: {:ok, body}
+  defp project_receipt(%{"discarded_file" => true}, _project), do: {:ok, %{}}
+  defp project_receipt(receipt, project), do: project.(receipt)
 
   defp stored_recent(state, person, key, digest, who, from) do
     case Idempotency.lookup(state.store, person, key) do
@@ -887,10 +897,7 @@ defmodule AttentionServer.ClientAPI.Writes do
         {:ok, nil}
 
       {:ok, %{digest: ^digest, status: status, body: receipt}} ->
-        case Projection.capture(fn -> replay(receipt, who, person, from, state) end) do
-          {:ok, body} -> {:replay, status, body}
-          error -> error
-        end
+        render_receipt(receipt, status, :recent, &replay(&1, who, person, from, state))
 
       {:ok, _other} ->
         {:error, :idempotency_conflict}
@@ -944,9 +951,6 @@ defmodule AttentionServer.ClientAPI.Writes do
   defp receipt({:answer, item_id, _, _}, _reply, _result), do: %{"item_id" => item_id}
   defp receipt({:file, _meta, _tmp}, _reply, {:ok, _status, body}), do: %{"file" => body}
   defp receipt(_settings_write, _reply, _result), do: %{"settings" => true}
-
-  defp replay(%{"file" => body}, _who, _person, _from, _state), do: {:ok, body}
-  defp replay(%{"discarded_file" => true}, _who, _person, _from, _state), do: {:ok, %{}}
 
   defp replay(%{"push_projection_failed" => device}, who, _person, _from, state) do
     case principal(state.store.engine, who) do
@@ -1762,6 +1766,9 @@ defmodule AttentionServer.ClientAPI.Writes do
       member -> {:error, "invalid_field", member}
     end
   end
+
+  def respond(conn, {:ok, status, {:encoded_json, body}, true}),
+    do: conn |> replayed(true) |> Errors.send_encoded_json(status, body)
 
   def respond(conn, {:ok, status, body, replayed?}),
     do: conn |> replayed(replayed?) |> Errors.send_json(status, body)

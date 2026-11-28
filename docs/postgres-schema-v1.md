@@ -9,11 +9,13 @@ A second bootstrap fails without modifying the installed schema. Application
 startup must check the installed version and performs no DDL.
 
 The explicit migration job applies
-[`001_initial.sql`](../priv/postgres/001_initial.sql) followed by
-[`002_message_history.sql`](../priv/postgres/002_message_history.sql)
-before claiming a fresh import. Both use the same advisory lock. The import
-schema digest is SHA-256 over the two files' bytes concatenated in order.
-Version 2 adds the complete message history representation.
+[`001_initial.sql`](../priv/postgres/001_initial.sql),
+[`002_message_history.sql`](../priv/postgres/002_message_history.sql), and
+[`003_large_text.sql`](../priv/postgres/003_large_text.sql) in order.
+They use the same advisory lock. For a fresh import, the schema digest is
+SHA-256 over the ordered files' concatenated bytes. When resuming an import
+claimed under an earlier version, keep its original pinned digest.
+Version 2 represents message history, and version 3 adds shared large text.
 
 - Keep person IDs and principal keys as opaque text. Preserve the server
   instance ID, cursor signing bytes and integer epoch exactly. Preserve
@@ -67,6 +69,15 @@ Version 2 adds the complete message history representation.
   Cleanup takes bounded batches of expired, unlinked reservations under
   manifest locks. Imported manifests without a reservation timestamp are
   excluded.
+- Store externalized large text in `large_texts` and `large_text_chunks`.
+  A typed resource holds a `Repository.Postgres.LargeText.Ref` with the
+  lowercase SHA-256 hex string and byte length. SQL keys use the raw
+  32-byte digest. Chunks start at zero and use 1 MiB except for a shorter
+  final chunk. Empty content has no chunks. Exact staged retries leave
+  stored bytes intact. Publish only after verifying the entire length and
+  hash, using bounded reads. Resolve references only from authorized parent
+  resources. The database is the authoritative copy. Preserve the source
+  marker and side facts separately during import.
 - Claims are scoped to one job, with an attempt count, unique claim token
   and expiry. A worker may record success while its token still matches an
   unfinished job, including after lease expiry. The fifth failed or expired
@@ -102,7 +113,7 @@ to begin in `loading`, rejects skipped or reversed phase transitions, and
 prevents replacing the source, schema, import identity or validated manifest.
 Restarting from scratch requires a new unpublished destination. An opted-in
 runtime must require both
-schema version 2 and `phase = 'active'` plus the server identity row. The
+schema version 3 and `phase = 'active'` plus the server identity row. The
 identity row alone cannot publish partial imports. An isolated fresh database
 uses the same lifecycle with a manifest describing the newly provisioned
 synthetic data.

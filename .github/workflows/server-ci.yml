@@ -87,7 +87,8 @@ jobs:
         run: |
           cat priv/postgres/001_initial.sql priv/postgres/002_message_history.sql \
             test/attention_server/repository/postgres_schema_v1.sql \
-            test/attention_server/repository/postgres_message_history.sql |
+            test/attention_server/repository/postgres_message_history.sql \
+            priv/postgres/003_large_text.sql |
             docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d fixture -f -
       - uses: erlef/setup-beam@v1
         with:
@@ -127,7 +128,7 @@ jobs:
       - name: Apply schema to a fresh throwaway database
         run: |
           apply_schema() {
-            cat priv/postgres/001_initial.sql priv/postgres/002_message_history.sql |
+            cat priv/postgres/001_initial.sql priv/postgres/002_message_history.sql priv/postgres/003_large_text.sql |
               docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d "$1" -f -
           }
           apply_schema migration_fixture
