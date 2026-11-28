@@ -81,9 +81,7 @@ defmodule AttentionServer.ClientAPI.Auth do
   """
   @spec browser(Plug.Conn.t(), term()) :: {:ok, Principal.t()} | {:error, :unauthorized | :unavailable}
   def browser(conn, backend) do
-    conn = Plug.Conn.fetch_cookies(conn)
-
-    with cookie when is_binary(cookie) <- Map.get(conn.req_cookies, @cookie),
+    with cookie when is_binary(cookie) <- browser_cookie(conn),
          {:ok, %{person: person, key: key, browser_session_id: session, revision: revision}}
          when is_binary(person) and is_binary(key) and is_binary(session) <-
            backend_call(backend, :browser_context, cookie) do
@@ -104,8 +102,7 @@ defmodule AttentionServer.ClientAPI.Auth do
   end
 
   def web(conn, backend, relay) do
-    conn = Plug.Conn.fetch_cookies(conn)
-    cookie = Map.get(conn.req_cookies, @cookie)
+    cookie = browser_cookie(conn)
 
     case {cookie, Plug.Conn.get_req_header(conn, "authorization")} do
       {_, []} ->
@@ -124,6 +121,9 @@ defmodule AttentionServer.ClientAPI.Auth do
         {:error, :unauthorized}
     end
   end
+
+  @doc false
+  def browser_cookie(conn), do: Map.get(Plug.Conn.fetch_cookies(conn).req_cookies, @cookie)
 
   @doc """
   Whether a browser request may proceed past the origin check. Reads pass.
