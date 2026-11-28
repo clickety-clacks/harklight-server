@@ -193,6 +193,53 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, ^key, _} = AgentItems.owned_item(:postgres, {person, origin}, "i7")
     end
 
+    test "an attachment is served only after its complete chunk sequence and digest verify" do
+      alias AttentionServer.Repository.Postgres.Uploads
+
+      person = "synthetic-upload-person"
+      owner = "synthetic-upload-owner"
+      ref = {person, owner, "synthetic-attachment"}
+      full = :binary.copy(<<42>>, Uploads.chunk_bytes())
+      tail = <<0, 1, 255>>
+      size = byte_size(full) + byte_size(tail)
+      digest = :crypto.hash(:sha256, [full, tail])
+
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+      assert {:error, :upload_cap_exceeded} =
+               Uploads.begin_upload(person, owner, "synthetic-attachment", size, digest, %{}, size - 1)
+      assert {:ok, "synthetic-attachment"} =
+               Uploads.begin_upload(person, owner, "synthetic-attachment", size, digest, %{}, size)
+      assert {:error, :not_found} = Uploads.read_chunk(person, "synthetic-attachment", 0)
+      assert {:error, :invalid_chunk} = Uploads.put_chunk(ref, 0, tail)
+      assert {:error, :not_found} =
+               Uploads.put_chunk({person, "other-owner", "synthetic-attachment"}, 0, full)
+
+      assert {:ok, :stored} = Uploads.put_chunk(ref, 0, full)
+      assert {:ok, :stored} = Uploads.put_chunk(ref, 0, full)
+      assert {:error, :upload_conflict} =
+               Uploads.put_chunk(ref, 0, :binary.copy(<<43>>, byte_size(full)))
+      assert {:error, :incomplete_upload} = Uploads.complete(ref, 10)
+      assert {:ok, :stored} = Uploads.put_chunk(ref, 1, tail)
+      assert {:ok, "synthetic-attachment"} = Uploads.complete(ref, 10)
+      assert {:ok, "synthetic-attachment"} = Uploads.complete(ref, 11)
+      assert {:ok, ^full} = Uploads.read_chunk(person, "synthetic-attachment", 0)
+      assert {:ok, ^tail} = Uploads.read_chunk(person, "synthetic-attachment", 1)
+      assert {:error, :not_found} = Uploads.read_chunk("other-person", "synthetic-attachment", 0)
+      assert {:error, :upload_completed} = Uploads.put_chunk(ref, 1, tail)
+
+      assert {:ok, "corrupt-attachment"} =
+               Uploads.begin_upload(person, owner, "corrupt-attachment", 3, digest, %{}, :none)
+      corrupt = {person, owner, "corrupt-attachment"}
+      assert {:ok, :stored} = Uploads.put_chunk(corrupt, 0, tail)
+      assert {:error, :upload_digest_mismatch} = Uploads.complete(corrupt, 10)
+      assert {:error, :not_found} = Uploads.read_chunk(person, "corrupt-attachment", 0)
+
+      empty_digest = :crypto.hash(:sha256, <<>>)
+      assert {:ok, "empty-attachment"} =
+               Uploads.begin_upload(person, owner, "empty-attachment", 0, empty_digest, %{}, :none)
+      assert {:ok, "empty-attachment"} = Uploads.complete({person, owner, "empty-attachment"}, 10)
+    end
+
     test "reversed multi-stream inputs wait on the same first lock" do
       left = {"lock-a", ""}
       right = {"lock-b", ""}
