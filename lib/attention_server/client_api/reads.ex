@@ -121,23 +121,13 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
-  def get_postgres_item(conn, %Context{params: %{item_id: item}}) do
+  def get_postgres_item(conn, %Context{params: %{item_id: item}} = ctx, auth \\ :web) do
     result =
-      Transaction.snapshot(fn ->
-        with {:ok, %{kind: :browser, person: person} = principal} <- Auth.web(conn, Identities, :postgres),
-             :ok <- Settings.check_active(person) do
-          RecipientItems.item(:postgres, browser_render_principal(principal), item)
-        else
-          {:ok, _native} -> {:error, :not_found}
-          {:error, :unavailable} -> {:error, :retry_later}
-          {:error, _} = error -> error
-        end
+      postgres_item_read(conn, ctx, auth, fn principal ->
+        RecipientItems.item(:postgres, postgres_render_principal(principal), item)
       end)
 
-    case result do
-      {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
-      error -> respond(conn, error)
-    end
+    respond_streamed(conn, result)
   end
 
   @doc false
@@ -159,29 +149,53 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
-  def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}} = ctx) do
+  def get_postgres_revision(conn, %Context{} = ctx),
+    do: get_postgres_revision(conn, ctx, :browser)
+
+  @doc false
+  def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}} = ctx, auth) do
     result =
-      Transaction.snapshot(fn ->
-        with {:ok, %{kind: :browser, person: person}} <- Auth.web(conn, Identities, :postgres),
-             :ok <- Settings.check_active(person),
-             {:ok, capability} <- SharedCapability.parse(conn),
-             :ok <- SharedAccess.check(person, capability, ctx.shared_features),
-             {:ok, revision} <- revision_number(raw_revision) do
+      postgres_item_read(conn, ctx, auth, fn %{person: person} ->
+        with {:ok, revision} <- revision_number(raw_revision) do
           RecipientItems.revision(:postgres, person, item, revision)
-        else
-          {:ok, _native} -> {:error, :not_found}
-          {:error, :unavailable} -> {:error, :retry_later}
-          {:error, token, field} -> {:error, {token, field}}
-          {:error, _} = error -> error
         end
       end)
 
-    case result do
-      {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
-      {:error, {token, field}} when is_binary(token) -> respond(conn, {:error, token, field})
-      error -> respond(conn, error)
+    respond_streamed(conn, result)
+  end
+
+  defp postgres_item_read(conn, ctx, auth, read) do
+    Transaction.snapshot(fn ->
+      with {:ok, %{kind: kind, person: person} = principal} when kind in [:browser, :device] <-
+             postgres_item_authority(conn, auth),
+           :ok <- Settings.check_active(person),
+           {:ok, capability} <- SharedCapability.parse(conn),
+           :ok <- SharedAccess.check(person, capability, ctx.shared_features) do
+        read.(principal)
+      else
+        {:ok, _agent} -> {:error, :not_found}
+        {:error, :unavailable} -> {:error, :retry_later}
+        {:error, token, field} -> {:error, {token, field}}
+        {:error, _} = error -> error
+      end
+    end)
+  end
+
+  defp postgres_item_authority(conn, :browser) do
+    case Auth.web(conn, Identities, :postgres) do
+      {:ok, %{kind: :browser}} = browser -> browser
+      {:ok, _native} -> {:error, :not_found}
+      error -> error
     end
   end
+
+  defp postgres_item_authority(conn, :web), do: Auth.web(conn, Identities, :postgres)
+
+  defp postgres_item_authority(conn, {:certificate, mode}) when mode in [:self_hosted, :saas],
+    do: Auth.device(conn, {:postgres, mode})
+
+  defp postgres_render_principal(%{kind: :browser} = principal), do: browser_render_principal(principal)
+  defp postgres_render_principal(%{kind: :device} = principal), do: principal
 
   @doc false
   def get_settings(conn, %Context{} = ctx),
@@ -276,6 +290,14 @@ defmodule AttentionServer.ClientAPI.Reads do
     conn = read_headers(conn, tag)
     if not_modified?(conn, tag), do: {:not_modified, conn}, else: {:send, conn}
   end
+
+  defp respond_streamed(conn, {:ok, body}),
+    do: Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
+
+  defp respond_streamed(conn, {:error, {token, field}}) when is_binary(token),
+    do: respond(conn, {:error, token, field})
+
+  defp respond_streamed(conn, error), do: respond(conn, error)
 
   def respond(conn, result, etag_of \\ &etag/1)
 

@@ -2,6 +2,7 @@ defmodule AttentionServer.Repository.RecipientItems do
   @moduledoc false
 
   alias AttentionServer.ClientAPI.Resources
+  alias AttentionServer.Repository.Postgres.{DeviceSubscriptions, Items}
 
   def fetch(:postgres, person, item_id),
     do: AttentionServer.Repository.Postgres.Items.recipient_item(person, item_id)
@@ -19,22 +20,32 @@ defmodule AttentionServer.Repository.RecipientItems do
     do: AttentionServer.Repository.Postgres.ItemSummaryFacts.read(person, item_id)
 
   def item(:postgres, %{person: person} = principal, item_id) do
-    alias AttentionServer.Repository.Postgres.Items
-
     with {:ok, %{chat: chat, availability: availability} = facts}
          when is_map(chat) and (is_map(availability) or is_nil(availability)) <-
            summary_facts(:postgres, person, item_id),
-         {:ok, key, record, files} <- Items.current_recipient(person, item_id, facts.request_revision) do
+         {:ok, {^person, sender, _} = key, record, files} <-
+           Items.current_recipient(person, item_id, facts.request_revision),
+         {:ok, viewer} <- item_viewer(principal, sender, record.origin) do
       item =
         key
         |> Resources.ordinary_item_payload(record, facts.rank, Map.put(facts, :files, files))
         |> Resources.stamp(facts.resource_revision)
-        |> then(&Resources.render(:item, &1, principal))
+        |> then(&Resources.render(:item, &1, viewer))
 
       {:ok, %{"rev" => facts.head, "item" => item}}
     else
       {:ok, _unprojected} -> {:error, :storage_unavailable}
       {:error, _} = error -> error
+    end
+  end
+
+  defp item_viewer(%{kind: :browser} = principal, _sender, _origin), do: {:ok, principal}
+  defp item_viewer(%{kind: :device, key: key} = principal, _sender, key), do: {:ok, principal}
+
+  defp item_viewer(%{kind: :device, person: person, key: key} = principal, sender, _origin) do
+    with {:ok, subscribed?} <- DeviceSubscriptions.contains?(person, key, sender) do
+      senders = if subscribed?, do: MapSet.new([sender]), else: MapSet.new()
+      {:ok, principal |> Map.take([:kind, :person, :key]) |> Map.put(:senders, senders)}
     end
   end
 
