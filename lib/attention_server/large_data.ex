@@ -1364,6 +1364,15 @@ defmodule AttentionServer.LargeData do
 
   defp valid_ref_metadata?(_), do: false
 
+  @doc false
+  def escape_json_chunks(bytes) when is_binary(bytes) do
+    Stream.unfold(bytes, fn
+      <<>> -> nil
+      <<part::binary-size(@chunk_size), rest::binary>> -> {escape_json_bytes(part), rest}
+      tail -> {escape_json_bytes(tail), <<>>}
+    end)
+  end
+
   defp escape_json_bytes(bytes) do
     bytes
     |> :binary.bin_to_list()

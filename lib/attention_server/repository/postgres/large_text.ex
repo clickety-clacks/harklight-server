@@ -8,6 +8,7 @@ defmodule AttentionServer.Repository.Postgres.LargeText do
   @moduledoc false
 
   alias __MODULE__.Ref
+  alias AttentionServer.LargeData
   alias AttentionServer.Repository.Postgres.{Transaction, Uploads}
 
   @chunk_bytes Uploads.chunk_bytes()
@@ -108,6 +109,47 @@ defmodule AttentionServer.Repository.Postgres.LargeText do
     else
       false -> {:error, :not_found}
       {:error, _} = error -> error
+    end
+  end
+
+  # Enumerate after the parent resource's authorization transaction returns.
+  # Each fetch borrows a connection only for that chunk's indexed query.
+  def escaped_stream(ref) do
+    Stream.resource(
+      fn -> open_stream(ref) end,
+      &stream_chunk(ref, &1),
+      fn _ -> :ok end
+    )
+    |> Stream.flat_map(&LargeData.escape_json_chunks/1)
+  end
+
+  defp open_stream(ref) do
+    with {:ok, hash} <- address(ref),
+         {:ok, %{rows: [[true]]}} <-
+           Transaction.query(
+             "SELECT verified FROM harklight.large_texts WHERE sha256 = $1 AND size_bytes = $2",
+             [hash, ref.size]
+           ) do
+      {hash, 0, :crypto.hash_init(:sha256)}
+    else
+      _ -> raise ArgumentError, "large text unavailable"
+    end
+  end
+
+  defp stream_chunk(%Ref{size: size}, {hash, number, context} = state)
+       when number * @chunk_bytes >= size do
+    if :crypto.hash_final(context) == hash,
+      do: {:halt, state},
+      else: raise(ArgumentError, "large text checksum mismatch")
+  end
+
+  defp stream_chunk(ref, {hash, number, context}) do
+    case fetch_chunk(ref, hash, number, true, &Transaction.query/2) do
+      {:ok, bytes} ->
+        {[bytes], {hash, number + 1, :crypto.hash_update(context, bytes)}}
+
+      {:error, _} ->
+        raise ArgumentError, "large text unavailable"
     end
   end
 
