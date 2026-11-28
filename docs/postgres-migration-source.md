@@ -627,3 +627,10 @@ membership from source owners while excluding the exactly verified Hosted
 accounts, and checks explicit rosters without adding owners. Global counts
 reject extra groups, memberships and invitations. The comparison is read-only
 and does not publish or activate the staged import.
+
+`Migration.VerifySubscriptions.run/3` verifies exact raw subscription rows before
+comparing the derived device head and sender-membership facts. Known-empty active
+devices retain revision zero; revoked devices without source subscriptions gain
+no head. Exact addresses include person, device, revision and sender. Missing,
+changed, extra, stale-revision or wrong-scope facts refuse validation. This is a
+read-only comparison and does not alter credentials or sender grants.

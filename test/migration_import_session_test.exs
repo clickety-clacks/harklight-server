@@ -52,6 +52,12 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
           agent = Base.encode16(:crypto.hash(:sha256, "synthetic revoked agent"), case: :lower)
           assert :ok = Relay.setup_device(relay, person, device)
           assert :ok = Relay.setup_sender(relay, device, "app:device-scope")
+          assert {:ok, subscription_reply} = Relay.request_line(relay, device, JSON.encode!(%{
+            "v" => 1, "type" => "subscribe_remote",
+            "op_id" => "95000000-0000-4000-8000-000000000001", "revision" => 7,
+            "sender_ids" => ["app:device-scope", "app:retained-subscription"]
+          }) <> "\n")
+          assert {:ok, %{"revision" => 7}} = JSON.decode_line(subscription_reply)
           assert :ok = Relay.owner_revoke_device(relay, person, owner, device)
 
           assert :ok =
@@ -490,6 +496,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
             "SELECT body FROM harklight.compatibility_facts WHERE family='device_subscription_senders' AND address=$1",
             [Attributes.key({person, device, revision, "app:never-subscribed"})])
         end
+        verify_subscription_drift(db, identity, bundle, expected_subscriptions)
         verify_messages(db, bundle, manifest)
         assert {:ok, _} = ImportSession.query(db, """
           CREATE FUNCTION harklight.fail_answer() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -1187,6 +1194,43 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       end)
       :ok = AttentionServer.Store.close(store)
       expected
+    end
+
+    defp verify_subscription_drift(db, identity, bundle, expected) do
+      verifier = AttentionServer.Migration.VerifySubscriptions
+      assert {:ok, counts} = verifier.run(db, identity, bundle)
+      assert counts.heads == length(expected)
+      assert counts.senders == Enum.sum(Enum.map(expected, fn {_, _, _, senders} -> length(senders) end))
+      assert counts.senders > 0
+      for family <- ~w(subscriptions device_subscription_heads device_subscription_senders) do
+        for change <- [:body, :missing] do
+          assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+            sql = if change == :body,
+              do: "UPDATE harklight.compatibility_facts SET body='{}'::jsonb WHERE family=$1",
+              else: "DELETE FROM harklight.compatibility_facts WHERE family=$1"
+            assert {:ok, %{num_rows: n}} = ImportSession.query(tx, sql, [family])
+            assert n > 0
+            assert {:error, {:subscription_fact_mismatch, ^family, _}} = verifier.run(tx, identity, bundle)
+            Postgrex.rollback(tx, :synthetic_drift)
+          end)
+          assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+        end
+      end
+      {person, device, revision, _} = hd(expected)
+      for {family, key, value} <- [
+        {"device_subscription_heads", {person, "synthetic-unexpected-device"}, 0},
+        {"device_subscription_senders", {person, device, revision + 1000, "app:stale-revision"}, true},
+        {"device_subscription_senders", {"synthetic-other-person", device, revision, "app:wrong-scope"}, true}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx,
+            "INSERT INTO harklight.compatibility_facts(family,address,body) VALUES($1,$2,$3::text::jsonb)",
+            [family, Attributes.key(key), JSON.encode!(Attributes.encode(value))])
+          assert {:error, {:subscription_count_mismatch, ^family}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
     end
 
     defp source_subscription_expectations(path) do
