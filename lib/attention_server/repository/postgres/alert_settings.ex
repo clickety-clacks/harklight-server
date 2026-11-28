@@ -25,58 +25,31 @@ defmodule AttentionServer.Repository.Postgres.AlertSettings do
   end
 
   defp apply_request(principal, view, value, if_match, key, operation, digest, at) do
-    person = principal.person
-
-    case Operations.lookup({person, "", "harklight_app_receipts", key}, digest) do
-      {:ok, nil} ->
-        recent(principal, view, value, if_match, key, operation, digest, at)
-
-      {:ok, {status, body, true}} when is_map(body) ->
-        {:ok, {status, body, true}}
-
-      {:ok, {_status, _body, true}} ->
-        {:error, :receipt_unavailable}
-
-      {:ok, {status, %{"settings" => true}, false}} ->
-        current(person, status, true)
-
-      {:ok, {_status, _other, false}} ->
-        {:ok, {202, %{"code" => "accepted_reconcile"}, true}}
-
-      {:error, _} = error ->
-        error
-    end
-  end
-
-  defp recent(principal, view, value, if_match, key, operation, digest, at) do
-    person = principal.person
-    scope = {person, "", "client_idempotency", key}
-
-    with {:ok, _} <-
-           Transaction.query(
-             """
-             DELETE FROM harklight.operation_receipts
-             WHERE person_id = $1 AND origin_key = '' AND namespace = 'client_idempotency'
-               AND operation_key = $2 AND expires_at_ms < $3
-             """,
-             [person, key, at]
-           ),
-         {:ok, {status, %{"settings" => true}, replayed?}} <-
-           Operations.execute(scope, digest, at, at + Idempotency.retention_ms(), fn ->
-             with :ok <- mutate(principal, view, value, if_match, operation, at) do
-               {:ok, 200, %{"settings" => true}}
-             end
-           end, false) do
-      current(person, status, replayed?)
-    else
-      {:error, _} = error -> error
-      _ -> {:error, :receipt_unavailable}
-    end
+    Operations.execute_client(
+      {principal.person, "", key},
+      digest,
+      at,
+      fn ->
+        with :ok <- mutate(principal, view, value, if_match, operation, at) do
+          {:ok, 200, %{"settings" => true}}
+        end
+      end,
+      fn
+        %{"settings" => true} -> render_settings(principal.person)
+        _ -> {:error, :receipt_unavailable}
+      end
+    )
   end
 
   defp current(person, status, replayed?) do
+    with {:ok, body} <- render_settings(person) do
+      {:ok, {status, body, replayed?}}
+    end
+  end
+
+  defp render_settings(person) do
     with {:ok, view} <- Settings.for_person(person) do
-      {:ok, {status, Settings.render(view), replayed?}}
+      {:ok, Settings.render(view)}
     end
   end
 
@@ -133,18 +106,7 @@ defmodule AttentionServer.Repository.Postgres.AlertSettings do
     attributes = view.attributes
     next = if value == "all", do: Map.put(attributes, :alert_choices, value), else: Map.delete(attributes, :alert_choices)
 
-    if next == attributes do
-      :ok
-    else
-      scope = {person, ""}
-      change = %{kind: "settings", resource_id: "settings", session_handle: nil, created_at_ms: at, first_seen_at_ms: nil}
-
-      with {:ok, head} <- Transaction.lock_stream(scope, view.seed),
-           {:ok, _} <- Transaction.query("UPDATE harklight.people SET settings = $2 WHERE id = $1", [person, Attributes.encode(next)]),
-           {:ok, _} <- Transaction.append(%{scope => head}, scope, [change]) do
-        :ok
-      end
-    end
+    with {:ok, _} <- Settings.write(person, view, next, at), do: :ok
   end
 
   defp result({:ok, {status, body, replayed?}}), do: {:ok, status, body, replayed?}

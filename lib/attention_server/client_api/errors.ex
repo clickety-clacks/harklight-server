@@ -152,7 +152,8 @@ defmodule AttentionServer.ClientAPI.Errors do
     end
   end
 
-  defp send_encoded_json(conn, status, encoded) do
+  @doc false
+  def send_encoded_json(conn, status, encoded) do
     conn
     |> put_resp_content_type("application/json", "utf-8")
     |> send_resp(status, encoded)

@@ -11,7 +11,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
 
       def init(opts), do: opts
 
-      def call(%Plug.Conn{path_info: ["v2", "items", item]} = conn, _opts) do
+      def call(%Plug.Conn{path_info: ["v2", "items", item]} = conn, observer) do
         result =
           Transaction.snapshot(fn ->
             with {:ok, %{kind: :browser, person: person}} <- Auth.web(conn, Identities, :postgres),
@@ -21,6 +21,12 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
             end
           end)
 
+        response = respond(conn, result)
+        send(observer, :large_text_response_finished)
+        response
+      end
+
+      defp respond(conn, result) do
         case result do
           {:ok, body} ->
             case Projection.capture(fn -> Errors.send_streamed_json(conn, 200, body) end) do
@@ -337,8 +343,10 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                )
 
       assert {:ok, _} = Application.ensure_all_started(:inets)
-      listener = start_supervised!({Bandit, plug: LargeTextTransportFixture, ip: {127, 0, 0, 1}, port: 0})
+      listener = start_supervised!({Bandit, plug: {LargeTextTransportFixture, self()}, ip: {127, 0, 0, 1}, port: 0})
       assert {:ok, {_, port}} = ThousandIsland.listener_info(listener)
+      spools = Path.join(System.tmp_dir!(), "harklight-json-response-*")
+      existing_spools = Path.wildcard(spools)
       for {_, item, _, message} <- source do
         assert {200, headers, body} = request_retained_text(port, item, cookie)
         assert {~c"content-type", ~c"application/json; charset=utf-8"} in headers
@@ -353,6 +361,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                Transaction.query("DELETE FROM harklight.large_text_chunks WHERE sha256 = $1 AND chunk_number = 2", [digest])
       assert {500, _, error} = request_retained_text(port, "i1", cookie)
       assert {:ok, %{"error" => "internal_error"}} = JSON.decode_line(error <> "\n")
+      assert Path.wildcard(spools) == existing_spools
     end
 
     defp request_retained_text(port, item, cookie) do
@@ -360,6 +369,7 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       headers = [{~c"cookie", String.to_charlist("__Host-harklight=" <> cookie)}]
       assert {:ok, {{_, status, _}, headers, body}} =
                :httpc.request(:get, {url, headers}, [timeout: 15_000], [body_format: :binary])
+      assert_receive :large_text_response_finished, 2_000
       {status, headers, body}
     end
 
@@ -553,6 +563,14 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                  """,
                  [principal.person, key, Base.decode16!(digest, case: :lower), Attributes.encode(original_body)]
                )
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.compatibility_facts (family, address, body) VALUES ('harklight_app_receipts', $1, $2)",
+                 [
+                   Attributes.key({principal.person, key}),
+                   Attributes.encode([principal.person, key, digest, 200, accepted, 1, 1])
+                 ]
+               )
       for opts <- [sqlite, postgres] do
         assert %{status: 200, resp_body: ^accepted} = replayed =
                  cookie |> alerts_request("all", tag, key, origin) |> Router.call(opts)
@@ -597,6 +615,123 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                Transaction.query("ALTER TABLE harklight.operation_receipts DROP CONSTRAINT fixture_alert_receipt", [])
       assert %{status: 200} =
                cookie |> alerts_request("all", "*", uuid, origin) |> Router.call(postgres)
+    end
+
+    @tag :tmp_dir
+    test "owner level saves preserve generation boundaries and roll back with their audit", %{tmp_dir: dir} do
+      alias AttentionServer.{JSON, Relay}
+      alias AttentionServer.ClientAPI.{Reads, Writes}
+      alias AttentionServer.Repository.Postgres.Attributes
+
+      {relay, _browser, _backend, _cookie, owner} = browser_fixture(dir)
+      %{person: person, key: key} = owner
+      origin = "synthetic-level-origin"
+      reader = "synthetic-level-reader"
+      assert :ok = Relay.setup_device(relay, person, origin)
+      assert :ok = Relay.setup_device(relay, person, reader)
+      assert :ok = Relay.setup_sender(relay, origin, "app:fixture")
+      message = %{"title" => "Fixture settings history", "created_at" => 10, "sender_id" => "app:fixture", "message_id" => "levels"}
+      frame = %{
+        "v" => 1, "type" => "forward", "op_id" => "00000000-0000-4000-8000-000000000012",
+        "session_handle" => "10000000-0000-4000-8000-000000000001", "message" => message
+      }
+      assert {:ok, reply} = Relay.request_line(relay, origin, JSON.encode!(frame) <> "\n")
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+      assert {:ok, %{"items" => [%{"item_id" => item}]}} = Reads.inbox(relay, reader)
+      assert {:ok, 200, _, false} =
+               Writes.reply(relay, reader, item, "Fixture reply", [], "00000000-0000-4000-8000-000000000013")
+
+      engine = :sys.get_state(relay).store.engine
+      accepted = Map.fetch!(engine.persons, person)
+      conversations = Map.fetch!(engine.conversation_highs, person)
+      assert accepted > 0 and conversations > 0
+      assert {:ok, %{"rev" => head}} = Reads.settings(relay, owner)
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)",
+                 [person, head]
+               )
+      for {kind, high} <- [{"accepted", accepted}, {"conversation", conversations}] do
+        assert {:ok, _} =
+                 Transaction.query(
+                   "INSERT INTO harklight.allocation_highs VALUES ($1, '', '', $2, $3)",
+                   [person, kind, high]
+                 )
+      end
+
+      assert Relay.dashboard_levels(:postgres, person, key) == Relay.dashboard_levels(relay, person, key)
+
+      rows = [
+        %{"name" => "Routine", "lower_bound" => 0, "bounce_after_days" => nil},
+        %{"name" => "Follow up", "lower_bound" => 0.6, "bounce_after_days" => 1.5}
+      ]
+
+      for backend <- [relay, :postgres] do
+        assert {:error, :forbidden} = Relay.save_dashboard_levels(backend, "synthetic-other", key, rows)
+        assert {:error, :forbidden} = Relay.save_dashboard_levels(backend, person, reader, [])
+        assert {:error, :invalid_levels} = Relay.save_dashboard_levels(backend, person, key, [])
+      end
+
+      # The dashboard owner operation still works for a paused Hosted account.
+      assert {:ok, _} = Relay.hosted_delivery_state(relay, person, "STOPPED")
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.people SET delivery_state = 'STOPPED' WHERE id = $1", [person])
+
+      assert {:ok, %{"levels" => ^rows}} = Relay.save_dashboard_levels(relay, person, key, rows)
+      assert {:ok, %{"levels" => ^rows}} = Relay.save_dashboard_levels(:postgres, person, key, rows)
+      {configuration, revision} = owner_settings_snapshot(person)
+      assert revision == head + 1
+      assert %{after_delivery_seq: ^accepted, after_conversation_seq: ^conversations, configured_at_ms: first_time} =
+               configuration
+      original = :sys.get_state(relay).store.engine.bounce_levels[person]
+      assert Map.delete(configuration, :configured_at_ms) == Map.delete(original, :configured_at_ms)
+      assert {:ok, %{"levels" => ^rows}} = Relay.save_dashboard_levels(:postgres, person, key, rows)
+      assert {^configuration, ^revision} = owner_settings_snapshot(person)
+
+      audit = Attributes.key({person, revision})
+      assert {:ok, %{rows: [[encoded]]}} =
+               Transaction.query(
+                 "SELECT body FROM harklight.compatibility_facts WHERE family = 'runtime_audit' AND address = $1",
+                 [audit]
+               )
+      assert {:ok, %{actor_id: ^key, person_id: ^person, action: "dashboard_levels", at_ms: ^first_time}} =
+               Attributes.decode(encoded)
+
+      changed = put_in(rows, [Access.at(1), "name"], "Follow up soon")
+      conflict = Attributes.key({person, revision + 1})
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.compatibility_facts VALUES ('runtime_audit', $1, '{}')", [conflict])
+      assert {:error, :storage_unavailable} = Relay.save_dashboard_levels(:postgres, person, key, changed)
+      assert {^configuration, ^revision} = owner_settings_snapshot(person)
+      assert {:ok, _} =
+               Transaction.query("DELETE FROM harklight.compatibility_facts WHERE family = 'runtime_audit' AND address = $1", [conflict])
+
+      assert {:ok, %{"levels" => ^changed}} = Relay.save_dashboard_levels(relay, person, key, changed)
+      assert {:ok, %{"levels" => ^changed}} = Relay.save_dashboard_levels(:postgres, person, key, changed)
+      assert {%{configured_at_ms: ^first_time, after_delivery_seq: ^accepted, after_conversation_seq: ^conversations}, next} =
+               owner_settings_snapshot(person)
+      assert next == revision + 1
+
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [key])
+      assert {:error, :forbidden} = Relay.save_dashboard_levels(:postgres, person, key, changed)
+      assert {:error, :forbidden} = Relay.dashboard_levels(:postgres, person, key)
+    end
+
+    defp owner_settings_snapshot(person) do
+      alias AttentionServer.Repository.Postgres.Attributes
+
+      assert {:ok, %{rows: [[attributes, revision]]}} =
+               Transaction.query(
+                 """
+                 SELECT person.settings, stream.head
+                 FROM harklight.people AS person JOIN harklight.stream_heads AS stream ON person.id = stream.person_id
+                 WHERE person.id = $1 AND stream.origin_key = ''
+                 """,
+                 [person]
+               )
+      assert {:ok, %{bounce_levels: levels}} = Attributes.decode(attributes)
+      {levels, revision}
     end
 
     defp alerts_request(cookie, value, if_match, key, origin) do

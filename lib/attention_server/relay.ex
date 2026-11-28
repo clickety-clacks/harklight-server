@@ -95,8 +95,16 @@ defmodule AttentionServer.Relay do
         :infinity
       )
 
+  def dashboard_levels(:postgres, person, owner_key),
+    do: CommittedRead.execute(:postgres, {:dashboard_levels, person, owner_key})
+
   def dashboard_levels(server, person, owner_key),
     do: GenServer.call(server, {:dashboard_levels, person, owner_key}, :infinity)
+
+  def save_dashboard_levels(:postgres, person, owner_key, levels) do
+    actor = %{kind: :owner, person: person, key: owner_key}
+    Command.execute(:postgres, actor, {:dashboard_levels, levels}, nil, System.system_time(:millisecond))
+  end
 
   def save_dashboard_levels(server, person, owner_key, levels),
     do: GenServer.call(server, {:save_dashboard_levels, person, owner_key, levels}, :infinity)

@@ -8,12 +8,7 @@ defmodule AttentionServer.Repository.Postgres.Settings do
   @settings_sql """
     SELECT person.settings, person.delivery_state, stream.head, stream.seed_revision,
            resource.revision, identity.cursor_epoch,
-           EXISTS (
-             SELECT 1 FROM harklight.allocation_highs AS allocation
-             WHERE allocation.person_id = scope.person_id
-               AND allocation.origin_key = '' AND allocation.session_handle = ''
-               AND allocation.kind IN ('accepted', 'conversation') AND allocation.high > 0
-           )
+           coalesce(delivery.high, 0), coalesce(conversation.high, 0)
     FROM scope
     JOIN harklight.people AS person ON person.id = scope.person_id
     CROSS JOIN harklight.server_identity AS identity
@@ -22,6 +17,17 @@ defmodule AttentionServer.Repository.Postgres.Settings do
     LEFT JOIN harklight.stream_resource_revisions AS resource
       ON resource.person_id = scope.person_id AND resource.origin_key = ''
       AND resource.resource_kind = 'settings' AND resource.resource_id = 'settings'
+    LEFT JOIN harklight.allocation_highs AS delivery
+      ON delivery.person_id = scope.person_id AND delivery.origin_key = ''
+      AND delivery.session_handle = '' AND delivery.kind = 'accepted'
+    LEFT JOIN harklight.allocation_highs AS conversation
+      ON conversation.person_id = scope.person_id AND conversation.origin_key = ''
+      AND conversation.session_handle = '' AND conversation.kind = 'conversation'
+  """
+
+  @owner_scope """
+  SELECT person_id FROM harklight.principals
+  WHERE person_id = $1 AND key = $2 AND kind = 'owner' AND NOT revoked
   """
 
   def browser(cookie) do
@@ -63,29 +69,56 @@ defmodule AttentionServer.Repository.Postgres.Settings do
     FOR SHARE OF session, owner
     """
 
+    lock_view(scope, [session, at, person, key, revision], false)
+  end
+
+  def owner_view(person, key), do: read_view(@owner_scope, [person, key], true)
+
+  def lock_owner(person, key) do
+    lock_view(@owner_scope <> " FOR SHARE", [person, key], true)
+  end
+
+  defp lock_view(scope, params, allow_paused?) do
     case Transaction.query(
            """
            WITH scope AS MATERIALIZED (#{scope})
-           SELECT person.delivery_state
+           SELECT person.id, person.delivery_state
            FROM scope JOIN harklight.people AS person ON person.id = scope.person_id
            FOR NO KEY UPDATE OF person
            """,
-           [session, at, person, key, revision]
+           params
          ) do
-      {:ok, %{rows: [["STOPPED"]]}} -> {:error, :account_paused}
-      {:ok, %{rows: [[_state]]}} -> for_person(person)
+      {:ok, %{rows: [[_person, "STOPPED"]]}} when not allow_paused? -> {:error, :account_paused}
+      {:ok, %{rows: [[person, _state]]}} -> read_view(person_scope(), [person], allow_paused?)
       {:ok, %{rows: []}} -> {:error, :unauthorized}
       {:error, _} = error -> error
     end
   end
 
-  def for_person(person), do: read_view("SELECT $1::text AS person_id", [person])
+  def for_person(person), do: read_view(person_scope(), [person])
+  defp person_scope, do: "SELECT $1::text AS person_id"
 
-  defp read_view(scope, params) do
+  def write(_person, %{attributes: attrs}, attrs, _at), do: {:ok, nil}
+
+  def write(person, view, attrs, at) do
+    scope = {person, ""}
+    change = %{kind: "settings", resource_id: "settings", session_handle: nil, created_at_ms: at, first_seen_at_ms: nil}
+
+    with {:ok, head} <- Transaction.lock_stream(scope, view.seed),
+         {:ok, %{num_rows: 1}} <-
+           Transaction.query("UPDATE harklight.people SET settings = $2 WHERE id = $1", [person, Attributes.encode(attrs)]) do
+      Transaction.append(%{scope => head}, scope, [change])
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :storage_unavailable}
+    end
+  end
+
+  defp read_view(scope, params, allow_paused? \\ false) do
     case Transaction.query("WITH scope AS (#{scope})\n" <> @settings_sql, params) do
-      {:ok, %{rows: [[_attrs, "STOPPED" | _]]}} -> {:error, :account_paused}
-      {:ok, %{rows: [[attrs, _, head, seed, revision, epoch, history?]]}} ->
-        view(attrs, head, seed, revision, epoch, history?)
+      {:ok, %{rows: [[_attrs, "STOPPED" | _]]}} when not allow_paused? -> {:error, :account_paused}
+      {:ok, %{rows: [[attrs, _, head, seed, revision, epoch, accepted, conversation]]}} ->
+        view(attrs, head, seed, revision, epoch, accepted, conversation)
 
       {:ok, %{rows: []}} -> {:error, :unauthorized}
       {:error, _} -> {:error, :retry_later}
@@ -112,12 +145,16 @@ defmodule AttentionServer.Repository.Postgres.Settings do
     end
   end
 
-  defp view(attrs, head, seed, revision, epoch, history?) do
+  defp view(attrs, head, seed, revision, epoch, accepted, conversation) do
     with {:ok, settings} when is_map(settings) <- decode_settings(attrs) do
       # FORMAT32 can have an implicit epoch before its first logged change.
-      seeded? = history? or Map.has_key?(settings, :bounce_levels) or Map.has_key?(settings, :alert_choices)
+      seeded? = accepted > 0 or conversation > 0 or Map.has_key?(settings, :bounce_levels) or Map.has_key?(settings, :alert_choices)
       seed = seed || if(seeded?, do: epoch, else: 0)
-      {:ok, %{head: head || seed, seed: seed, revision: revision || max(seed, 1), attributes: settings}}
+      {:ok,
+       %{
+         head: head || seed, seed: seed, revision: revision || max(seed, 1), attributes: settings,
+         accepted_high: accepted, conversation_high: conversation
+       }}
     else
       _ -> {:error, :storage_unavailable}
     end
