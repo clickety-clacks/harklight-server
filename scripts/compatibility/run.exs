@@ -32,7 +32,7 @@ try do
       :ok = CompatibilityScenarios.expire(relay, fixture, manifest)
   end
 
-  IO.puts(JSON.encode!(%{scenario: "compatibility-v1", mode: mode, result: "pass"}))
+  IO.puts(JSON.encode!(%{"scenario" => "compatibility-v1", "mode" => mode, "result" => "pass"}))
 after
   GenServer.stop(relay)
   Agent.stop(fixture.clock)
