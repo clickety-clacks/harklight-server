@@ -309,3 +309,48 @@ record attributes. It does not populate attachment chunks or attachment link
 rows, per-recipient seen state, conversations or answers. Those stages and their
 field-level reader comparisons are required before import validation and
 activation; this stage's success alone is not a complete history import.
+
+`ImportFeeds.run/3` projects origin and advisory allocation highs independently
+of change-log positions. Entries retain their exact sequence, session and typed
+body; origin delivery acknowledgements retain their stage map and advisory
+receipts retain their IDs. Highs are copied before entries and receipts, using
+separate checkpoints. Entries beyond the recorded high, acknowledgements without
+an origin entry and receipts without an advisory entry refuse the stage. This
+preserves feed facts without dispatching deliveries or activating the target.
+
+`ImportBytes.run/5` copies an already-verified bundle file into a matching target
+upload manifest one 1 MiB chunk at a time. Each chunk and source-prefix checkpoint
+commit atomically. Restart rereads and verifies the committed prefix before
+continuing; a changed prefix refuses, and final byte length and SHA-256 must
+match. Empty files produce no chunks. Completed uploads can only be rechecked
+when their checkpoint already covers the file; this routine cannot append to a
+completed upload. It does not mark uploads complete, create attachment links or
+activate the database. The caller must finish those stages and validate target
+content and references before activation.
+
+`ImportUploads.run/3` stages published Engine and retained staged-file manifests,
+transfers and verifies their chunks, and links ordinary message revisions using
+each original file ordinal and typed descriptor. UUIDs and staged `fs` IDs stay
+distinct; person, uploader/owner, size and SHA-256 are preserved. Full source
+metadata is retained through the typed codec. Published Engine uploads use their
+original `last_activity_ms` as the import publication marker, not a reconstructed
+completion time. Staged files use their original `at_ms`, with the original
+30-day expiry recorded as numeric top-level `reservation_expires_at_ms` for the
+runtime cleanup reader. Engine uploads acquire no invented expiry.
+
+Completion verifies target chunk count, exact bytes and hash before publishing
+that upload's marker. Per-file completion and message-link checkpoints make the
+stage repeatable. Inline file descriptors remain in their original message
+record. Shared-message and conversation-entry links and large-data references
+remain distinct follow-up projections; full closure and retained-history checks
+are still required before database validation and activation.
+
+Upload byte completion means that the exported bytes have been copied and their
+length and digest verified; it does not mean that a staged reservation was linked
+to a message. Staged reservations retain their original expiry. Upload cleanup
+preserves every manifest and chunk while an import is loading or validated, so
+cleanup cannot remove a committed chunk prefix before resume. Once active, the
+ordinary cleanup policy again removes expired, unlinked reservations, including
+those whose bytes have been fully transferred. Linked attachments remain retained.
+`ImportBytes` is an internal chunk primitive; the `ImportUploads` entry point
+binds the verified bundle to the import's source digest before calling it.
