@@ -2007,6 +2007,24 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert %{status: 304, resp_body: ""} = Reads.get_postgres_item(conditional, ctx)
       pg = Router.init(relay: nil, repository: :postgres, auth: {:browser, Identities, nil})
       assert %{status: 404} = Router.call(conn, pg)
+
+      assert {:ok, _} = Transaction.query("""
+        INSERT INTO harklight.messages (id, person_id, origin_key, sender_id, message_id, kind, revision, accepted_at_ms)
+        VALUES ('complete', $1, $2, 'app:fixture', 'complete', 'shared', 2, 1)
+        """, [person, origin])
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.message_revisions VALUES ('complete', 2, 1, $1)", [
+                 Attributes.encode(record.message)
+               ])
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.message_recipients VALUES ('complete', $1, 'i99', $2, $3)", [
+                 person, seen, Attributes.encode(metadata)
+               ])
+      snapshot = fn -> AttentionServer.Repository.RecipientItems.summary_facts(:postgres, person, "i99") end
+      assert {:error, :not_found} = Transaction.snapshot(snapshot)
+      assert {:error, :storage_unavailable} =
+               AttentionServer.Repository.Postgres.Items.current_recipient(person, "i99", 2)
+      assert %{status: 404} = Reads.get_postgres_item(conn, %{ctx | params: %{item_id: "i99"}})
     end
 
     test "an attachment is served only after its complete chunk sequence and digest verify" do
