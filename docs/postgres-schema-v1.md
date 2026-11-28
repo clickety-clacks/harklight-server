@@ -10,12 +10,15 @@ startup must check the installed version and performs no DDL.
 
 The explicit migration job applies
 [`001_initial.sql`](../priv/postgres/001_initial.sql),
-[`002_message_history.sql`](../priv/postgres/002_message_history.sql), and
-[`003_large_text.sql`](../priv/postgres/003_large_text.sql) in order.
+[`002_message_history.sql`](../priv/postgres/002_message_history.sql),
+[`003_large_text.sql`](../priv/postgres/003_large_text.sql), and
+[`004_conversation_read_positions.sql`](../priv/postgres/004_conversation_read_positions.sql)
+in order.
 They use the same advisory lock. For a fresh import, the schema digest is
 SHA-256 over the ordered files' concatenated bytes. When resuming an import
 claimed under an earlier version, keep its original pinned digest.
-Version 2 represents message history, and version 3 adds shared large text.
+Version 2 represents message history, version 3 adds shared large text, and
+version 4 represents revisionless read-position facts.
 
 - Keep person IDs and principal keys as opaque text. Preserve the server
   instance ID, cursor signing bytes and integer epoch exactly. Preserve
@@ -23,7 +26,12 @@ Version 2 represents message history, and version 3 adds shared large text.
 - Use a stable internal message ID in `messages.id`. Keep the existing
   person/sender/message tuple on ordinary records and all public item IDs
   in `message_recipients.item_id`. Preserve accepted positions and ordering
-  values. Conversation entry IDs are scoped to their conversation.
+  values. For ordinary conversation entries, use the original per-person
+  conversation sequence as both the internal decimal row ID and the integer
+  position. Preserve the original payload event ID, which can be reused by
+  facts in the same conversation. A source read-position fact has a null
+  `request_revision`. Keep its original `read_through_conversation_seq`
+  and the corresponding `read_positions` row.
 - Store each original revision as a separate row. Keep exact wire values and
   legacy fields needed for projection in the versioned JSON bodies or
   attributes. Canonical digests are stored as bytes without rehashing during
@@ -108,7 +116,7 @@ to begin in `loading`, rejects skipped or reversed phase transitions, and
 prevents replacing the source, schema, import identity or validated manifest.
 Restarting from scratch requires a new unpublished destination. An opted-in
 runtime must require both
-schema version 3 and `phase = 'active'` plus the server identity row. The
+schema version 4 and `phase = 'active'` plus the server identity row. The
 identity row alone cannot publish partial imports. An isolated fresh database
 uses the same lifecycle with a manifest describing the newly provisioned
 synthetic data.
