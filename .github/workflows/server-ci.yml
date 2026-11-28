@@ -148,4 +148,4 @@ jobs:
           HARKLIGHT_MIGRATION_TEST_URL: postgres://fixture:fixture-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/migration_fixture
           ATTENTION_SERVER_ENABLE: '0'
           ERL_FLAGS: '+S 2:2'
-        run: mix test test/migration_import_session_test.exs test/migration_bundle_test.exs test/migration_material_identity_test.exs test/migration_large_text_source_test.exs test/migration_large_text_import_test.exs test/migration_recipient_state_test.exs test/migration_subscription_test.exs
+        run: mix test test/migration_import_session_test.exs test/migration_bundle_test.exs test/migration_material_identity_test.exs test/migration_large_text_source_test.exs test/migration_large_text_import_test.exs test/migration_recipient_state_test.exs test/migration_subscription_test.exs test/migration_entry_test.exs

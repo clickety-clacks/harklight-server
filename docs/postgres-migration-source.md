@@ -494,3 +494,11 @@ checkpoint; active devices without a source subscription get the source's
 known-empty revision 0. Revoked devices without a row get no invented head.
 Sender grants remain separate certificate authority and are never treated as
 inbound subscriptions. Raw source subscriptions remain unchanged.
+
+`ImportEntries.run/3` reconstructs ordinary conversation event records after
+conversation containers and read positions. Internal entry IDs are the exact
+original per-person position as text; payload event IDs, including reused IDs,
+remain in the full typed source event. Missing request revisions are accepted
+only for read-position events under schema 004. Verified LargeText paths are
+projected before writing. This loading-only phase does not activate conversation
+routes, synthesize answers, or claim shared-conversation parity.
