@@ -563,3 +563,14 @@ record by a digest and the projection field, without returning source identity
 or content. This read-only result covers ordinary record reconstruction;
 recipient state, conversations, answers, file links and shared history require
 their separate checks before lifecycle validation.
+
+`PrepareSchema.run/2` is the explicit schema-preparation primitive for the
+packaged import command. It uses a dedicated PostgreSQL simple-protocol
+connection to execute the package's ordered SQL files unchanged. A session
+advisory lock spans their separate transactions. It refuses foreign user
+relations, unknown or noncontiguous versions, populated unclaimed schemas, and
+imports that are not owned by the supplied loading identity. A claimed older
+schema may advance, retaining its original import digest and rows. An interrupted
+setup resumes from the last committed schema version. Application startup never
+calls this primitive. The complete packaged import command and activation gates
+remain unfinished; capabilities continue to report migration_ready=false.

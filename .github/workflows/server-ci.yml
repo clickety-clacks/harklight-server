@@ -140,9 +140,13 @@ jobs:
             docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c "CREATE DATABASE $fixture_db"
             apply_schema "$fixture_db"
           done
+          for fixture_db in migration_schema_fresh migration_schema_partial migration_schema_foreign; do
+            docker exec "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d postgres -c "CREATE DATABASE $fixture_db"
+          done
+          cat priv/postgres/001_initial.sql | docker exec -i "${{ job.services.postgres.id }}" psql -X -v ON_ERROR_STOP=1 -U fixture -d migration_schema_partial -f -
       - name: Exercise stopped-history staging and interrupted transactions
         env:
           HARKLIGHT_MIGRATION_TEST_URL: postgres://fixture:fixture-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/migration_fixture
           ATTENTION_SERVER_ENABLE: '0'
           ERL_FLAGS: '+S 2:2'
-        run: mix test test/migration_import_session_test.exs test/migration_bundle_test.exs test/migration_material_identity_test.exs test/migration_large_text_source_test.exs test/migration_large_text_import_test.exs test/migration_recipient_state_test.exs test/migration_subscription_test.exs test/migration_entry_test.exs
+        run: mix test test/migration_import_session_test.exs test/migration_bundle_test.exs test/migration_material_identity_test.exs test/migration_large_text_source_test.exs test/migration_large_text_import_test.exs test/migration_recipient_state_test.exs test/migration_subscription_test.exs test/migration_entry_test.exs test/migration_prepare_schema_test.exs

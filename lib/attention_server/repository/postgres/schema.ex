@@ -10,6 +10,7 @@ defmodule AttentionServer.Repository.Postgres.Schema do
   @version 4
 
   def version, do: @version
+  def migration_files, do: @migration_files
 
   def digest do
     root = Application.app_dir(:attention_server, "priv/postgres")
