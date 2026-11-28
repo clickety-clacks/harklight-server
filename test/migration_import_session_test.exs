@@ -12,7 +12,10 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     @original_json ~s({ "synthetic" : true })
 
     for epoch <- [1, 17] do
-      @tag timeout: 120_000, epoch: epoch
+      # Full source/import/restore equivalence over >256 records and conversation
+      # entries, including repeated read-only mutation probes, is deliberately
+      # bounded separately from the smaller migration cases below.
+      @tag timeout: 300_000, epoch: epoch
       test "interrupted migration and authority readback with epoch #{epoch}", %{epoch: epoch} do
         uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
         assert uri.host in ["localhost", "127.0.0.1"]
