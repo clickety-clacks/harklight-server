@@ -55,6 +55,86 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       :ok
     end
 
+    @tag :tmp_dir
+    test "a FORMAT32 browser cookie keeps its principal after projection to PostgreSQL", %{tmp_dir: dir} do
+      alias AttentionServer.{DashboardBackend, DashboardBrowserSession, Relay, Store.AuthSchema}
+      alias AttentionServer.ClientAPI.{Auth, Router}
+      alias AttentionServer.Repository.{CommittedRead, Postgres.Identities}
+      alias Exqlite.Sqlite3
+
+      path = Path.join(dir, "relay.sqlite3")
+      opts = [
+        store_path: path,
+        deployment_mode: :saas,
+        dashboard_origin: "https://account.example.test"
+      ]
+
+      {:ok, relay} = Relay.start_link(opts)
+      {:ok, person} = Relay.hosted_account_create(relay, "browser-fixture")
+      :ok = GenServer.stop(relay)
+
+      {:ok, db} = Sqlite3.open(path)
+      assert {:ok, _} = AuthSchema.initialize(db)
+      :ok = Sqlite3.close(db)
+
+      relay = start_supervised!({Relay, opts})
+      browser = start_supervised!({DashboardBrowserSession, relay: relay})
+      backend = {DashboardBackend, %DashboardBackend{relay: relay, sessions: browser}}
+      assert {:ok, grant} = Relay.hosted_browser_grant(relay, person, "fixture-browser", "google")
+      assert {:ok, %{cookie: cookie}} = Relay.redeem_hosted_browser_grant(relay, grant, "fixture-browser")
+      conn = Plug.Test.conn(:get, "/v2/me") |> Plug.Test.put_req_cookie("__Host-harklight", cookie)
+
+      assert {:ok, %{person: ^person, key: key, owner_revision: revision, session_id: hash} = principal} =
+               Auth.web(conn, backend, relay)
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'owner', $3)",
+                 [key, person, revision]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.auth_sessions
+                   (token_hash, person_id, principal_key, kind, principal_revision)
+                 VALUES ($1, $2, $3, 'browser', $4)
+                 """,
+                 [hash, person, key, revision]
+               )
+
+      assert {:ok, ^principal} = Auth.web(conn, Identities, :postgres)
+      # Exercise the browser authentication seam in the real router. Both
+      # requests still use the FORMAT32 relay for the /me projection.
+      sqlite_opts = Router.init(relay: relay, auth: {:browser, backend, nil})
+      postgres_opts = Router.init(relay: relay, auth: {:browser, Identities, nil})
+      assert %{status: 200, resp_body: body} = Router.call(conn, sqlite_opts)
+      assert %{status: 200, resp_body: ^body} = Router.call(conn, postgres_opts)
+
+      assert {:ok, ^person, ^revision} = CommittedRead.execute(:postgres, {:owner_identity, key})
+      assert {:ok, ^revision} = CommittedRead.execute(:postgres, {:owner_revision, person, key})
+      assert {:error, :forbidden} =
+               CommittedRead.execute(:postgres, {:owner_revision, "other-person", key})
+
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revision = revision + 1 WHERE key = $1", [key])
+      assert {:error, :unauthorized} = Auth.web(conn, Identities, :postgres)
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revision = $2, revoked = true WHERE key = $1", [
+                 key,
+                 revision
+               ])
+      assert {:error, :forbidden} = CommittedRead.execute(:postgres, {:owner_identity, key})
+      assert {:error, :unauthorized} = Auth.web(conn, Identities, :postgres)
+      assert %{status: 401} = Router.call(conn, postgres_opts)
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.principals SET revoked = false WHERE key = $1", [key])
+
+      assert :ok = DashboardBrowserSession.end_session(browser, cookie)
+      assert {:ok, _} = Transaction.query("DELETE FROM harklight.auth_sessions WHERE token_hash = $1", [hash])
+      assert {:error, :unauthorized} = Auth.web(conn, backend, relay)
+      assert {:error, :unauthorized} = Auth.web(conn, Identities, :postgres)
+    end
+
     test "committed pages preserve person and Agent position and retention contracts" do
       alias AttentionServer.Repository.Postgres.Streams
 

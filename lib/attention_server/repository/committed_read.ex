@@ -1,6 +1,6 @@
 defmodule AttentionServer.Repository.CommittedRead do
   @moduledoc """
-  Queries that run entirely against a published Engine snapshot.
+  Queries against committed repository state.
 
   Each query carries the person or key needed for authorization and selection.
   Both the ordinary Relay path and the persistence wait use the same query
@@ -10,6 +10,7 @@ defmodule AttentionServer.Repository.CommittedRead do
   """
 
   alias AttentionServer.{BounceDecision, DashboardInventory, Engine}
+  alias AttentionServer.Repository.Postgres.Identities
 
   defguard supported?(request)
            when is_tuple(request) and
@@ -24,8 +25,17 @@ defmodule AttentionServer.Repository.CommittedRead do
                      (tuple_size(request) == 4 and elem(request, 0) == :dashboard_inventory))
 
   def execute(engine, {:cursor, key}), do: Engine.acknowledged_cursor(engine, key)
+  def execute(:postgres, {:owner_identity, key}), do: Identities.owner_identity(key)
   def execute(engine, {:owner_identity, key}), do: Engine.owner_identity(engine, key)
   def execute(engine, {:agent_identity, key}), do: Engine.agent_identity(engine, key)
+
+  def execute(:postgres, {:owner_revision, person, key}) do
+    case Identities.owner_identity(key) do
+      {:ok, ^person, revision} -> {:ok, revision}
+      {:ok, _person, _revision} -> {:error, :forbidden}
+      {:error, _} = error -> error
+    end
+  end
 
   def execute(engine, {:owner_revision, person, key}),
     do: Engine.owner_revision(engine, person, key)
