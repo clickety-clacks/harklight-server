@@ -574,3 +574,11 @@ schema may advance, retaining its original import digest and rows. An interrupte
 setup resumes from the last committed schema version. Application startup never
 calls this primitive. The complete packaged import command and activation gates
 remain unfinished; capabilities continue to report migration_ready=false.
+
+Schema preparation also requires the trusted installer role pair (by default
+`harklight_migrator` and `harklight`), never inferred from the supplied login.
+The connection must be the migration role and database/schema/table owner.
+Runtime role membership, elevated role powers, database CREATE or public/app
+schema CREATE privileges refuse preparation before any DDL, including when no
+schema update is needed. Isolated tests can supply an explicit trusted role pair
+through `PrepareSchema.run/3`; production wiring uses the installer contract.
