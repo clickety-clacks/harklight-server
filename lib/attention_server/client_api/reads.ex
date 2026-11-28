@@ -121,6 +121,26 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
+  def get_postgres_item(conn, %Context{params: %{item_id: item}}) do
+    result =
+      Transaction.snapshot(fn ->
+        with {:ok, %{kind: :browser, person: person} = principal} <- Auth.web(conn, Identities, :postgres),
+             :ok <- Settings.check_active(person) do
+          RecipientItems.item(:postgres, browser_render_principal(principal), item)
+        else
+          {:ok, _native} -> {:error, :not_found}
+          {:error, :unavailable} -> {:error, :retry_later}
+          {:error, _} = error -> error
+        end
+      end)
+
+    case result do
+      {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
+      error -> respond(conn, error)
+    end
+  end
+
+  @doc false
   def get_entries(conn, %Context{} = ctx) do
     conn = fetch_query_params(conn)
 
@@ -837,14 +857,7 @@ defmodule AttentionServer.ClientAPI.Reads do
 
     case Engine.owner_revision(engine, person, owner_key) do
       {:ok, ^pinned} ->
-        {:ok,
-         %{
-           person: person,
-           # Internal only: never an origin, never sent or logged.
-           key: "browser:" <> Base.url_encode64(to_string(Map.get(who, :session_id))),
-           kind: :browser,
-           senders: MapSet.new()
-         }}
+        {:ok, browser_render_principal(who)}
 
       _ ->
         {:error, :unauthorized}
@@ -871,6 +884,16 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   defp principal(_engine, _who), do: {:error, :unauthorized}
+
+  defp browser_render_principal(%{person: person} = who) do
+    %{
+      person: person,
+      # Internal only: never an origin, never sent or logged.
+      key: "browser:" <> Base.url_encode64(to_string(Map.get(who, :session_id))),
+      kind: :browser,
+      senders: MapSet.new()
+    }
+  end
 
   # Ranks are stored by the change log's rank hook, once per change (review
   # findings F3/F5). A read pages from that stored order. Only a person with

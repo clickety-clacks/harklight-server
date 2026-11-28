@@ -1866,6 +1866,167 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                ])
     end
 
+    @tag :tmp_dir
+    test "ordinary PostgreSQL item preserves the full FORMAT32 body and inherited UI/1 file IDs", %{tmp_dir: dir} do
+      alias AttentionServer.{ChangeLog, JSON, Relay}
+      alias AttentionServer.ClientAPI.{Context, Reads, Resources, Router, Writes}
+      alias AttentionServer.Repository.Postgres.Identities
+      alias AttentionServer.Store.RecordTable
+
+      {relay, _browser, backend, cookie, principal} = browser_fixture(dir)
+      person = principal.person
+      origin = "synthetic-item-complete-origin"
+      session = "10000000-0000-4000-8000-000000000092"
+      key = {person, "app:fixture", "complete"}
+      assert :ok = Relay.setup_device(relay, person, origin)
+      assert :ok = Relay.setup_sender(relay, origin, "app:fixture")
+
+      image = %{"kind" => "image", "x" => 0, "y" => 0, "width" => 100, "height" => 100, "file" => "plan.png"}
+      action = %{"id" => "blue", "label" => "Blue", "kind" => "value", "value" => "blue", "illustration" => "plan"}
+      screen = %{
+        "schema" => "attention-client.ui/1",
+        "requires" => ~w(scene/1 result/1 illustration/1 response/1 image/1),
+        "illustrations" => [%{"id" => "plan", "label" => "Plan", "width" => 100, "height" => 100, "primitives" => [image]}],
+        "inputs" => [%{"id" => "choice", "label" => "Choose", "kind" => "response", "actions" => [action]}],
+        "open" => %{"kind" => "input", "id" => "choice", "layout" => "cards"},
+        "resolved" => %{"kind" => "text", "text" => "Recorded", "style" => "body"},
+        "submission" => %{"label" => "Send", "result" => %{"kind" => "input", "id" => "choice"}}
+      }
+      message = %{
+        "sender_id" => "app:fixture", "message_id" => "complete", "created_at" => 1,
+        "title" => "First", "message_type" => "request", "answer_ui" => screen
+      }
+
+      request = fn payload ->
+        assert {:ok, reply} = Relay.request_line(relay, origin, JSON.encode!(Map.put(payload, "v", 1)) <> "\n")
+        assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+      end
+
+      request.(%{
+        "type" => "forward", "op_id" => "00000000-0000-4000-8000-000000000061",
+        "session_handle" => session, "message" => message,
+        "files" => Enum.map(["unused.png", "plan.png"], &%{"name" => &1, "data_base64" => "AAEC"})
+      })
+      request.(%{
+        "type" => "conversation_revise", "op_id" => "00000000-0000-4000-8000-000000000062",
+        "sender_id" => "app:fixture", "message_id" => "complete", "base_revision" => 1,
+        "message" => %{message | "title" => "Current"},
+        "files" => [%{"name" => "current.bin", "data_base64" => "AQI="}]
+      })
+      assert {:ok, 200, _, false} =
+               Writes.answer(relay, principal, "i1", 2, {:result, %{"choice" => "blue"}}, "00000000-0000-4000-8000-000000000063")
+
+      source_state = :sys.get_state(relay)
+      terminal =
+        source_state.store.engine.origin_feeds[{person, origin}].entries
+        |> Map.values()
+        |> Enum.find(&(&1["kind"] == "terminal"))
+      assert %{"feed_seq" => terminal_seq} = terminal
+      assert {:ok, _} =
+               GenServer.call(relay, {:origin_ack2, origin, terminal_seq,
+                 %{"op_id" => "00000000-0000-4000-8000-000000000064", "outcome" => "handed"}})
+      request.(%{
+        "type" => "conversation_result", "op_id" => "00000000-0000-4000-8000-000000000065",
+        "sender_id" => "app:fixture", "message_id" => "complete", "in_reply_to" => terminal_seq, "status" => "applied"
+      })
+
+      path = "/v2/items/i1"
+      conn = browser_request(:get, path, cookie)
+      format32 = Router.init(relay: relay, auth: {:browser, backend, nil})
+      assert %{status: 200, resp_body: expected} = response = Router.call(conn, format32)
+      assert [tag] = Plug.Conn.get_resp_header(response, "etag")
+      assert {:ok, %{"rev" => head, "item" => item}} = JSON.decode_line(expected <> "\n")
+      assert %{
+        "request_revision" => 2,
+        "files" => [%{"file_id" => "fi1.2.0", "name" => "current.bin"}, %{"file_id" => "fi1.1.1", "name" => "plan.png"}],
+        "terminal" => %{"answer" => %{"kind" => "result", "value" => %{"choice" => "blue"}}},
+        "result" => %{"status" => "applied"}
+      } = item
+
+      state = :sys.get_state(relay)
+      record = state.store.engine.messages[key]
+      files = Resources.item_file_refs(record, state.store.engine.uploads)
+      assert files == item["files"]
+      assert {:ok, [[rank_key, rank_json]]} =
+               RecordTable.select(state.store.db, "SELECT rank_key, rank_json FROM client_ranks WHERE person_id = ? AND item_id = 'i1'", [person])
+
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 1)", [origin, person])
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.origin_sessions (person_id, origin_key, handle) VALUES ($1, $2, $3)", [person, origin, session])
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.messages
+                   (id, person_id, origin_key, session_handle, sender_id, message_id, revision,
+                    accepted_at_ms, accepted_position, free_order, terminal)
+                 VALUES ('complete-item', $1, $2, $3, 'app:fixture', 'complete', 2, $4, 1, $5, $6)
+                 """,
+                 [person, origin, session, record.accepted_at, Map.get(record, :free_order), Attributes.encode(record.terminal)]
+               )
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.message_revisions VALUES ('complete-item', 2, $1, $2)", [
+                 record.revision_accepted_at, Attributes.encode(record.message)
+               ])
+
+      bounce = state.store.engine.bounce_revisions[key]
+      substantive = Map.get(bounce.raw_to_substantive, 2, bounce.current_substantive_revision)
+      metadata = %{visible: true, substantive_revision: substantive, origin_result: record.origin_result}
+      seen = if item["seen"], do: substantive
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.message_recipients VALUES ('complete-item', $1, 'i1', $2, $3)", [
+                 person, seen, Attributes.encode(metadata)
+               ])
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.stream_heads (person_id, origin_key, head) VALUES ($1, '', $2)", [person, head])
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.stream_resource_revisions VALUES ($1, '', 'item', $2, $3, NULL)", [
+                 person, ChangeLog.item_resource(key), item["rev"]
+               ])
+      put_summary_fact("client_rank_state", person, [person])
+      put_summary_fact("client_ranks", {person, "i1"}, [person, "i1", rank_key, rank_json])
+
+      ctx = %Context{principal: nil, relay: nil, request_id: nil, params: %{item_id: "i1"}}
+      assert %{status: 503} = Reads.get_postgres_item(conn, ctx)
+      chat = %{
+        chat_started: item["chat"]["started"],
+        latest_origin_reply_seq: nil,
+        unread_replies: item["chat"]["unread_replies"]
+      }
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.conversations VALUES ('complete-item', 'complete-item', $1)", [Attributes.encode(chat)])
+      availability = item["availability"]
+      put_summary_fact("ordinary_item_availability", {person, "i1"}, {
+        availability["state"], availability["last_detached_at_ms"]
+      })
+      assert %{status: 503} = Reads.get_postgres_item(conn, ctx)
+      put_summary_fact("ordinary_item_files", {person, "i1", 2}, files)
+
+      assert %{status: 200, resp_body: ^expected} = actual = Reads.get_postgres_item(conn, ctx)
+      assert [^tag] = Plug.Conn.get_resp_header(actual, "etag")
+      conditional = Plug.Conn.put_req_header(conn, "if-none-match", tag)
+      assert %{status: 304, resp_body: ""} = Reads.get_postgres_item(conditional, ctx)
+      pg = Router.init(relay: nil, repository: :postgres, auth: {:browser, Identities, nil})
+      assert %{status: 404} = Router.call(conn, pg)
+
+      assert {:ok, _} = Transaction.query("""
+        INSERT INTO harklight.messages (id, person_id, origin_key, sender_id, message_id, kind, revision, accepted_at_ms)
+        VALUES ('complete', $1, $2, 'app:fixture', 'complete', 'shared', 2, 1)
+        """, [person, origin])
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.message_revisions VALUES ('complete', 2, 1, $1)", [
+                 Attributes.encode(record.message)
+               ])
+      assert {:ok, _} =
+               Transaction.query("INSERT INTO harklight.message_recipients VALUES ('complete', $1, 'i99', $2, $3)", [
+                 person, seen, Attributes.encode(metadata)
+               ])
+      snapshot = fn -> AttentionServer.Repository.RecipientItems.summary_facts(:postgres, person, "i99") end
+      assert {:error, :not_found} = Transaction.snapshot(snapshot)
+      assert {:error, :storage_unavailable} =
+               AttentionServer.Repository.Postgres.Items.current_recipient(person, "i99", 2)
+      assert %{status: 404} = Reads.get_postgres_item(conn, %{ctx | params: %{item_id: "i99"}})
+    end
+
     test "an attachment is served only after its complete chunk sequence and digest verify" do
       alias AttentionServer.Repository.Postgres.Uploads
 

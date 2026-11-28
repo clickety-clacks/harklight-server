@@ -18,6 +18,26 @@ defmodule AttentionServer.Repository.RecipientItems do
   def summary_facts(:postgres, person, item_id),
     do: AttentionServer.Repository.Postgres.ItemSummaryFacts.read(person, item_id)
 
+  def item(:postgres, %{person: person} = principal, item_id) do
+    alias AttentionServer.Repository.Postgres.Items
+
+    with {:ok, %{chat: chat, availability: availability} = facts}
+         when is_map(chat) and (is_map(availability) or is_nil(availability)) <-
+           summary_facts(:postgres, person, item_id),
+         {:ok, key, record, files} <- Items.current_recipient(person, item_id, facts.request_revision) do
+      item =
+        key
+        |> Resources.ordinary_item_payload(record, facts.rank, Map.put(facts, :files, files))
+        |> Resources.stamp(facts.resource_revision)
+        |> then(&Resources.render(:item, &1, principal))
+
+      {:ok, %{"rev" => facts.head, "item" => item}}
+    else
+      {:ok, _unprojected} -> {:error, :storage_unavailable}
+      {:error, _} = error -> error
+    end
+  end
+
   def read_through(engine, {person, _, _} = key, entry_id) do
     with {:ok, seq} <- item_entry_seq(engine, person, key, entry_id) do
       current = Map.get(engine.chat_read_positions, key, 0)

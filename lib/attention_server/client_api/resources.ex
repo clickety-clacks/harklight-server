@@ -27,6 +27,7 @@ defmodule AttentionServer.ClientAPI.Resources do
   alias AttentionServer.ClientAPI.Projection
 
   alias AttentionServer.{BounceDecision, Conversation, Engine, LargeData, Message, ReplyPriority}
+  alias AttentionServer.Repository.Postgres.LargeText
 
   @viewer "_viewer"
   @sources "_sources"
@@ -228,21 +229,31 @@ defmodule AttentionServer.ClientAPI.Resources do
     end)
   end
 
-  defp project_item(engine, {person, sender, _id} = key, rank) do
+  defp project_item(engine, key, rank) do
     record = Map.fetch!(engine.messages, key)
-    revision = Map.get(record, :revision, 1)
     summary = Map.get(engine.route_b_index.conversation_summary_by_item, key, %{})
-    {reply, rank} = Map.pop(rank, "_reply")
+
+    ordinary_item_payload(key, record, rank, %{
+      files: item_file_refs(record, engine.uploads),
+      seen: seen?(engine, key, record),
+      chat: chat(engine, key, record, summary, rank["_reply"]),
+      availability: AttentionServer.AgentAPI.FeedActivity.item_availability(engine, key)
+    })
+  end
+
+  @doc false
+  def ordinary_item_payload({person, sender, _id}, record, rank, facts) do
+    rank = Map.delete(rank, "_reply")
     {thread, rank} = Map.pop(rank, "_thread")
 
     %{
       "item_id" => item_id(record),
       "sender" => sender,
-      "request_revision" => revision,
+      "request_revision" => Map.get(record, :revision, 1),
       "message" => record.message,
-      "files" => engine |> typed_files(item_files(record, revision)),
-      "seen" => seen?(engine, key, record),
-      "chat" => chat(engine, key, record, summary, reply),
+      "files" => facts.files,
+      "seen" => facts.seen,
+      "chat" => facts.chat,
       "terminal" => terminal(person, record),
       "rank" => rank,
       @viewer => %{"origin" => record.origin}
@@ -254,7 +265,7 @@ defmodule AttentionServer.ClientAPI.Resources do
     # Round 9: the effective group thread, so clients form today's thread rows
     # from adjacent items with the same (sender, thread).
     |> put_present("thread", thread)
-    |> put_present("availability", AttentionServer.AgentAPI.FeedActivity.item_availability(engine, key))
+    |> put_present("availability", facts.availability)
     |> put_present("result", origin_result(record))
   end
 
@@ -363,9 +374,11 @@ defmodule AttentionServer.ClientAPI.Resources do
     end
   end
 
-  # The current revision's files, plus files of earlier revisions that the
-  # current answer screen names (a revision keeps showing revision 1's images).
-  defp item_files(record, revision) do
+  @doc false
+  # The current revision's files, followed by earlier files named by its UI/1
+  # screen. The old revision and ordinal remain part of an inline file ID.
+  def item_file_refs(record, uploads) do
+    revision = Map.get(record, :revision, 1)
     by_revision = Map.get(record, :files_by_revision, %{})
     current = Map.get(by_revision, revision, [])
     own = file_refs(current, "fi#{record.accepted_seq}.#{revision}.")
@@ -393,7 +406,7 @@ defmodule AttentionServer.ClientAPI.Resources do
         end)
       end)
 
-    own ++ earlier
+    typed_files(%{uploads: uploads}, own ++ earlier)
   end
 
   # The names a UI/1 screen's image primitives use ("file": name).
@@ -474,13 +487,14 @@ defmodule AttentionServer.ClientAPI.Resources do
       {"result", value} ->
         %{"kind" => "result", "value" => value}
 
-      {"comment", text} when is_binary(text) or is_struct(text, LargeData.Ref) ->
+      {"comment", text}
+      when is_binary(text) or is_struct(text, LargeData.Ref) or is_struct(text, LargeText.Ref) ->
         %{"kind" => "reply", "text" => text}
 
       {nil, nil} ->
         %{"kind" => "seen"}
 
-      {nil, text} when is_binary(text) or is_struct(text, LargeData.Ref) ->
+      {nil, text} when is_binary(text) or is_struct(text, LargeData.Ref) or is_struct(text, LargeText.Ref) ->
         %{"kind" => "reply", "text" => text}
 
       _ ->
@@ -507,7 +521,7 @@ defmodule AttentionServer.ClientAPI.Resources do
           %{"id" => id} = action when is_binary(id) ->
             put_present(%{"kind" => "choice", "id" => id}, "label", text_or_nil(action["label"]))
 
-          nil when is_binary(answer) or is_struct(answer, LargeData.Ref) ->
+          nil when is_binary(answer) or is_struct(answer, LargeData.Ref) or is_struct(answer, LargeText.Ref) ->
             %{"kind" => "reply", "text" => answer}
 
           nil ->
