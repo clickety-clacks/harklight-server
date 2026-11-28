@@ -553,3 +553,13 @@ content types are retained. Upload content/link admission and recipient
 visibility precede this phase. Fact writes and the source checkpoint commit
 together. This enables the bounded recipient revision reader; current Item file
 inheritance and shared revision files remain separate projections.
+
+`VerifyMessages.run/3` first verifies raw facts and published long-text source
+closure, then compares ordinary normalized message fields, supplemental typed
+attributes, recipient identity and every retained revision with the source.
+Known first/latest clocks and unknown intermediate clocks remain exact. Row
+counts reject extra ordinary records or revisions. Mismatches identify the
+record by a digest and the projection field, without returning source identity
+or content. This read-only result covers ordinary record reconstruction;
+recipient state, conversations, answers, file links and shared history require
+their separate checks before lifecycle validation.

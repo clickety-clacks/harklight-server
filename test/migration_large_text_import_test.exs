@@ -115,6 +115,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       stop_supervised!(Repo)
       assert :ok = ImportTables.run(db, identity, bundle)
       verify_published_text(db, identity, bundle, count, hash)
+      assert {:ok, %{ordinary_messages: 2, ordinary_revisions: 2}} = AttentionServer.Migration.VerifyMessages.run(db, identity, bundle)
       file = Path.join(bundle, "files/uploads/" <> hash)
       File.rename!(file, file <> ".saved")
       assert {:error, _} = ImportLargeText.run(db, identity, bundle)
