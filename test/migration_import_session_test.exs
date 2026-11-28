@@ -12,7 +12,10 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     @original_json ~s({ "synthetic" : true })
 
     for epoch <- [1, 17] do
-      @tag timeout: 120_000, epoch: epoch
+      # Full source/import/restore equivalence over >256 records and conversation
+      # entries, including repeated read-only mutation probes, is deliberately
+      # bounded separately from the smaller migration cases below.
+      @tag timeout: 300_000, epoch: epoch
       test "interrupted migration and authority readback with epoch #{epoch}", %{epoch: epoch} do
         uri = URI.parse(System.fetch_env!("HARKLIGHT_MIGRATION_TEST_URL"))
         assert uri.host in ["localhost", "127.0.0.1"]
@@ -648,6 +651,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         verify_item_facts(db, identity, bundle, manifest)
         verify_message_drift(db, identity, bundle)
         verify_recipient_drift(db, identity, bundle)
+        verify_authority_drift(db, identity, bundle)
         verify_conversation_drift(db, identity, bundle)
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
         extra_hash = :crypto.hash(:sha256, "")
@@ -1908,6 +1912,39 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, %{rows: members}} =
         ImportSession.query(db, "SELECT person_id FROM harklight.organization_members WHERE organization_id=$1 ORDER BY person_id", [organization])
       assert List.flatten(members) == Enum.sort(expected)
+    end
+
+    defp verify_authority_drift(db, identity, bundle) do
+      verifier = AttentionServer.Migration.VerifyAuthority
+      assert {:ok, counts} = verifier.run(db, identity, bundle)
+      assert counts.principals > 0 and counts.grants > 0 and counts.sessions > 0
+      for sql <- [
+        "UPDATE harklight.principals SET revision=revision+1 WHERE revoked=true",
+        "UPDATE harklight.principals SET revoked=false WHERE revoked=true",
+        "UPDATE harklight.principals SET attributes='{}'::jsonb WHERE kind='agent'",
+        "UPDATE harklight.sender_grants SET pattern=pattern || '/wrong'",
+        "UPDATE harklight.origin_sessions SET attributes='{}'::jsonb"
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: n}} = ImportSession.query(tx, sql, [])
+          assert n > 0
+          assert {:error, {:authority_mismatch, _, _}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
+      for {sql, field} <- [
+        {"INSERT INTO harklight.principals(key,person_id,kind,revision) SELECT 'synthetic-extra-principal',id,'agent',1 FROM harklight.people LIMIT 1", :principals},
+        {"INSERT INTO harklight.sender_grants(principal_key,pattern) SELECT key,'synthetic-extra-pattern' FROM harklight.principals LIMIT 1", :grants},
+        {"INSERT INTO harklight.origin_sessions(person_id,origin_key,handle) SELECT person_id,key,'synthetic-extra-session' FROM harklight.principals LIMIT 1", :sessions}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, %{num_rows: 1}} = ImportSession.query(tx, sql, [])
+          assert {:error, {:authority_count_mismatch, ^field}} = verifier.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^counts} = verifier.run(db, identity, bundle)
+      end
     end
 
     defp verify_account(db, {{:row, field, person}, high})
