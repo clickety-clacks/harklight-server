@@ -800,6 +800,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         end
 
         source = %{store | change_log: true}
+        assert {:ok, [[source_epoch]]} = RecordTable.select(store.db,
+          "SELECT epoch FROM client_change_log_epoch WHERE id=1")
         assert {:ok, head} = ChangeLog.head(source, person)
         if mode == :implicit, do: assert(head == epoch)
         assert {:ok, [], false, ^head} = ChangeLog.read(source, person, head, 50)
@@ -820,8 +822,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert {:ok, _} = AttentionServer.Migration.VerifyStreamPositions.run(db, identity, bundle)
-        expected_epoch = if mode == :reset, do: epoch + 1, else: epoch
-        assert {:ok, %{epoch: ^expected_epoch}} = AttentionServer.Migration.VerifyStreamHeads.run(db, identity, bundle)
+        assert {:ok, %{epoch: ^source_epoch}} = AttentionServer.Migration.VerifyStreamHeads.run(db, identity, bundle)
         start_supervised!({Repo, config})
         assert {:ok, [], false, ^head} = Streams.person_page(person, head, 50)
         assert {:error, :cursor_expired} = Streams.person_page(person, head - 1, 50)
