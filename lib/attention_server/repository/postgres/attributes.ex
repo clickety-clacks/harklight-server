@@ -15,8 +15,12 @@ defmodule AttentionServer.Repository.Postgres.Attributes do
   def decode(%{"encoding" => @encoding, "data" => data} = envelope)
       when map_size(envelope) == 2 and is_binary(data) do
     with {:ok, payload} <- Base.decode64(data) do
-      StoredTerms.load_atoms()
-      {:ok, :erlang.binary_to_term(payload, [:safe])}
+      :ok = StoredTerms.load_keyed_atoms()
+
+      case :erlang.binary_to_term(payload, [:safe, :used]) do
+        {value, used} when used == byte_size(payload) -> {:ok, value}
+        _ -> {:error, :invalid_attributes}
+      end
     else
       _ -> {:error, :invalid_attributes}
     end
