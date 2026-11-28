@@ -58,7 +58,62 @@ defmodule AttentionServer.Migration.MaterialIdentityTest do
     end
   end
 
-  defp bundle(certs, invitations, changes \\ %{}) do
+  test "configured provider and feature files preserve opaque bytes with exact source paths", %{certs: certs} do
+    configured = %{
+      "ATTENTION_SERVER_JEV_KEY_PATH" => {"jev.key", "synthetic opaque provider bytes"},
+      "ATTENTION_SERVER_APNS_KEY_PATH" => {"apns.key", <<0, 1, 2, 255>>},
+      "ATTENTION_SERVER_APNS_PRODUCTION_KEY_PATH" => {"apns-production.key", "synthetic production key"},
+      "ATTENTION_SERVER_FEATURE_FLAGS_PATH" => {"flags.json", "{}"}
+    }
+    {root, manifest} = bundle(certs, [], %{}, configured)
+    assert :ok = MaterialProvenance.verify(root, manifest.material, manifest.material_provenance)
+    assert :ok = MaterialIdentity.validate(root, manifest)
+    assert {:ok, paths} = MaterialProvenance.configured_paths(root, manifest.material, manifest.material_provenance["files"])
+    for {variable, {_, bytes}} <- configured do
+      name = Map.fetch!(paths, variable)
+      assert File.read!(Path.join(root, name)) == bytes
+      assert name == "material/external" <> manifest.material_provenance["files"][name]["path"]
+    end
+    name = paths["ATTENTION_SERVER_JEV_KEY_PATH"]
+    changed = put_in(manifest.material_provenance, ["files", name, "path"], "/different/configured.key")
+    assert {:error, :configured_material_missing} = MaterialProvenance.verify(root, manifest.material, changed)
+    assert {:error, :configured_material_missing} = MaterialProvenance.configured_paths(root, manifest.material,
+      Map.delete(manifest.material_provenance["files"], name))
+    alias_name = "material/external/wrong-restore-path"
+    files = manifest.material_provenance["files"] |> Map.put(alias_name, manifest.material_provenance["files"][name]) |> Map.delete(name)
+    material = manifest.material |> Map.put(alias_name, manifest.material[name]) |> Map.delete(name)
+    assert {:error, :configured_material_path_mismatch} = MaterialProvenance.configured_paths(root, material, files)
+    assert :ok = MaterialIdentity.validate(root, manifest)
+  end
+
+  test "dashboard pairing is local and unknown external or score output is refused", %{certs: certs} do
+    configured = %{
+      "ATTENTION_SERVER_DASHBOARD_CERTFILE" => {"dashboard.pem", File.read!(Path.join(certs, "server.pem"))},
+      "ATTENTION_SERVER_DASHBOARD_KEYFILE" => {"dashboard.key", File.read!(Path.join(certs, "server.key"))}
+    }
+    {root, manifest} = bundle(certs, [], %{}, configured)
+    assert :ok = MaterialIdentity.validate(root, manifest)
+    foreign = Map.put(configured, "ATTENTION_SERVER_DASHBOARD_KEYFILE", {"dashboard.key", File.read!(Path.join(certs, "b1.key"))})
+    {root, manifest} = bundle(certs, [], %{}, foreign)
+    assert {:error, :material_dashboard_identity_mismatch} = MaterialIdentity.validate(root, manifest)
+    {root, manifest} = bundle(certs, [], %{}, Map.delete(configured, "ATTENTION_SERVER_DASHBOARD_KEYFILE"))
+    assert {:error, :material_dashboard_identity_mismatch} = MaterialIdentity.validate(root, manifest)
+    for variable <- ["UNCONFIGURED_FILE", "ATTENTION_SERVER_JEV_SCORE_RECORD_PATH"] do
+      {root, manifest} = bundle(certs, [], %{}, %{variable => {"not-imported", "synthetic output"}})
+      assert {:error, :unsupported_or_missing_identity_material} = MaterialIdentity.validate(root, manifest)
+    end
+  end
+
+  test "optional configured files may be disabled but never evaluated" do
+    assert {:ok, values} = MaterialProvenance.configuration("ATTENTION_SERVER_APNS_KEY_PATH=''\nATTENTION_SERVER_FEATURE_FLAGS_PATH=\"\"")
+    assert values["ATTENTION_SERVER_APNS_KEY_PATH"] == ""
+    for variable <- ["ATTENTION_SERVER_JEV_KEY_PATH", "ATTENTION_SERVER_DASHBOARD_KEYFILE", "ATTENTION_SERVER_FEATURE_FLAGS_PATH"] do
+      assert {:error, :unsupported_tls_configuration} = MaterialProvenance.configuration(variable <> "=$UNEXPANDED/key")
+      assert {:error, :unsupported_tls_configuration} = MaterialProvenance.configuration(variable <> "=/a\n" <> variable <> "=/b")
+    end
+  end
+
+  defp bundle(certs, invitations, changes \\ %{}, configured \\ %{}) do
     root = Path.join(System.tmp_dir!(), "material-identity-#{System.unique_integer([:positive])}")
     File.mkdir_p!(Path.join(root, "material"))
     on_exit(fn -> File.rm_rf!(root) end)
@@ -73,6 +128,15 @@ defmodule AttentionServer.Migration.MaterialIdentityTest do
       {"CACERTFILE", "tls/ca.pem"}], "\n", fn {key, name} ->
         "export ATTENTION_SERVER_#{key}='#{material[name]}'"
       end))
+    external_root = root <> "-configured"
+    File.mkdir_p!(external_root)
+    on_exit(fn -> File.rm_rf!(external_root) end)
+    material = Enum.reduce(configured, material, fn {variable, {filename, bytes}}, acc ->
+      path = Path.join(external_root, filename)
+      File.write!(path, bytes)
+      File.write!(env, "\n#{variable}='#{path}'\n", [:append])
+      Map.put(acc, "external" <> path, path)
+    end)
     material = material |> Map.put("person-id", person) |> Map.put("server.env", env)
     {:ok, before} = MaterialProvenance.capture(material)
     facts = Map.new(material, fn {name, source} ->
