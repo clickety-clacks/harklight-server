@@ -685,3 +685,30 @@ root, every directory, both markers and every file must have that process's
 effective UID and GID, as well as private modes. A foreign owner refuses without
 repair: otherwise a correctly hashed 0600 key could be unreadable after cutover.
 Changing the runtime account is not part of migration validation.
+
+
+### Configured external material
+
+The captured `server.env` may also name dashboard certificate/key files,
+JEV and APNs private-key files, and a feature-flags file. The supported variables
+are `ATTENTION_SERVER_DASHBOARD_CERTFILE`, `ATTENTION_SERVER_DASHBOARD_KEYFILE`,
+`ATTENTION_SERVER_JEV_KEY_PATH`, `ATTENTION_SERVER_APNS_KEY_PATH`,
+`ATTENTION_SERVER_APNS_PRODUCTION_KEY_PATH`, and `ATTENTION_SERVER_FEATURE_FLAGS_PATH`.
+Unset or empty optional paths mean no file. Each nonempty path must be an absolute
+literal assignment, captured with the stopped source; configuration is never
+executed. Its copied bytes and original path must match the provenance record.
+Outside the state directory the material-map key is `external` followed by the
+absolute path; files inside it use their relative restore path.
+
+Each dashboard component uses its captured override or independently falls back
+to the corresponding Server TLS file, as at runtime. The resulting certificate
+and private key must match. Provider keys are preserved
+as opaque private bytes using the stopped configuration as their continuity
+anchor; migration never uses them or contacts a provider. Unknown or unconfigured
+external files are refused. Private staging and final validation apply the same
+permissions, ownership and checksum checks as other material.
+
+`ATTENTION_SERVER_JEV_SCORE_RECORD_PATH` names append-only output, not imported
+identity or runtime state. Exclude that file from the migration bundle and leave
+it untouched. It remains covered by the installation's single documented backup
+and restore procedure.

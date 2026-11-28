@@ -5,6 +5,10 @@ defmodule AttentionServer.Migration.MaterialProvenance do
   @tls %{"cert" => "ATTENTION_SERVER_CERTFILE", "key" => "ATTENTION_SERVER_KEYFILE",
     "ca" => "ATTENTION_SERVER_CACERTFILE"}
 
+  @optional ~w(ATTENTION_SERVER_DASHBOARD_CERTFILE ATTENTION_SERVER_DASHBOARD_KEYFILE
+    ATTENTION_SERVER_JEV_KEY_PATH ATTENTION_SERVER_APNS_KEY_PATH
+    ATTENTION_SERVER_APNS_PRODUCTION_KEY_PATH ATTENTION_SERVER_FEATURE_FLAGS_PATH)
+
   # Runs between the stopped-source observations. No shell evaluation or SQLite
   # access: the configured paths and the exact copied bytes are the TLS anchor.
   def capture(material) when is_map(material) do
@@ -43,7 +47,8 @@ defmodule AttentionServer.Migration.MaterialProvenance do
           Map.take(before, [:size, :sha256]) == Map.take(Map.fetch!(material, name), [:size, :sha256])
       end)
     with true <- valid,
-         {:ok, _} <- tls_paths(root, material, files) do
+         {:ok, _} <- tls_paths(root, material, files),
+         {:ok, _} <- configured_paths(root, material, files) do
       :ok
     else
       false -> {:error, :material_provenance_mismatch}
@@ -72,15 +77,45 @@ defmodule AttentionServer.Migration.MaterialProvenance do
     end
   end
 
+  # Optional files inherit the stopped configuration's exact path/byte anchor.
+  # The restore name must also name that path, never a caller-selected alias.
+  def configured_paths(root, material, files) do
+    if Map.has_key?(material, "material/server.env") do
+      with {:ok, bytes} <- File.read(Path.join(root, "material/server.env")),
+           {:ok, configured} <- configuration(bytes) do
+        source_root = Path.dirname(files["material/server.env"]["path"])
+        Enum.reduce_while(@optional, {:ok, %{}}, fn variable, {:ok, acc} ->
+          case configured[variable] do
+            path when is_binary(path) and path != "" ->
+              matches = Enum.filter(files, fn {_, entry} -> entry["path"] == path end)
+              case matches do
+                [{name, _}] ->
+                  relative = Path.relative_to(path, source_root)
+                  internal = relative != path and not String.starts_with?(relative, "../")
+                  expected = if internal, do: "material/" <> relative, else: "material/external" <> path
+                  if name == expected and Map.has_key?(material, name),
+                    do: {:cont, {:ok, Map.put(acc, variable, name)}},
+                    else: {:halt, {:error, :configured_material_path_mismatch}}
+                _ -> {:halt, {:error, :configured_material_missing}}
+              end
+            _ -> {:cont, {:ok, acc}}
+          end
+        end)
+      end
+    else
+      {:ok, %{}}
+    end
+  end
+
   # Accept literal shell assignments produced by the installer, including %q
   # backslash quoting and single/double quotes. Refuse expansion; never source it.
   def configuration(bytes) do
     Enum.reduce_while(String.split(bytes, "\n"), {:ok, %{}}, fn line, {:ok, acc} ->
-      case Regex.run(~r/^\s*(?:export\s+)?(ATTENTION_SERVER_(?:CERTFILE|KEYFILE|CACERTFILE))=(.*)$/, line) do
+      case Regex.run(~r/^\s*(?:export\s+)?(ATTENTION_SERVER_(?:CERTFILE|KEYFILE|CACERTFILE|DASHBOARD_CERTFILE|DASHBOARD_KEYFILE|JEV_KEY_PATH|APNS_KEY_PATH|APNS_PRODUCTION_KEY_PATH|FEATURE_FLAGS_PATH))=(.*)$/, line) do
         [_, key, value] ->
           with {:ok, path} <- literal(String.trim(value), :plain, []),
-               true <- Path.type(path) == :absolute and not Map.has_key?(acc, key) do
-            {:cont, {:ok, Map.put(acc, key, Path.expand(path))}}
+               true <- (Path.type(path) == :absolute or (key in @optional and path == "")) and not Map.has_key?(acc, key) do
+            {:cont, {:ok, Map.put(acc, key, if(path == "", do: "", else: Path.expand(path)))}}
           else
             _ -> {:halt, {:error, :unsupported_tls_configuration}}
           end

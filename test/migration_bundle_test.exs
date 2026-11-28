@@ -155,6 +155,12 @@ defmodule AttentionServer.Migration.BundleTest do
     end)
     opts = Keyword.update!(opts, :material, &Map.merge(&1, auxiliary))
 
+    provider = root <> "-provider.key"
+    File.write!(provider, "synthetic opaque provider key bytes")
+    on_exit(fn -> File.rm!(provider) end)
+    File.write!(env, "\nATTENTION_SERVER_JEV_KEY_PATH='#{provider}'\n", [:append])
+    opts = Keyword.update!(opts, :material, &Map.put(&1, "external" <> provider, provider))
+
     material_map = Path.join(root, "material-map.json")
     File.write!(material_map, JSON.encode!(opts[:material]))
     assert {:ok, %{"command" => "export", "bundle_version" => 2}} = CLI.run([
@@ -227,6 +233,10 @@ defmodule AttentionServer.Migration.BundleTest do
     staging = Path.join(root, "private-stage")
     assert {:ok, material} = AttentionServer.Migration.ImportMaterial.run(destination, identity, staging)
     assert material["root"] == Path.join(staging, "files")
+    provider_stage = Path.join(material["root"], "external" <> provider)
+    assert File.read!(provider_stage) == File.read!(provider)
+    assert Bitwise.band(File.stat!(provider_stage).mode, 0o777) == 0o600
+
     staged = Path.join(material["root"], "owner/identity.key")
     assert File.read!(staged) == File.read!(secret)
     assert Bitwise.band(File.stat!(staged).mode, 0o777) == 0o600

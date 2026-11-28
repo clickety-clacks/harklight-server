@@ -15,7 +15,8 @@ defmodule AttentionServer.Migration.MaterialIdentity do
   def validate(bundle, manifest) do
     names = Map.keys(manifest.material)
     with {:ok, tls} <- MaterialProvenance.tls_paths(bundle, manifest.material, manifest.material_provenance["files"]),
-         supported = @supported ++ Map.values(tls) ++ ["material/tls/ca.key"],
+         {:ok, configured} <- MaterialProvenance.configured_paths(bundle, manifest.material, manifest.material_provenance["files"]),
+         supported = @supported ++ Map.values(configured) ++ Map.values(tls) ++ ["material/tls/ca.key"],
          true <- map_size(tls) == 3,
          true <- Enum.all?(@owner_files, &(&1 in names)),
          true <- Enum.all?(names, &(&1 in supported)),
@@ -25,12 +26,26 @@ defmodule AttentionServer.Migration.MaterialIdentity do
          {:ok, ^fingerprint} <- private_key(Path.join(bundle, "material/owner/identity.key")),
          {:ok, ^fingerprint} <- owner(bundle, manifest, person),
          :ok <- tls_identity(bundle, manifest, tls),
+         :ok <- dashboard_identity(bundle, configured, tls),
          :ok <- auxiliary_sources(manifest) do
       :ok
     else
       false -> {:error, :unsupported_or_missing_identity_material}
       {:ok, _} -> {:error, :material_identity_source_mismatch}
       {:error, _} = error -> error
+    end
+  end
+
+  defp dashboard_identity(bundle, configured, tls) do
+    # Runtime resolves these overrides independently. A one-sided override can
+    # pair with the already validated Server certificate or private key.
+    cert = configured["ATTENTION_SERVER_DASHBOARD_CERTFILE"] || tls["cert"]
+    key = configured["ATTENTION_SERVER_DASHBOARD_KEYFILE"] || tls["key"]
+    with {:ok, fingerprint} <- certificate(Path.join(bundle, cert)),
+         {:ok, ^fingerprint} <- private_key(Path.join(bundle, key)) do
+      :ok
+    else
+      _ -> {:error, :material_dashboard_identity_mismatch}
     end
   end
 
