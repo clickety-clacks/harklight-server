@@ -680,7 +680,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert {:error, :large_text_hash_count_mismatch} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
         assert {:ok, _} = ImportSession.query(db, "DELETE FROM harklight.large_texts WHERE sha256=$1", [extra_hash])
         assert {:ok, %{references: 0}} = AttentionServer.Migration.VerifyLargeText.run(db, identity, bundle)
-        verify_complete_report(db, identity, bundle, root)
+        verify_complete_report(db, identity, bundle, root, config)
         # The expiry/replacement exercise intentionally changes a receipt. Run
         # it only after comparing the untouched imported state with the source.
         verify_receipt_replay(session_person, {agent_person, agent_key}, receipt_digest)
@@ -697,8 +697,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
                    end
                  )
 
-        assert {:ok, %{rows: [["loading"]]}} =
-                 ImportSession.query(db, "SELECT phase FROM harklight.import_state", [])
+        assert {:ok, %{rows: [["validated", true]]}} =
+                 ImportSession.query(db, "SELECT phase,manifest_sha256 IS NOT NULL FROM harklight.import_state", [])
 
         assert {:ok, %{rows: [[^epoch]]}} =
                  ImportSession.query(db, "SELECT cursor_epoch FROM harklight.server_identity", [])
@@ -897,8 +897,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         "tls/ca.pem" => Path.join(certs, "ca.pem"), "tls/ca.key" => Path.join(certs, "ca.key")}
     end
 
-    defp verify_complete_report(db, identity, bundle, root) do
-      alias AttentionServer.Migration.{ValidationReport, ImportMaterial, ImportStatus}
+    defp verify_complete_report(db, identity, bundle, root, config) do
+      alias AttentionServer.Migration.{ValidationReport, ValidateImport, ImportMaterial, ImportStatus}
       # Complete the shared projections too: the report cannot accept a partial
       # ordinary-only import even when all ordinary checks already passed.
       assert :ok = AttentionServer.Migration.ImportSharedReaderFacts.run(db, identity, bundle)
@@ -917,6 +917,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, ^before} = ImportStatus.read(db, identity)
       assert before["phase"] == "loading" and before["validation_sha256"] == nil
       assert {:error, :postgres_not_active} = Transaction.verify_ready()
+      verify_validation_concurrency(db, config, identity, bundle, staging)
+      assert {:ok, ^report} = ValidationReport.run(db, identity, bundle, staging)
 
       marker = Path.join(staging, "COMPLETE.json")
       File.rename!(marker, marker <> ".partial")
@@ -932,13 +934,78 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, _} = ImportSession.query(db,
         "UPDATE harklight.compatibility_facts SET body='{}'::jsonb WHERE family='ordinary_item_availability' AND address=$1", [address])
       try do
-        assert {:error, {:validation_comparison_failed, "ordinary_availability", _}} = ValidationReport.run(db, identity, bundle, staging)
+        assert {:error, {:validation_comparison_failed, "ordinary_availability", _}} = ValidateImport.run(db, identity, bundle, staging)
+        assert {:ok, ^before} = ImportStatus.read(db, identity)
       after
         assert {:ok, _} = ImportSession.query(db,
           "UPDATE harklight.compatibility_facts SET body=$2::text::jsonb WHERE family='ordinary_item_availability' AND address=$1", [address, JSON.encode!(body)])
       end
-      assert {:ok, ^report} = ValidationReport.run(db, identity, bundle, staging)
+      assert {:error, :import_identity_mismatch} = ValidateImport.run(db, %{identity | id: "foreign-import"}, bundle, staging)
       assert {:ok, ^before} = ImportStatus.read(db, identity)
+      assert {:ok, validated} = ValidateImport.run(db, identity, bundle, staging)
+      assert validated["validation_sha256"] == report["sha256"]
+      assert validated["report"] == report["report"]
+      assert validated["material"] == material
+      assert {:ok, ^validated} = ValidateImport.run(db, identity, bundle, staging)
+      assert {:ok, status} = ImportStatus.read(db, identity)
+      assert status["phase"] == "validated"
+      assert status["validation_sha256"] == report["sha256"]
+      assert {:error, :postgres_not_active} = Transaction.verify_ready()
+      assert {:error, :import_not_loading} = ImportSession.checkpoint(db, identity, "records")
+    end
+
+    defp verify_validation_concurrency(db, config, identity, bundle, staging) do
+      alias AttentionServer.Migration.{ValidateImport, ImportStatus}
+      {:ok, loader_db} = Postgrex.start_link(config)
+      {:ok, validator_db} = Postgrex.start_link(config)
+      try do
+        assert {:ok, %{rows: [[validator_pid]]}} = ImportSession.query(validator_db, "SELECT pg_backend_pid()", [])
+        assert {:ok, %{rows: [[address, original]]}} = ImportSession.query(db,
+          "SELECT address,body FROM harklight.compatibility_facts WHERE family='ordinary_item_availability' ORDER BY address LIMIT 1", [])
+        family = "synthetic/validation-concurrency"
+        assert {:ok, checkpoint} = ImportSession.checkpoint(loader_db, identity, family)
+        parent = self()
+        loader = Task.async(fn ->
+          ImportSession.batch(loader_db, identity, family, checkpoint, [:synthetic_change], fn tx, _ ->
+            assert {:ok, %{num_rows: 1}} = ImportSession.query(tx,
+              "UPDATE harklight.compatibility_facts SET body='{}'::jsonb WHERE family='ordinary_item_availability' AND address=$1", [address])
+            send(parent, {:loader_waiting, self()})
+            receive do
+              :commit -> :ok
+            after
+              4_000 -> {:error, :test_commit_not_signalled}
+            end
+          end)
+        end)
+        assert_receive {:loader_waiting, loader_pid}, 2_000
+        validator = Task.async(fn -> ValidateImport.run(validator_db, identity, bundle, staging) end)
+        # Observe the actual blocked row lock, not an assumed scheduling delay.
+        await_validation_lock(db, validator_pid, 200)
+        send(loader_pid, :commit)
+        assert {:ok, _} = Task.await(loader, 5_000)
+        assert {:error, %Postgrex.Error{postgres: %{code: :serialization_failure}}} = Task.await(validator, 5_000)
+        assert {:ok, %{"phase" => "loading", "validation_sha256" => nil}} = ImportStatus.read(db, identity)
+        assert {:error, {:validation_comparison_failed, "ordinary_availability", _}} =
+          ValidateImport.run(validator_db, identity, bundle, staging)
+        assert {:ok, %{num_rows: 1}} = ImportSession.query(db,
+          "UPDATE harklight.compatibility_facts SET body=$2::text::jsonb WHERE family='ordinary_item_availability' AND address=$1",
+          [address, JSON.encode!(original)])
+        assert {:ok, %{num_rows: 1}} = ImportSession.query(db,
+          "DELETE FROM harklight.import_checkpoints WHERE import_id=$1 AND family=$2", [identity.id, family])
+      after
+        GenServer.stop(loader_db)
+        GenServer.stop(validator_db)
+      end
+    end
+
+    defp await_validation_lock(_db, _pid, 0), do: flunk("validator never waited for the loader row lock")
+    defp await_validation_lock(db, pid, remaining) do
+      assert {:ok, %{rows: [[blocked]]}} = ImportSession.query(db,
+        "SELECT cardinality(pg_blocking_pids($1)) > 0", [pid])
+      unless blocked do
+        Process.sleep(10)
+        await_validation_lock(db, pid, remaining - 1)
+      end
     end
 
     defp verify_catalog_drift(db, identity, bundle) do

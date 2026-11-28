@@ -33,35 +33,46 @@ defmodule AttentionServer.Migration.ValidationReport do
   ]
 
   def run(connection, identity, bundle, material_root) do
+    Postgrex.transaction(connection, fn db ->
+      with {:ok, _} <- ImportSession.query(db,
+             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", []),
+           {:ok, report} <- in_transaction(db, identity, bundle, material_root) do
+        report
+      else
+        {:error, reason} -> Postgrex.rollback(db, reason)
+      end
+    end, timeout: 300_000)
+  end
+
+  # Used by the guarded validation transition after it has locked import_state.
+  # The same complete fixed comparison set runs; no report supplied by a caller
+  # can bypass the comparisons. The caller owns the transaction and isolation.
+  def in_transaction(db, identity, bundle, material_root) do
     with {:ok, manifest, summary} <- Bundle.verify(bundle),
          {:ok, material} <- VerifyMaterial.run(bundle, identity, material_root) do
-      Postgrex.transaction(connection, fn db ->
-        result = with {:ok, _} <- ImportSession.query(db,
-                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", []),
-                      {:ok, %{"phase" => phase} = before} when phase in ["loading", "validated"] <- ImportStatus.read(db, identity),
-                      {:ok, comparisons} <- comparisons(db, identity, bundle),
-                      {:ok, ordinary} <- VerifyMessageUploads.run(db, identity, bundle, :ordinary),
-                      {:ok, shared} <- VerifyMessageUploads.run(db, identity, bundle, :shared),
-                      {:ok, ^before} <- ImportStatus.read(db, identity),
-                      {:ok, ^material} <- VerifyMaterial.run(bundle, identity, material_root),
-                      {:ok, ^manifest, ^summary} <- Bundle.verify(bundle) do
-          checks = comparisons |> Map.put("ordinary_message_uploads", ordinary) |> Map.put("shared_message_uploads", shared)
-          report = %{"report_version" => 1, "scope" => "staged_import_comparisons",
-            "identity" => ImportReceipt.document(identity), "schema_version" => Schema.version(),
-            "comparisons" => normalize(checks),
-            "material" => Map.take(material, ["manifest_sha256", "files"])}
-          digest = :crypto.hash(:sha256, Attributes.key(report)) |> Base.encode16(case: :lower)
-          {:ok, %{"report" => report, "sha256" => digest, "digest_encoding" => "deterministic-etf-v2",
-            "material" => material}}
-        else
-          {:error, _} = error -> error
-          _ -> {:error, :validation_report_state_changed}
-        end
-        case result do
-          {:ok, report} -> report
-          {:error, reason} -> Postgrex.rollback(db, reason)
-        end
-      end, timeout: 300_000)
+      compare(db, identity, bundle, material_root, manifest, summary, material)
+    end
+  end
+
+  defp compare(db, identity, bundle, material_root, manifest, summary, material) do
+    with {:ok, %{"phase" => phase} = before} when phase in ["loading", "validated"] <- ImportStatus.read(db, identity),
+         {:ok, comparisons} <- comparisons(db, identity, bundle),
+         {:ok, ordinary} <- VerifyMessageUploads.run(db, identity, bundle, :ordinary),
+         {:ok, shared} <- VerifyMessageUploads.run(db, identity, bundle, :shared),
+         {:ok, ^before} <- ImportStatus.read(db, identity),
+         {:ok, ^material} <- VerifyMaterial.run(bundle, identity, material_root),
+         {:ok, ^manifest, ^summary} <- Bundle.verify(bundle) do
+      checks = comparisons |> Map.put("ordinary_message_uploads", ordinary) |> Map.put("shared_message_uploads", shared)
+      report = %{"report_version" => 1, "scope" => "staged_import_comparisons",
+        "identity" => ImportReceipt.document(identity), "schema_version" => Schema.version(),
+        "comparisons" => normalize(checks),
+        "material" => Map.take(material, ["manifest_sha256", "files"])}
+      digest = :crypto.hash(:sha256, Attributes.key(report)) |> Base.encode16(case: :lower)
+      {:ok, %{"report" => report, "sha256" => digest, "digest_encoding" => "deterministic-etf-v2",
+        "material" => material}}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :validation_report_state_changed}
     end
   end
 
