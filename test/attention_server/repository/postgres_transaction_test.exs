@@ -90,6 +90,56 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, [%{rev: 3}], false, 3} = Streams.agent_page(agent, 2, 10, nil, true)
     end
 
+    test "a concurrent retention pass keeps page bounds and rows in one snapshot" do
+      alias AttentionServer.Repository.Postgres.Streams
+
+      person = "synthetic-retention"
+      scope = {person, ""}
+      observer = self()
+
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+      assert {:ok, 1} = Transaction.run([scope], &Transaction.append(&1, scope, [change("old")]))
+
+      # An imported high can be beyond every retained change.
+      assert {:ok, _} =
+               Transaction.query(
+                 "UPDATE harklight.stream_heads SET head = 9 WHERE person_id = $1 AND origin_key = ''",
+                 [person]
+               )
+
+      blocker =
+        Task.async(fn ->
+          Transaction.run([], fn _ ->
+            assert {:ok, %{rows: [[1]]}} =
+                     Transaction.query(
+                       """
+                       SELECT revision FROM harklight.stream_changes
+                       WHERE person_id = $1 AND origin_key = '' AND revision = 1 FOR UPDATE
+                       """,
+                       [person]
+                     )
+
+            send(observer, :row_locked)
+            receive do: (:release_row -> {:ok, :released})
+          end)
+        end)
+
+      assert_receive :row_locked, 2_000
+      prune = Task.async(fn -> Streams.prune(scope, 50) end)
+      await_lock_wait("stream_changes", 100)
+
+      assert {:ok, [%{rev: 1}], false, 1} = Streams.person_page(person, 0, 10)
+      assert {:ok, [], false, 8} = Streams.person_page(person, 8, 10)
+
+      send(blocker.pid, :release_row)
+      assert {:ok, :released} = Task.await(blocker)
+      assert {:ok, 1} = Task.await(prune)
+      assert {:ok, 1} = Streams.prune(scope, 50)
+      assert {:error, :cursor_expired} = Streams.person_page(person, 0, 10)
+      assert {:ok, [], false, 8} = Streams.person_page(person, 8, 10)
+      assert {:error, :cursor_expired} = Streams.person_page(person, 10, 10)
+    end
+
     test "unrelated streams commit independently and same-stream revisions follow commit order" do
       observer = self()
       scope = {"synthetic-one", ""}
