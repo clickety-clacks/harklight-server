@@ -5,12 +5,15 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     use ExUnit.Case, async: false
     alias AttentionServer.{CompatibilityScenarios, Engine, Groups, SharedMessages, Store}
     alias AttentionServer.ClientAPI.SharedCapability
-    alias AttentionServer.Migration.{Bundle, ImportConversations, ImportEntries, ImportMessages, ImportSession, ImportSharedMessages}
+    alias AttentionServer.Migration.{Bundle, ImportConversations, ImportEntries, ImportMessages, ImportSession, ImportSharedMessages, ImportSharedReaderFacts, ImportUploads}
     alias AttentionServer.Repository.Postgres.{Attributes, Schema}
 
     @sender "a1000000-0000-4000-8000-000000000001"
     @first "a1000000-0000-4000-8000-000000000002"
     @second "a1000000-0000-4000-8000-000000000003"
+    @outside "a1000000-0000-4000-8000-000000000004"
+    @origin AttentionServer.BrowserRecipient.key(@sender, "synthetic-retained-session", "a6000000-0000-4000-8000-000000000001")
+    @upload "a5000000-0000-4000-8000-000000000001"
     @group "a2000000-0000-4000-8000-000000000001"
     @shared "shared_synthetic-collision"
 
@@ -48,6 +51,59 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_shared_recipient ON harklight.message_recipients", [])
       assert :ok = ImportSharedMessages.run(db, identity, bundle)
       assert :ok = ImportSharedMessages.run(db, identity, bundle)
+      assert :ok = ImportUploads.run(db, identity, bundle)
+      assert {:ok, %{rows: [upload_row]}} = ImportSession.query(db,
+        "SELECT id,person_id,owner_key,size_bytes,sha256,completed_at_ms,attributes FROM harklight.uploads WHERE id=$1", [@upload])
+      assert {:ok, %{rows: chunks}} = ImportSession.query(db,
+        "SELECT chunk_number,bytes FROM harklight.upload_chunks WHERE upload_id=$1 ORDER BY chunk_number", [@upload])
+      assert {:ok, _} = ImportSession.query(db, "DELETE FROM harklight.uploads WHERE id=$1", [@upload])
+      assert {:error, _} = ImportSharedReaderFacts.run(db, identity, bundle)
+      assert {:ok, _} = ImportSession.query(db,
+        "INSERT INTO harklight.uploads(id,person_id,owner_key,size_bytes,sha256,completed_at_ms,attributes) VALUES($1,$2,$3,$4,$5,$6,$7)", upload_row)
+      for [ordinal, bytes] <- chunks do
+        assert {:ok, _} = ImportSession.query(db,
+          "INSERT INTO harklight.upload_chunks(upload_id,chunk_number,bytes) VALUES($1,$2,$3)", [@upload, ordinal, bytes])
+      end
+      for {column, bad, good} <- [{"completed_at_ms", nil, Enum.at(upload_row, 5)},
+                                  {"owner_key", "unrelated-owner", Enum.at(upload_row, 2)},
+                                  {"person_id", @outside, @sender}] do
+        assert {:ok, _} = ImportSession.query(db, "UPDATE harklight.uploads SET " <> column <> "=$2 WHERE id=$1", [@upload, bad])
+        assert {:error, _} = ImportSharedReaderFacts.run(db, identity, bundle)
+        assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "shared/reader-messages/v1")
+        assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+          "SELECT count(*) FROM harklight.message_uploads WHERE message_id=$1", [@shared])
+        assert {:ok, _} = ImportSession.query(db, "UPDATE harklight.uploads SET " <> column <> "=$2 WHERE id=$1", [@upload, good])
+      end
+      assert {:ok, _} = ImportSession.query(db, """
+        CREATE FUNCTION harklight.fail_shared_scope() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.family='shared_revision_scope' THEN RAISE EXCEPTION 'synthetic interruption'; END IF; RETURN NEW; END $$
+        """, [])
+      assert {:ok, _} = ImportSession.query(db,
+        "CREATE TRIGGER fail_shared_scope BEFORE INSERT ON harklight.compatibility_facts FOR EACH ROW EXECUTE FUNCTION harklight.fail_shared_scope()", [])
+      assert {:error, _} = ImportSharedReaderFacts.run(db, identity, bundle)
+      assert {:ok, %{ordinal: 0}} = ImportSession.checkpoint(db, identity, "shared/reader-recipients/v1")
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
+        "SELECT count(*) FROM harklight.compatibility_facts WHERE family='shared_revision_scope'", [])
+      assert {:ok, _} = ImportSession.query(db, "DROP TRIGGER fail_shared_scope ON harklight.compatibility_facts", [])
+      assert :ok = ImportSharedReaderFacts.run(db, identity, bundle)
+      assert :ok = ImportSharedReaderFacts.run(db, identity, bundle)
+      for person <- Map.keys(source.persons) do
+        expected_access = MapSet.size(SharedMessages.organizations(source, person)) > 0 or SharedMessages.retained_history?(source, person)
+        assert read_fact(db, "shared_read_access", person) == expected_access
+      end
+      assert read_fact(db, "shared_read_access", @outside) == false
+      assert read_fact(db, "shared_read_access", @sender) == true
+      for {{id, person}, recipient} <- source.shared_recipients do
+        record = Map.fetch!(source.shared_messages, id)
+        assert read_fact(db, "shared_revision_scope", {person, recipient.item_id}) ==
+          %{group?: Map.has_key?(record, :group_id), frozen_revision: get_in(recipient, [:frozen, :revision])}
+      end
+      assert {:ok, %{rows: [[@upload]]}} = ImportSession.query(db,
+        "SELECT upload_id FROM harklight.message_uploads WHERE message_id=$1 AND revision=1 AND ordinal=0", [@shared])
+      for revision <- [1, 2] do
+        historical = SharedMessages.historical_record(source.shared_messages[@shared], revision)
+        assert read_fact(db, "shared_revision_files", {@shared, revision}) == Map.get(historical, :files, [])
+      end
       # Both ordinary tuple consumers must still resolve the ordinary row.
       assert :ok = ImportConversations.run(db, identity, bundle)
       assert :ok = ImportEntries.run(db, identity, bundle)
@@ -58,7 +114,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       expected = source.shared_messages[@shared]
       assert {:ok, ^expected} = Attributes.decode(attrs)
       assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
-        "SELECT count(*) FROM harklight.principals WHERE key='historical-unenrolled-origin'", [])
+        "SELECT count(*) FROM harklight.principals WHERE key=$1", [@origin])
       assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.groups WHERE id=$1", [@group])
       assert {:ok, %{rows: rows}} = ImportSession.query(db,
         "SELECT person_id,attributes FROM harklight.message_recipients WHERE message_id=$1 ORDER BY person_id", [@shared])
@@ -84,6 +140,13 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       end
     end
 
+    defp read_fact(db, family, key) do
+      assert {:ok, %{rows: [[body]]}} = ImportSession.query(db,
+        "SELECT body FROM harklight.compatibility_facts WHERE family=$1 AND address=$2", [family, Attributes.key(key)])
+      assert {:ok, value} = Attributes.decode(body)
+      value
+    end
+
     defp visible_revision(engine, person, groups?, revision) do
       with true <- MapSet.size(SharedMessages.organizations(engine, person)) > 0 or SharedMessages.retained_history?(engine, person),
            %{item_id: item} <- engine.shared_recipients[{@shared, person}],
@@ -99,16 +162,26 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
 
     defp seed(path) do
       {:ok, store} = Store.open_relay(path)
+      bytes = "shared retained attachment"
+      metadata = %{id: @upload, person: @sender, uploader: @origin,
+        uploader_kind: "client", op_id: "a5000000-0000-4000-8000-000000000002",
+        sender_id: "app:shared-fixture", message_id: @shared, revision: 1,
+        name: "retained.txt", size: byte_size(bytes), sha256: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower),
+        last_activity_ms: 100, content_type: "text/plain"}
+      File.mkdir_p!(store.upload_dir)
+      File.write!(Path.join(store.upload_dir, @upload), bytes)
+      files = AttentionServer.ClientAPI.SharedAttachments.references([{metadata, nil}])
       {engine, :ok, touched} = Engine.with_touches(store.engine, fn engine ->
-        engine = Enum.reduce(Enum.with_index([@sender, @first, @second]), engine, fn {person, n}, acc ->
+        engine = Engine.put_row(engine, :uploads, @upload, metadata)
+        engine = Enum.reduce(Enum.with_index([@sender, @first, @second, @outside]), engine, fn {person, n}, acc ->
           {:ok, next, _} = Engine.hosted_account_create(acc, "shared-fixture-#{n}", false, person, String.duplicate(Integer.to_string(n + 1), 64))
           next
         end)
         {:ok, engine} = Engine.replace_hosted_organization(engine, "shared-business", [@sender, @first, @second], "a3000000-0000-4000-8000-000000000001")
         {:ok, engine, _} = Groups.replace_hosted(engine, {"shared-business", "team"}, @group, "Retained group", [@sender, @first, @second], 1)
-        attrs = %{id: @shared, sender_person: @sender, sender_key: "historical-unenrolled-origin",
+        attrs = %{id: @shared, sender_person: @sender, sender_key: @origin,
           sender_id: "app:shared-fixture", message: %{"title" => "First shared revision"},
-          answer_policy: nil, group_id: @group, group_name: "Retained group"} |> Map.put("created_at_ms", 100)
+          answer_policy: nil, files: files, group_id: @group, group_name: "Retained group"} |> Map.put("created_at_ms", 100)
         {:ok, engine, record, _} = SharedMessages.create(engine, attrs, [@first, @second], nil)
         {:ok, engine, _} = Groups.replace_hosted(engine, {"shared-business", "team"}, @group, "Retained group", [@sender, @second], 2)
         {:ok, engine} = SharedMessages.revise(engine, record, 1, %{"title" => "Second shared revision"}, [], 200)
