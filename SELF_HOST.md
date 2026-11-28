@@ -696,7 +696,11 @@ backup of the private install root (outside `ROOT/postgres`), export the store
 with its identity material and any files `server.env` points at, verify the
 export, import into the empty database as the migration role, validate, apply
 the runtime role's grants and verify them, and only then activate the
-destination. It never edits `server.env` or starts the Server; you add the
+destination. After activation it verifies the importer's staged identity
+material against its recorded digests and installs only the listed files at
+their original locations, never overwriting a file that differs; if that check
+fails the database is already active, the Server must stay stopped, and
+`migrate --resume` repeats the check. It never edits `server.env` or starts the Server; you add the
 printed backend setting yourself. If any step fails nothing is activated; run
 `migrate --resume WORKDIR` after fixing the cause, or abandon the unpublished
 destination and restore the original backup. Rolling back to the old stack is

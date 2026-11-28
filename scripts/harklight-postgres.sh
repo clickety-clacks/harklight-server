@@ -701,6 +701,67 @@ migration_step() {
   printf '%s' "$out"
 }
 
+# Verify the importer's staged identity material against its COMPLETE.json and
+# install only the listed files at their mapped locations. Fail closed.
+install_material() {
+  python3 -I - "$work_dir/validate.json" "$work_dir/material-map.json" "$work_dir" <<'PY' || return 1
+import hashlib, json, os, shutil, sys
+vpath, mpath, work = sys.argv[1:4]
+def die(msg):
+    sys.stderr.write("harklight-postgres: material check failed: " + msg + "\n"); sys.exit(1)
+def sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+v = json.load(open(vpath)); mapping = json.load(open(mpath))
+mat = v.get("material")
+if not isinstance(mat, dict) or not all(k in mat for k in ("root", "manifest_sha256", "files")):
+    die("validate output has no complete material section")
+root = os.path.realpath(mat["root"]); parent = os.path.dirname(root)
+if os.path.commonpath([os.path.realpath(work), root]) != os.path.realpath(work):
+    die("staging root is outside the migration work directory")
+complete = os.path.join(parent, "COMPLETE.json")
+if not os.path.isfile(complete) or sha(complete) != mat["manifest_sha256"]:
+    die("COMPLETE.json is missing or does not match its recorded digest")
+c = json.load(open(complete))
+for k in ("import_id", "source_sha256", "schema_sha256"):
+    if c.get(k) != v.get(k):
+        die("COMPLETE.json identity differs from the validated import (" + k + ")")
+listed = {}
+for f in mat["files"]:
+    rel = f.get("path", "")
+    if not rel or rel.startswith("/") or "//" in rel or ".." in rel.split("/"):
+        die("unsafe staged path " + repr(rel))
+    src = os.path.realpath(os.path.join(root, rel))
+    if os.path.commonpath([root, src]) != root or not os.path.isfile(src):
+        die("staged file missing or outside the staging root: " + rel)
+    if os.path.getsize(src) != f.get("size") or sha(src) != f.get("sha256"):
+        die("staged file length or hash differs: " + rel)
+    listed[rel] = src
+missing = sorted(set(mapping) - set(listed))
+if missing:
+    die("required material was not staged: " + ", ".join(missing))
+extra = sorted(set(listed) - set(mapping))
+if extra:
+    die("staged files outside the export map: " + ", ".join(extra))
+plan = []
+for rel, src in sorted(listed.items()):
+    dest = mapping[rel]
+    if os.path.exists(dest):
+        if sha(dest) != sha(src):
+            die("the existing file differs from the verified staged copy and was not overwritten: " + dest)
+        continue
+    plan.append((src, dest))
+for src, dest in plan:
+    os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+    tmp = dest + ".hk-install"
+    shutil.copyfile(src, tmp); os.chmod(tmp, 0o600); os.replace(tmp, dest)
+print("installed %d file(s); %d already identical" % (len(plan), len(listed) - len(plan)))
+PY
+}
+
 do_migrate() {
   find_pg_bin
   load_config
@@ -786,8 +847,16 @@ PY
   fi
   out="$(migration_step status status --receipt "$receipt")"
   [[ "$(json_field "$out" phase)" == active ]] || migrate_failed "status (database is not active)" "$work_dir"
+  if ! out="$(install_material)"; then
+    cat >&2 <<EOF
+harklight-postgres: the destination is ACTIVE but the importer's identity material could not be verified and installed.
+Do not start Harklight Server. Nothing in server.env was changed. Fix the cause and run: harklight-postgres migrate --resume $work_dir
+EOF
+    exit 2
+  fi
+  note "identity material verified: $out"
   note "PostgreSQL destination is active for this import. server.env was not changed and Harklight Server was not started."
-  note "Before starting a PostgreSQL-backed Server, install the importer's verified identity material and add to $state/server.env:"
+  note "Before starting a PostgreSQL-backed Server, add to $state/server.env:"
   note "  export ATTENTION_SERVER_STORE_BACKEND=postgres"
   note "  source $env_file"
   note "Rollback to the old stack is valid only until PostgreSQL has accepted new writes; backup: $work_dir/backup"

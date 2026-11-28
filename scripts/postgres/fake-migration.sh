@@ -16,7 +16,14 @@ case "$cmd" in
   export)
     out="$(arg --output "$@")"; [[ ! -e "$out" ]] || fail "output_exists"
     [[ -f "$(arg --source "$@")" && -f "$(arg --material-map "$@")" && -n "$(arg --unit "$@")" ]] || fail "bad_args"
-    mkdir -m 700 "$out"; echo manifest > "$out/MANIFEST"; json exported null ;;
+    mkdir -m 700 "$out"; echo manifest > "$out/MANIFEST"; cp "$(arg --material-map "$@")" "$out/material-map.json"
+    python3 -I - "$out" <<'PY'
+import json, os, shutil, sys
+out = sys.argv[1]
+for rel, src in json.load(open(out + "/material-map.json")).items():
+    dst = os.path.join(out, "material", rel); os.makedirs(os.path.dirname(dst), exist_ok=True); shutil.copyfile(src, dst)
+PY
+    json exported null ;;
   verify) [[ -f "$1/MANIFEST" ]] || fail "no_bundle"; json verified null ;;
   import)
     [[ -f "$(arg --bundle "$@")/MANIFEST" && -d "$(dirname -- "$(arg --receipt "$@")")" ]] || fail "bad_args"
@@ -33,7 +40,24 @@ case "$cmd" in
     phase="$(m -c "select phase from harklight.import_state")"; json "$phase" null ;;
   validate)
     m -c "update harklight.import_state set phase = 'validated', manifest_sha256 = decode('$vsha','hex') where phase = 'loading'" >/dev/null
-    json validated "\"$vsha\"" ;;
+    stage="$(dirname -- "$(arg --receipt "$@")")/staging"; rm -rf "$stage"; mkdir -p "$stage/root"
+    material="$(python3 -I - "$(arg --bundle "$@")" "$stage" "${FAKE_BAD_MATERIAL:-}" <<'PY'
+import hashlib, json, os, shutil, sys
+bundle, stage, bad = sys.argv[1:4]
+files = []
+for rel in sorted(json.load(open(bundle + "/material-map.json"))):
+    src = os.path.join(bundle, "material", rel)
+    dst = os.path.join(stage, "root", rel); os.makedirs(os.path.dirname(dst), exist_ok=True); shutil.copyfile(src, dst)
+    d = open(dst, "rb").read()
+    files.append({"path": rel, "size": len(d), "sha256": hashlib.sha256(d).hexdigest()})
+if bad == "drop" and files:
+    files.pop()
+complete = {"import_id": "imp-1", "source_sha256": "a" * 64, "schema_sha256": "b" * 64, "files": files}
+cp = os.path.join(stage, "COMPLETE.json"); json.dump(complete, open(cp, "w"))
+print(json.dumps({"root": os.path.join(stage, "root"), "manifest_sha256": hashlib.sha256(open(cp, "rb").read()).hexdigest(), "files": files}))
+PY
+)"
+    printf '{"contract_version":1,"command":"validate","phase":"validated","import_id":"imp-1","source_sha256":"%s","schema_sha256":"%s","validation_sha256":"%s","material":%s}\n' "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" "$vsha" "$material" ;;
   activate)
     [[ "$(arg --validation-sha256 "$@")" == "$vsha" ]] || fail "digest_mismatch"
     [[ "$(m -c "select has_schema_privilege('harklight', 'harklight', 'USAGE')")" == t ]] || fail "grants_not_applied_before_activation"
