@@ -123,8 +123,15 @@ defmodule AttentionServer.ClientAPI.Reads do
   @doc false
   def get_postgres_item(conn, %Context{params: %{item_id: item}}) do
     result =
-      postgres_browser_read(conn, fn principal ->
-        RecipientItems.item(:postgres, browser_render_principal(principal), item)
+      Transaction.snapshot(fn ->
+        with {:ok, %{kind: :browser, person: person} = principal} <- Auth.web(conn, Identities, :postgres),
+             :ok <- Settings.check_active(person) do
+          RecipientItems.item(:postgres, browser_render_principal(principal), item)
+        else
+          {:ok, _native} -> {:error, :not_found}
+          {:error, :unavailable} -> {:error, :retry_later}
+          {:error, _} = error -> error
+        end
       end)
 
     case result do
@@ -154,9 +161,15 @@ defmodule AttentionServer.ClientAPI.Reads do
   @doc false
   def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}}) do
     result =
-      postgres_browser_read(conn, fn %{person: person} ->
-        with {:ok, revision} <- revision_number(raw_revision) do
+      Transaction.snapshot(fn ->
+        with {:ok, %{kind: :browser, person: person}} <- Auth.web(conn, Identities, :postgres),
+             :ok <- Settings.check_active(person),
+             {:ok, revision} <- revision_number(raw_revision) do
           RecipientItems.revision(:postgres, person, item, revision)
+        else
+          {:ok, _native} -> {:error, :not_found}
+          {:error, :unavailable} -> {:error, :retry_later}
+          {:error, _} = error -> error
         end
       end)
 
@@ -164,19 +177,6 @@ defmodule AttentionServer.ClientAPI.Reads do
       {:ok, body} -> Errors.send_streamed_json(conn, 200, body, &streamed_read_headers/2)
       error -> respond(conn, error)
     end
-  end
-
-  defp postgres_browser_read(conn, read) do
-    Transaction.snapshot(fn ->
-      with {:ok, %{kind: :browser, person: person} = principal} <- Auth.web(conn, Identities, :postgres),
-           :ok <- Settings.check_active(person) do
-        read.(principal)
-      else
-        {:ok, _native} -> {:error, :not_found}
-        {:error, :unavailable} -> {:error, :retry_later}
-        {:error, _} = error -> error
-      end
-    end)
   end
 
   @doc false
