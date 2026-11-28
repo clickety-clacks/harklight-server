@@ -266,6 +266,228 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert {:ok, ^key, _} = AgentItems.owned_item(:postgres, {person, origin}, "i7")
     end
 
+    test "an attachment is served only after its complete chunk sequence and digest verify" do
+      alias AttentionServer.Repository.Postgres.Uploads
+
+      person = "synthetic-upload-person"
+      owner = "synthetic-upload-owner"
+      ref = {person, owner, "synthetic-attachment"}
+      full = :binary.copy(<<42>>, Uploads.chunk_bytes())
+      tail = <<0, 1, 255>>
+      size = byte_size(full) + byte_size(tail)
+      digest = :crypto.hash(:sha256, [full, tail])
+
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+      assert {:error, :upload_cap_exceeded} =
+               Uploads.begin_upload(
+                 person, owner, "synthetic-attachment", size, digest, %{},
+                 upload_limits(size - 1, size)
+               )
+      assert {:ok, "synthetic-attachment"} =
+               Uploads.begin_upload(
+                 person, owner, "synthetic-attachment", size, digest, %{}, upload_limits(size, size)
+               )
+      assert {:error, :not_found} = Uploads.read_chunk(person, "synthetic-attachment", 0)
+      assert {:error, :invalid_chunk} = Uploads.put_chunk(ref, 0, tail)
+      assert {:error, :not_found} =
+               Uploads.put_chunk({person, "other-owner", "synthetic-attachment"}, 0, full)
+
+      assert {:ok, :stored} = Uploads.put_chunk(ref, 0, full)
+      assert {:ok, :stored} = Uploads.put_chunk(ref, 0, full)
+      assert {:error, :upload_conflict} =
+               Uploads.put_chunk(ref, 0, :binary.copy(<<43>>, byte_size(full)))
+      assert {:error, :incomplete_upload} = Uploads.complete(ref, 10)
+      assert {:ok, :stored} = Uploads.put_chunk(ref, 1, tail)
+      assert {:ok, "synthetic-attachment"} = Uploads.complete(ref, 10)
+      assert {:ok, "synthetic-attachment"} = Uploads.complete(ref, 11)
+      assert {:ok, ^full} = Uploads.read_chunk(person, "synthetic-attachment", 0)
+      assert {:ok, ^tail} = Uploads.read_chunk(person, "synthetic-attachment", 1)
+      assert {:error, :not_found} = Uploads.read_chunk("other-person", "synthetic-attachment", 0)
+      assert {:error, :upload_completed} = Uploads.put_chunk(ref, 1, tail)
+
+      assert {:ok, "corrupt-attachment"} =
+               Uploads.begin_upload(
+                 person, owner, "corrupt-attachment", 3, digest, %{}, upload_limits(:none, size + 3)
+               )
+      corrupt = {person, owner, "corrupt-attachment"}
+      assert {:ok, :stored} = Uploads.put_chunk(corrupt, 0, tail)
+      assert {:error, :upload_digest_mismatch} = Uploads.complete(corrupt, 10)
+      assert {:error, :not_found} = Uploads.read_chunk(person, "corrupt-attachment", 0)
+
+      empty_digest = :crypto.hash(:sha256, <<>>)
+      assert {:ok, "empty-attachment"} =
+               Uploads.begin_upload(
+                 person, owner, "empty-attachment", 0, empty_digest, %{}, upload_limits(:none, size + 3)
+               )
+      assert {:ok, "empty-attachment"} = Uploads.complete({person, owner, "empty-attachment"}, 10)
+    end
+
+    test "a committed upload reservation can be replayed after its response is lost" do
+      alias AttentionServer.Repository.Postgres.Uploads
+
+      person = "synthetic-upload-replay"
+      owner = "synthetic-owner"
+      id = "resumable-upload"
+      bytes = <<1, 2, 3>>
+      digest = :crypto.hash(:sha256, bytes)
+      metadata = %{filename: "fixture.bin"}
+      observer = self()
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people VALUES ($1)", [person])
+
+      {writer, monitor} =
+        spawn_monitor(fn ->
+          result = Uploads.begin_upload(person, owner, id, 3, digest, metadata, upload_limits(3, 3))
+          send(observer, {:reservation_committed, result})
+          receive do: (:response_delivered -> :ok)
+        end)
+
+      assert_receive {:reservation_committed, {:ok, ^id}}, 2_000
+      Process.exit(writer, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^writer, :killed}, 2_000
+
+      assert {:ok, ^id} =
+               Uploads.begin_upload(person, owner, id, 3, digest, metadata, upload_limits(2, 2))
+      assert {:error, :upload_conflict} =
+               Uploads.begin_upload(person, owner, id, 3, digest, %{}, upload_limits(3, 3))
+      assert {:error, :upload_conflict} =
+               Uploads.begin_upload(person, "other-owner", id, 3, digest, metadata, upload_limits(3, 3))
+      assert {:ok, :stored} = Uploads.put_chunk({person, owner, id}, 0, bytes)
+      assert {:ok, ^id} = Uploads.complete({person, owner, id}, 11)
+      assert {:ok, ^bytes} = Uploads.read_chunk(person, id, 0)
+    end
+
+    test "parallel reservations share the account cap across upload owners" do
+      alias AttentionServer.Repository.Postgres.Uploads
+
+      person = "synthetic-upload-quota"
+      bytes = <<1, 2, 3>>
+      digest = :crypto.hash(:sha256, bytes)
+      observer = self()
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people VALUES ($1)", [person])
+
+      blocker =
+        Task.async(fn ->
+          Transaction.run([], fn _ ->
+            assert {:ok, %{num_rows: 1}} =
+                     Transaction.query(
+                       "SELECT id FROM harklight.people WHERE id = $1 FOR NO KEY UPDATE",
+                       [person]
+                     )
+
+            send(observer, :account_locked)
+            receive do: (:release_account -> {:ok, :released})
+          end)
+        end)
+
+      assert_receive :account_locked, 2_000
+
+      requests =
+        for id <- ["quota-one", "quota-two"] do
+          Task.async(fn ->
+            Uploads.begin_upload(person, id, id, 3, digest, %{}, upload_limits(3, 5))
+          end)
+        end
+
+      await_admission_waits(100)
+      send(blocker.pid, :release_account)
+      assert {:ok, :released} = Task.await(blocker)
+      assert [{:error, :upload_cap_exceeded}, {:ok, winner}] =
+               requests |> Enum.map(&Task.await/1) |> Enum.sort()
+
+      assert {:ok, :stored} = Uploads.put_chunk({person, winner, winner}, 0, bytes)
+      assert {:ok, 0} = Uploads.cleanup(person, 99)
+      assert {:ok, 1} = Uploads.cleanup(person, 100)
+      assert {:ok, %{rows: [[0]]}} =
+               Transaction.query("SELECT count(*) FROM harklight.upload_chunks WHERE upload_id = $1", [winner])
+      assert {:ok, "replacement"} =
+               Uploads.begin_upload(person, "owner", "replacement", 3, digest, %{}, upload_limits(3, 5))
+    end
+
+    test "cleanup skips attachment links in flight and only retires expired orphans" do
+      alias AttentionServer.Repository.Postgres.Uploads
+
+      person = "synthetic-upload-cleanup"
+      owner = "synthetic-upload-writer"
+      target = {person, owner, "linked-upload"}
+      orphan = {person, owner, "orphan-upload"}
+      message = "synthetic-attachment-message"
+      observer = self()
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people VALUES ($1)", [person])
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 1)",
+                 [owner, person]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.messages
+                   (id, person_id, origin_key, sender_id, message_id, revision, accepted_at_ms)
+                 VALUES ($1, $2, $3, 'app:fixture', 'message', 1, 10)
+                 """,
+                 [message, person, owner]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.message_revisions VALUES ($1, 1, 10, '{}')",
+                 [message]
+               )
+
+      for {_person, _owner, id} <- [target, orphan] do
+        assert {:ok, ^id} =
+                 Uploads.begin_upload(
+                   person, owner, id, 0, :crypto.hash(:sha256, <<>>), %{}, upload_limits(0, 0)
+                 )
+      end
+
+      assert {:error, :transaction_required} = Uploads.link(target, message, 1, 0, %{})
+      assert {:error, :incomplete_upload} =
+               Transaction.run([], fn _ -> Uploads.link(target, message, 1, 0, %{}) end)
+      assert {:ok, "linked-upload"} = Uploads.complete(target, 10)
+
+      linker =
+        Task.async(fn ->
+          Transaction.run([], fn _ ->
+            assert {:ok, "linked-upload"} = Uploads.link(target, message, 1, 0, %{})
+            send(observer, :attachment_linked)
+            receive do: (:commit_link -> {:ok, :linked})
+          end)
+        end)
+
+      assert_receive :attachment_linked, 2_000
+      assert {:ok, 1} = Uploads.cleanup(person, 100)
+      send(linker.pid, :commit_link)
+      assert {:ok, :linked} = Task.await(linker)
+      assert {:ok, 0} = Uploads.cleanup(person, 100)
+      assert {:error, :not_found} =
+               Transaction.run([], fn _ -> Uploads.link(orphan, message, 1, 1, %{}) end)
+      assert {:ok, %{rows: [["linked-upload"]]}} =
+               Transaction.query("SELECT upload_id FROM harklight.message_uploads WHERE message_id = $1", [message])
+    end
+
+    defp upload_limits(file, account) do
+      %{file_limit: file, account_limit: account, expires_at_ms: 100}
+    end
+
+    defp await_admission_waits(0), do: flunk("both admissions did not reach the account lock")
+
+    defp await_admission_waits(remaining) do
+      assert {:ok, %{rows: [[count]]}} =
+               Transaction.query(
+                 """
+                 SELECT count(*) FROM pg_stat_activity
+                 WHERE wait_event_type = 'Lock'
+                   AND query LIKE 'SELECT id FROM harklight.people%FOR NO KEY UPDATE'
+                 """,
+                 []
+               )
+
+      if count < 2 do
+        Process.sleep(10)
+        await_admission_waits(remaining - 1)
+      end
+    end
+
     test "reversed multi-stream inputs wait on the same first lock" do
       left = {"lock-a", ""}
       right = {"lock-b", ""}

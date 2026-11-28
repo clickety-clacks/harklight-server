@@ -36,6 +36,14 @@ The authoritative columns and constraints live in
   digest have been validated. An empty file has zero chunks. Writers may
   only link complete files. Keep each attachment ordinal and its wire
   attributes from the selected message revision.
+- PostgreSQL admissions reserve the declared bytes against one person,
+  across upload owners. A new manifest adds the integer
+  `reservation_expires_at_ms` key beside its typed attributes envelope.
+  Remove this key when decoding the envelope. Exact scoped retries match the
+  declared size, digest and typed metadata and retain the original expiration.
+  Cleanup takes bounded batches of expired, unlinked reservations under
+  manifest locks. Imported manifests without a reservation timestamp are
+  excluded.
 - Claims are scoped to one job, with an attempt count, unique claim token
   and expiry. A worker may record success while its token still matches an
   unfinished job, including after lease expiry. The fifth failed or expired
