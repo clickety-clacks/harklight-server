@@ -428,8 +428,10 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert :ok = ImportStreams.run(db, identity, bundle)
         assert {:ok, _} = AttentionServer.Migration.VerifyStreamPositions.run(db, identity, bundle)
+        assert {:ok, %{epoch: ^epoch}} = AttentionServer.Migration.VerifyStreamHeads.run(db, identity, bundle)
         verify_streams(db, bundle, manifest)
         verify_stream_position_drift(db, identity, bundle)
+        verify_stream_head_drift(db, identity, bundle)
         assert :ok = ImportReceipts.run(db, identity, bundle)
         assert :ok = ImportReceipts.run(db, identity, bundle)
         verify_receipts(db, bundle, manifest)
@@ -1382,6 +1384,36 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, %{rows: [[^expected_count]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts", [])
       assert {:ok, %{rows: [[2]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-same-key'", [])
       assert {:ok, %{rows: [[1]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.operation_receipts WHERE operation_key='synthetic-agent-key' AND origin_key<>''", [])
+    end
+
+    defp verify_stream_head_drift(db, identity, bundle) do
+      alias AttentionServer.Migration.VerifyStreamHeads
+      source_file = Path.join(bundle, "source.sqlite3")
+      before = AttentionServer.Migration.Source.file_observation(source_file)
+      assert {:ok, heads} = VerifyStreamHeads.run(db, identity, bundle)
+      assert heads.heads > 0
+      for {sql, error} <- [
+        {"UPDATE harklight.stream_heads SET head=head+1", :stream_head_mismatch},
+        {"UPDATE harklight.stream_heads SET floor=floor+1,head=head+1", :stream_head_mismatch},
+        {"UPDATE harklight.stream_heads SET seed_revision=seed_revision+1,head=head+1", :stream_head_mismatch},
+        {"UPDATE harklight.server_identity SET cursor_epoch=cursor_epoch+1", :cursor_identity_mismatch},
+        {"UPDATE harklight.server_identity SET cursor_signing_key=decode(repeat('00',32),'hex')", :cursor_identity_mismatch}
+      ] do
+        assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+          assert {:ok, _} = ImportSession.query(tx, sql, [])
+          assert {:error, ^error} = VerifyStreamHeads.run(tx, identity, bundle)
+          Postgrex.rollback(tx, :synthetic_drift)
+        end)
+        assert {:ok, ^heads} = VerifyStreamHeads.run(db, identity, bundle)
+      end
+      assert {:error, :synthetic_drift} = Postgrex.transaction(db, fn tx ->
+        assert {:ok, _} = ImportSession.query(tx,
+          "INSERT INTO harklight.stream_heads(person_id,origin_key,head,floor,seed_revision) SELECT person_id,'extra-synthetic-stream',head,floor,seed_revision FROM harklight.stream_heads LIMIT 1", [])
+        assert {:error, :stream_head_count_mismatch} = VerifyStreamHeads.run(tx, identity, bundle)
+        Postgrex.rollback(tx, :synthetic_drift)
+      end)
+      assert {:ok, ^heads} = VerifyStreamHeads.run(db, identity, bundle)
+      assert AttentionServer.Migration.Source.file_observation(source_file) == before
     end
 
     defp verify_stream_position_drift(db, identity, bundle) do
