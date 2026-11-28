@@ -172,12 +172,21 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   @doc false
   def put_priority_levels(conn, %Context{} = ctx) do
+    parse_priority_levels(conn, &priority_levels(ctx.relay, ctx.principal, &1, &2, &3))
+  end
+
+  @doc false
+  def put_postgres_priority_levels(conn, %Context{} = ctx) do
+    parse_priority_levels(conn, &postgres_settings(ctx, {:priority_levels, &1, &2}, &3))
+  end
+
+  defp parse_priority_levels(conn, apply_levels) do
     with {:ok, key} <- optional_key(conn),
          {:ok, if_match} <- if_match(conn),
          {:ok, body, conn} <- json_body(conn),
          :ok <- only_members(body, ["levels"]),
          {:ok, levels} <- list_member(body, "levels") do
-      respond(conn, priority_levels(ctx.relay, ctx.principal, levels, if_match, key))
+      respond(conn, apply_levels.(levels, if_match, key))
     else
       {:error, token, field, conn} -> Errors.send_error(conn, token, field: field)
       {:error, token, field} -> Errors.send_error(conn, token, field: field)
@@ -191,12 +200,14 @@ defmodule AttentionServer.ClientAPI.Writes do
 
   @doc false
   def put_postgres_alerts(conn, %Context{} = ctx) do
-    parse_alerts(conn, fn alerts, if_match, key ->
-      case Command.execute(:postgres, ctx.principal, {:alerts, alerts, if_match}, key, System.system_time(:millisecond)) do
-        {:ok, _, _, _} = success -> success
-        error -> result(error, false)
-      end
-    end)
+    parse_alerts(conn, &postgres_settings(ctx, {:alerts, &1, &2}, &3))
+  end
+
+  defp postgres_settings(ctx, request, key) do
+    case Command.execute(:postgres, ctx.principal, request, key, System.system_time(:millisecond)) do
+      {:ok, _, _, _} = success -> success
+      error -> result(error, false)
+    end
   end
 
   defp parse_alerts(conn, apply_alerts) do

@@ -3206,7 +3206,8 @@ defmodule AttentionServer.Engine do
     end
   end
 
-  defp levels_semantic(levels) do
+  @doc false
+  def levels_semantic(levels) do
     %{
       "type" => "levels_set",
       "levels" =>
