@@ -570,6 +570,88 @@ agent directory before it is sent, it needs a deliberate ANSWER confirmation,
 and rerunning the same command replays a committed answer instead of writing a
 second one. It carries no source ruling authority.
 
+## Optional PostgreSQL storage (opt-in preparation)
+
+**Status: opt-in and off by default.** Harklight Server still stores everything
+in SQLite exactly as described elsewhere in this guide, and a Server started
+without `ATTENTION_SERVER_STORE_BACKEND=postgres` behaves as it did before. The
+`harklight-postgres` command described here prepares and protects a PostgreSQL
+database for the planned PostgreSQL storage backend. It does not migrate your
+existing SQLite data, and it changes nothing until you run it. Do not enable
+the backend on a Server that holds data you need until a release states that
+migration and adoption are available. Migration and adoption have not shipped.
+
+Tested platform: Linux x86_64 with PostgreSQL 16 from Ubuntu 24.04, run as the
+same unprivileged user as Harklight Server. The command requires PostgreSQL 16
+or newer (`postgresql` package, including the client programs) and refuses an
+older version. It was tested only with 16 and says so when it finds a newer one.
+
+### One local PostgreSQL for a one-machine install
+
+    "$PACKAGE/bin/harklight-postgres" preflight --root "$HOME/.local/share/harklight-server"
+    "$PACKAGE/bin/harklight-postgres" setup     --root "$HOME/.local/share/harklight-server"
+
+`preflight` checks, without changing anything: Linux x86_64, PostgreSQL
+version, that the PostgreSQL programs exist, that the state directory exists,
+that the data location is absent, that the loopback port is free, that the
+systemd user manager is available, and free disk space under the install root
+(at least 2 GiB, or 1 GiB plus three times the existing state, or the value of
+`--min-free-mb`). `setup` runs the same checks and then creates, in
+`ROOT/postgres/`, one dedicated cluster: its own data directory, `scram-sha-256`
+authentication, listening on `127.0.0.1` only (default port 15432, not the
+usual 5432, so it does not collide with a PostgreSQL you already run), a
+dedicated `harklight` role and `harklight` database, a private password file,
+and a `harklight-postgres.service` user service with automatic restart. It
+orders `harklight-server.service` after it. It never reuses an existing data
+directory and never touches another PostgreSQL on the machine; if setup fails
+partway it removes only what that run created.
+
+Setup writes the connection settings to `STATE/postgres.env` and prints them.
+It does not edit `server.env`. The public address, TLS and client enrollment
+flow are unchanged.
+
+### An operator-supplied PostgreSQL instead
+
+    "$PACKAGE/bin/harklight-postgres" setup --remote-url postgres://harklight@db.example.net:5432/harklight \
+      --password-file /path/to/password-file --ca-file /path/to/server-ca.pem
+
+Create an empty database and a role dedicated to Harklight first. Setup
+connects, requires PostgreSQL 16 or newer, refuses a database that already holds
+any objects (it is never repurposed), checks that the role can create tables,
+and records the connection. A password never appears in the URL. Availability,
+replication and the network path of that database are yours to operate.
+
+### Backup and restore: one command each
+
+    "$PACKAGE/bin/harklight-postgres" backup  /safe/place/harklight-2026-11-28.tar
+    "$PACKAGE/bin/harklight-postgres" restore /safe/place/harklight-2026-11-28.tar --replace
+
+Stop Harklight Server first; both commands refuse to run while
+`harklight-server.service` is active. `backup` writes one mode-0600 archive
+holding a PostgreSQL dump of the Harklight database, the whole state directory
+(configuration, TLS and owner keys, and any files Harklight keeps there) and
+SHA-256 checksums of both. It checks free space first and never overwrites an
+existing file. The archive contains private keys: store it like the state
+directory itself. `postgres.env` and the database password are not in it,
+because they belong to the cluster, not the data.
+
+`restore` verifies the checksums and the archive's contents before changing
+anything. A database that already holds data is refused unless you pass
+`--replace`; with it, the local database is dropped and recreated so nothing
+from before survives. The state directory is replaced only after the database
+restored cleanly, and the previous one is kept beside it as
+`state.pre-restore-TIMESTAMP`. To restore on a new machine, create an empty private state directory
+(`mkdir -m 700 "$STATE"`), run `preflight` and `setup`, then run `restore`;
+it replaces that empty directory with the archived state. Run
+`harklight-postgres status` afterwards.
+
+What this does not cover: the existing SQLite store, which still needs the
+stopped-state backup described under "Upgrade or rollback"; the installer's
+pre-upgrade backup deliberately excludes `ROOT/postgres` and does not back up
+or restore the database. Backup and restore round trips were exercised only on
+synthetic data, not on Harklight Server's own PostgreSQL schema, which does not
+ship yet.
+
 ## Upgrade or rollback
 
 ### Releases that write FORMAT32

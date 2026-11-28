@@ -45,3 +45,20 @@ jobs:
             if mountpoint -q "$root"; then sudo umount "$root"; fi
             rm -rf "$root"
           fi
+
+  selfhost-postgres-scripts:
+    name: Self-host PostgreSQL scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install PostgreSQL 16 programs
+        run: |
+          if [ ! -x /usr/lib/postgresql/16/bin/postgres ]; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-16
+          fi
+
+      # Private cluster in mode-0700 scratch on loopback; synthetic data only.
+      - name: Backup, restore and refusal self-test
+        run: bash scripts/postgres/selftest.sh

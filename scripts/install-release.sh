@@ -263,7 +263,7 @@ restore_preinstall_root() {
   for path in "$root"/*; do
     name="${path##*/}"
     case "$name" in
-      releases|backups|.release-install.lock) continue ;;
+      releases|backups|postgres|.release-install.lock) continue ;;
     esac
     if ! rm -rf -- "$path"; then
       restore_failed=1
@@ -276,7 +276,7 @@ restore_preinstall_root() {
   for path in "$restore_tmp"/*; do
     name="${path##*/}"
     case "$name" in
-      releases|backups|.release-install.lock) restore_failed=1; continue ;;
+      releases|backups|postgres|.release-install.lock) restore_failed=1; continue ;;
     esac
     if ! mv -T -- "$path" "$root/$name"; then
       restore_failed=1
@@ -538,7 +538,7 @@ if [[ -z "$backup_final" ]]; then
   backup_tmp="$(mktemp -d "$root/backups/.harklight-backup.XXXXXX")"
   backup_id="${backup_tmp##*.}"
   backup_final="$root/backups/$(date -u +%Y%m%dT%H%M%SZ)-$current_tag-to-$HARKLIGHT_RELEASE_TAG-$backup_id"
-  if ! tar --exclude='./releases' --exclude='./backups' --exclude='./.release-install.lock' \
+  if ! tar --exclude='./releases' --exclude='./backups' --exclude='./postgres' --exclude='./.release-install.lock' \
     -cf "$backup_tmp/private-root.tar" -C "$root" .; then
     rm -rf -- "$backup_tmp"
     backup_tmp=""
