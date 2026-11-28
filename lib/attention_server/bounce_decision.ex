@@ -35,30 +35,27 @@ defmodule AttentionServer.BounceDecision do
 
   def configure_levels(%Engine{} = engine, person, levels, now_ms)
       when is_binary(person) and is_list(levels) and is_integer(now_ms) do
-    case Map.get(engine.bounce_levels, person) do
-      %{levels: current} = config when is_list(current) ->
-        if BouncePolicy.equivalent_levels?(current, levels) do
-          {:ok, engine, config}
-        else
-          updated = %{config | levels: levels}
-          {:ok, put_configuration(engine, person, updated), updated}
-        end
+    current = Map.get(engine.bounce_levels, person)
 
-      nil ->
-        config = %{
-          levels: levels,
-          configured_at_ms: now_ms,
-          after_delivery_seq: Map.get(engine.persons, person, 0),
-          after_conversation_seq: Map.get(engine.conversation_highs, person, 0)
-        }
+    generation = %{
+      configured_at_ms: now_ms,
+      after_delivery_seq: Map.get(engine.persons, person, 0),
+      after_conversation_seq: Map.get(engine.conversation_highs, person, 0)
+    }
 
-        {:ok, put_configuration(engine, person, config), config}
-
-      config ->
-        updated = %{config | levels: levels}
-        {:ok, put_configuration(engine, person, updated), updated}
-    end
+    config = level_configuration(current, levels, generation)
+    next = if config == current, do: engine, else: put_configuration(engine, person, config)
+    {:ok, next, config}
   end
+
+  @doc false
+  def level_configuration(nil, levels, generation), do: Map.put(generation, :levels, levels)
+
+  def level_configuration(%{levels: current} = config, levels, _generation) when is_list(current) do
+    if BouncePolicy.equivalent_levels?(current, levels), do: config, else: %{config | levels: levels}
+  end
+
+  def level_configuration(config, levels, _generation), do: %{config | levels: levels}
 
   def record_initial(%Engine{} = engine, key, record) do
     person = elem(key, 0)

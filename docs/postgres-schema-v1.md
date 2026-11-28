@@ -38,6 +38,11 @@ The authoritative columns and constraints live in
   in the revision index only. Agent changes retain the full resource ID and
   use the Agent decoder kind as text. Both advisory prefixes have kind
   `advisory`. Rows with a null source timestamp are revision-only.
+- PostgreSQL owner level saves record a typed audit fact under
+  `runtime_audit`, addressed by `Attributes.key({person, stream_revision})`.
+  Its body contains `person_id`, `actor_id`, `action` and `at_ms`. It
+  commits with the settings and stream revision. Imported `relay_audit`
+  rows keep their original ordinal and value.
 - Import upload sizes and SHA-256 bytes unchanged, with zero-based chunks
   of up to 1 MiB. A non-null completion timestamp means the total size and
   digest have been validated. An empty file has zero chunks. Writers may
