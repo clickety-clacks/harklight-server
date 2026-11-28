@@ -700,6 +700,72 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
     end
 
     @tag :tmp_dir
+    test "staged browser settings feed matches FORMAT32 cursor and wire behavior", %{tmp_dir: dir} do
+      alias AttentionServer.{ChangeLog, JSON}
+      alias AttentionServer.ClientAPI.{Context, Feed, Router}
+      alias AttentionServer.Repository.Postgres.{Identities, Streams}
+
+      {relay, _, backend, cookie, principal} = browser_fixture(dir)
+      origin = "https://account.example.test"
+      sqlite = Router.init(relay: relay, auth: {:browser, backend, origin})
+      postgres = Router.init(relay: nil, repository: :postgres, auth: {:browser, Identities, origin})
+      ctx = %Context{relay: nil, request_id: nil, principal: nil}
+      read = &Feed.postgres_changes(&1, ctx)
+      scope = {principal.person, ""}
+      commit = alerts_request(cookie, "all", "*", nil, origin)
+      assert %{status: 200, resp_body: body} = Router.call(commit, sqlite)
+      assert %{status: 200, resp_body: ^body} = Router.call(commit, postgres)
+      assert {:ok, %{"rev" => head}} = JSON.decode_line(body <> "\n")
+      assert head > 0
+
+      store = :sys.get_state(relay).store
+      assert :ok = ChangeLog.ranks_available(store, principal.person)
+      assert {:ok, _} = Transaction.query(
+        "INSERT INTO harklight.compatibility_facts VALUES ('client_rank_state', $1, $2)",
+        [Attributes.key(principal.person), Attributes.encode([principal.person])]
+      )
+
+      batch = browser_request(:get, "/v2/changes?after=#{head + 1}&limit=1", cookie)
+      fetch = Plug.Conn.put_req_header(batch, "last-event-id", "0")
+      assert %{status: 200, resp_body: changes} = Router.call(fetch, sqlite)
+      assert %{status: 200, resp_body: ^changes} = read.(fetch)
+      assert {:ok, %{"rev" => ^head, "more" => false, "changes" => [
+        %{"rev" => ^head, "kind" => "settings", "data" => %{"alerts" => "all", "rev" => ^head}}
+      ]}} = JSON.decode_line(changes <> "\n")
+
+      huge = browser_request(:get, "/v2/changes?after=9223372036854775808", cookie)
+      invalid = Plug.Conn.put_req_header(batch, "last-event-id", "invalid")
+      for request <- [batch, huge], run <- [&Router.call(&1, sqlite), read] do
+        assert %{status: 410, assigns: %{client_api_error: "cursor_expired"}} = run.(request)
+      end
+      for run <- [&Router.call(&1, sqlite), read] do
+        assert %{status: 400, resp_body: error} = run.(invalid)
+        assert {:ok, %{"field" => "last_event_id", "error" => "invalid_field"}} = JSON.decode_line(error <> "\n")
+      end
+
+      assert %{status: 401} = read.(Plug.Test.conn(:get, "/v2/changes"))
+      assert %{status: 404} = Router.call(fetch, postgres)
+      assert %{status: 404} = read.(Plug.Conn.put_req_header(fetch, "accept", "text/event-stream"))
+
+      cutoff = System.system_time(:millisecond) + 1_000
+      assert {:ok, 1} = ChangeLog.prune(store, cutoff)
+      assert {:ok, ^head} = Streams.prune(scope, cutoff)
+      after_floor = browser_request(:get, "/v2/changes?after=#{head}", cookie)
+      assert %{status: 200, resp_body: empty} = Router.call(after_floor, sqlite)
+      assert %{status: 200, resp_body: ^empty} = read.(after_floor)
+      assert {:ok, %{"rev" => ^head, "changes" => [], "more" => false}} = JSON.decode_line(empty <> "\n")
+      assert %{status: 410} = Router.call(fetch, sqlite)
+      assert %{status: 410} = read.(fetch)
+
+      next = head + 1
+      assert {:ok, ^next} = Transaction.run([scope], &Transaction.append(&1, scope, [change("item:synthetic")]))
+      assert %{status: 503, resp_body: error} = read.(after_floor)
+      assert {:ok, %{"error" => "storage_unavailable"} = unavailable} = JSON.decode_line(error <> "\n")
+      refute Map.has_key?(unavailable, "rev")
+      assert {:ok, [%{rev: ^next}], false, ^next} = Streams.person_page(principal.person, head, 1)
+    end
+
+    @tag :tmp_dir
     test "failed final receipt update rolls back browser alerts and its stream append", %{tmp_dir: dir} do
       alias AttentionServer.ClientAPI.Router
       alias AttentionServer.Repository.Postgres.{Attributes, Identities}
