@@ -309,3 +309,11 @@ record attributes. It does not populate attachment chunks or attachment link
 rows, per-recipient seen state, conversations or answers. Those stages and their
 field-level reader comparisons are required before import validation and
 activation; this stage's success alone is not a complete history import.
+
+`ImportFeeds.run/3` projects origin and advisory allocation highs independently
+of change-log positions. Entries retain their exact sequence, session and typed
+body; origin delivery acknowledgements retain their stage map and advisory
+receipts retain their IDs. Highs are copied before entries and receipts, using
+separate checkpoints. Entries beyond the recorded high, acknowledgements without
+an origin entry and receipts without an advisory entry refuse the stage. This
+preserves feed facts without dispatching deliveries or activating the target.
