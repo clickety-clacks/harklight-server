@@ -447,8 +447,8 @@ schema, claims a destination, starts Server or changes lifecycle state.
 bundle, creates a private receipt before database changes, and preserves the
 original import UUID and pinned schema digest on every resume. An existing receipt
 for another bundle is refused. A receipt alone is not evidence of imported data.
-The full import/validate/activate commands remain unavailable until their gates
-are implemented.
+The import and validate commands are implemented below but installer readiness
+remains false until integration and rehearsal gates pass. Activation is unavailable.
 
 `harklight-migration capabilities` is a read-only availability probe, with no
 receipt or database access. Contract version 1 returns `commands` and
@@ -764,8 +764,36 @@ The runtime still rejects the validated database, further import writes are
 closed, and migration readiness remains disabled pending command integration
 and the remaining rehearsals.
 
+
+### Import and validate command wiring
+
+The packaged CLI accepts `import --bundle BUNDLE --receipt RECEIPT` and
+`validate --bundle BUNDLE --receipt RECEIPT`. Import persists the private receipt,
+uses the designated migrator to prepare an empty owned schema, resumes the fixed
+ordered projection stages, and stages material beside the receipt at
+`RECEIPT.material`. Status continues to report actual database custody and phase.
+Validate uses that same receipt and material stage, returning the complete report,
+validation digest and verified `material` description.
+
+Rerunning import while loading resumes committed checkpoints. After validated
+publication it rechecks the complete report and returns the same validated
+identity, without reopening writes or repairing material. This recovers a lost
+validation response before an installer completion marker. Active imports refuse.
+Non-retryable errors remain exit 2 with a stable code; success is one contract-version-1 JSON
+object. No command starts Server, edits backend configuration, contacts providers
+or activates PostgreSQL. Capabilities lists import and validate, but
+`migration_ready` remains false until the full rehearsal gates pass.
+
 A loader batch also versions its locked import-state row. If validation began
 before that batch committed, PostgreSQL refuses the older validation snapshot
-with a serialization failure. Retry `validate` with the same bundle and receipt;
+with a serialization failure (SQLSTATE 40001). The API returns
+`{:error, :validation_retry_required}`. The CLI exits 75, writes no success JSON,
+and emits only `Migration retryable: validation_retry_required; retry the same
+command with the same bundle and receipt.` on stderr. This also applies when
+`import` revalidates an already validated destination. An installer receiving 75
+must preserve the receipt, bundle, material and destination, keep Server stopped,
+and retry that same command (or offer its existing `migrate --resume` path).
+Exit 75 is not validation success and does not authorize grants or activation.
+Retry `validate` with the same bundle and receipt;
 it recomputes every comparison from a fresh snapshot. No report from the failed
 attempt is published or reused.

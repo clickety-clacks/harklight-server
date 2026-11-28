@@ -983,7 +983,9 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         await_validation_lock(db, validator_pid, 200)
         send(loader_pid, :commit)
         assert {:ok, _} = Task.await(loader, 5_000)
-        assert {:error, %Postgrex.Error{postgres: %{code: :serialization_failure}}} = Task.await(validator, 5_000)
+        assert {:error, :validation_retry_required = retryable} = Task.await(validator, 5_000)
+        assert {75, "Migration retryable: validation_retry_required; retry the same command with the same bundle and receipt."} =
+          AttentionServer.Migration.CLI.failure(retryable)
         assert {:ok, %{"phase" => "loading", "validation_sha256" => nil}} = ImportStatus.read(db, identity)
         assert {:error, {:validation_comparison_failed, "ordinary_availability", _}} =
           ValidateImport.run(validator_db, identity, bundle, staging)

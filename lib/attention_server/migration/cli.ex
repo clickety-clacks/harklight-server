@@ -6,7 +6,28 @@ defmodule AttentionServer.Migration.CLI do
   # Status alone does not imply that the complete upgrade pipeline is available.
   def run(["capabilities"]) do
     {:ok, %{"contract_version" => 1, "command" => "capabilities",
-      "commands" => ["export", "verify", "status"], "migration_ready" => false}}
+      "commands" => ["export", "verify", "import", "status", "validate"], "migration_ready" => false}}
+  end
+
+  def run([command | args]) when command in ["import", "validate"] do
+    {opts, rest, invalid} = OptionParser.parse(args, strict: [bundle: :string, receipt: :string])
+    with true <- rest == [] and invalid == [] and length(opts) == 2,
+         {:ok, bundle} <- required(opts, :bundle),
+         {:ok, receipt} <- required(opts, :receipt) do
+      case command do
+        "import" -> AttentionServer.Migration.ImportPipeline.run(System.get_env(), bundle, receipt)
+        "validate" ->
+          with {:ok, identity} <- AttentionServer.Migration.ImportReceipt.load(receipt) do
+            AttentionServer.Migration.Connection.with_connection(System.get_env(), fn db ->
+              AttentionServer.Migration.ValidateImport.run(db, identity, bundle,
+                AttentionServer.Migration.ImportPipeline.material_root(receipt))
+            end)
+          end
+      end
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_arguments}
+    end
   end
 
   def run(["status", "--receipt", path]) do
@@ -63,10 +84,16 @@ defmodule AttentionServer.Migration.CLI do
 
       {:error, reason} ->
         # Do not print source values, paths, configuration or identity material.
-        IO.puts(:stderr, "Migration refused: " <> error_code(reason))
-        System.halt(2)
+        {status, message} = failure(reason)
+        IO.puts(:stderr, message)
+        System.halt(status)
     end
   end
+
+  # Stable process contract for orchestration; never includes database details.
+  def failure(:validation_retry_required),
+    do: {75, "Migration retryable: validation_retry_required; retry the same command with the same bundle and receipt."}
+  def failure(reason), do: {2, "Migration refused: " <> error_code(reason)}
 
   defp required(opts, key) do
     case Keyword.get(opts, key) do
