@@ -896,7 +896,7 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
     end
 
     defp verify_complete_report(db, identity, bundle, root) do
-      alias AttentionServer.Migration.{ValidationReport, ImportMaterial, ImportStatus}
+      alias AttentionServer.Migration.{ValidationReport, ValidateImport, ImportMaterial, ImportStatus}
       # Complete the shared projections too: the report cannot accept a partial
       # ordinary-only import even when all ordinary checks already passed.
       assert :ok = AttentionServer.Migration.ImportSharedReaderFacts.run(db, identity, bundle)
@@ -930,13 +930,24 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
       assert {:ok, _} = ImportSession.query(db,
         "UPDATE harklight.compatibility_facts SET body='{}'::jsonb WHERE family='ordinary_item_availability' AND address=$1", [address])
       try do
-        assert {:error, {:validation_comparison_failed, "ordinary_availability", _}} = ValidationReport.run(db, identity, bundle, staging)
+        assert {:error, {:validation_comparison_failed, "ordinary_availability", _}} = ValidateImport.run(db, identity, bundle, staging)
+        assert {:ok, ^before} = ImportStatus.read(db, identity)
       after
         assert {:ok, _} = ImportSession.query(db,
           "UPDATE harklight.compatibility_facts SET body=$2::text::jsonb WHERE family='ordinary_item_availability' AND address=$1", [address, JSON.encode!(body)])
       end
-      assert {:ok, ^report} = ValidationReport.run(db, identity, bundle, staging)
+      assert {:error, :import_identity_mismatch} = ValidateImport.run(db, %{identity | id: "foreign-import"}, bundle, staging)
       assert {:ok, ^before} = ImportStatus.read(db, identity)
+      assert {:ok, validated} = ValidateImport.run(db, identity, bundle, staging)
+      assert validated["validation_sha256"] == report["sha256"]
+      assert validated["report"] == report["report"]
+      assert validated["material"] == material
+      assert {:ok, ^validated} = ValidateImport.run(db, identity, bundle, staging)
+      assert {:ok, status} = ImportStatus.read(db, identity)
+      assert status["phase"] == "validated"
+      assert status["validation_sha256"] == report["sha256"]
+      assert {:error, :postgres_not_active} = Transaction.verify_ready()
+      assert {:error, :import_not_loading} = ImportSession.checkpoint(db, identity, "records")
     end
 
     defp verify_catalog_drift(db, identity, bundle) do

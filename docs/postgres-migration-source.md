@@ -746,3 +746,20 @@ future validate command must bind the complete report to the guarded lifecycle
 transition. A successful comparison report also does not prove runtime pending
 work reconciliation, saved-baseline continuation, material installation or the
 required client/release rehearsals. Migration readiness remains disabled.
+
+
+### Guarded validated transition
+
+`Migration.ValidateImport.run/4` locks the import ownership row used by checkpoint
+batches, runs the same complete comparison report within that transaction, and
+publishes its digest while moving `loading` to `validated`. It accepts neither a
+caller-provided digest nor a partial report. A failed comparison rolls back and
+leaves the database loading. A repeated validation reruns all comparisons and
+must reproduce the immutable validated digest. A foreign identity or already
+active import is refused.
+
+The transition returns the report and verified material description for the
+future packaged command. It does not install material or activate PostgreSQL.
+The runtime still rejects the validated database, further import writes are
+closed, and migration readiness remains disabled pending command integration
+and the remaining rehearsals.
