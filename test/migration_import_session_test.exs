@@ -433,6 +433,8 @@ if System.get_env("HARKLIGHT_MIGRATION_TEST_URL") do
         schema: :crypto.hash(:sha256, File.read!("priv/postgres/001_initial.sql"))}
       assert :ok = ImportOrganizations.run(db, identity, bundle)
       assert :ok = ImportOrganizations.run(db, identity, bundle)
+      assert :ok = ImportAuth.run(db, identity, bundle)
+      assert {:ok, %{rows: [[0]]}} = ImportSession.query(db, "SELECT count(*) FROM harklight.auth_sessions", [])
       assert_members(db, expected.instance, expected.members)
       assert {:ok, %{rows: [[0]]}} = ImportSession.query(db,
         "SELECT count(*) FROM harklight.organization_members WHERE person_id=$1", [expected.hosted])

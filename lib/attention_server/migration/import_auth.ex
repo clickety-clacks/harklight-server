@@ -11,14 +11,17 @@ defmodule AttentionServer.Migration.ImportAuth do
          :ok <- ImportTables.run(db, identity, root),
          {:ok, manifest, _} <- Bundle.verify(root) do
       Enum.reduce_while(@tables, :ok, fn table, :ok ->
-        source = Map.fetch!(manifest.data.tables, table)
-        case ImportRows.run(
-               db, identity, "auth/" <> table <> "/v1",
-               Path.join(root, source.file), source.summary,
-               fn _ -> true end, &write(&1, table, &2)
-             ) do
-          {:ok, _} -> {:cont, :ok}
-          error -> {:halt, error}
+        case Map.fetch(manifest.data.tables, table) do
+          :error -> {:cont, :ok}
+          {:ok, source} ->
+            case ImportRows.run(
+                   db, identity, "auth/" <> table <> "/v1",
+                   Path.join(root, source.file), source.summary,
+                   fn _ -> true end, &write(&1, table, &2)
+                 ) do
+              {:ok, _} -> {:cont, :ok}
+              error -> {:halt, error}
+            end
         end
       end)
     end
