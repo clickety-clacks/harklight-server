@@ -1,6 +1,6 @@
 defmodule AttentionServer.Migration.VerifyAccounts do
   @moduledoc false
-  alias AttentionServer.Migration.{Bundle, Frames, ImportSession, VerifyFacts}
+  alias AttentionServer.Migration.{Bundle, Frames, ImportSession, VerifyFacts, VerifyAllocationBounds}
   alias AttentionServer.Repository.Postgres.Attributes
 
   @settings [:algorithm_choices, :alert_choices, :bounce_levels]
@@ -11,7 +11,8 @@ defmodule AttentionServer.Migration.VerifyAccounts do
          {:ok, counts} <- Frames.fold(Path.join(bundle, "records.frames"), manifest.data.records,
            %{people: 0, highs: 0}, fn row, acc -> verify(db, row, acc) end),
          :ok <- count(db, "people", counts.people),
-         :ok <- count(db, "allocation_highs", counts.highs) do
+         :ok <- count(db, "allocation_highs", counts.highs),
+         :ok <- VerifyAllocationBounds.run(db, Path.join(bundle, "records.frames"), manifest.data.records) do
       {:ok, counts}
     end
   end
@@ -44,10 +45,10 @@ defmodule AttentionServer.Migration.VerifyAccounts do
            "SELECT family,body FROM harklight.compatibility_facts WHERE family=ANY($1::text[]) AND address=ANY($2::bytea[])",
            [Enum.map(fields, &Atom.to_string/1), addresses]),
          {:ok, values} <- decode(rows),
-         profile = case Map.fetch(values, "people_profiles") do
+         profile = (case Map.fetch(values, "people_profiles") do
            :error -> %{}
            {:ok, value} -> Attributes.encode(value)
-         end,
+         end),
          settings = for(field <- @settings, Map.has_key?(values, Atom.to_string(field)), into: %{},
            do: {field, Map.fetch!(values, Atom.to_string(field))}),
          settings_body = if(map_size(settings) == 0, do: %{}, else: Attributes.encode(settings)),

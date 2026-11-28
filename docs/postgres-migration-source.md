@@ -602,3 +602,9 @@ people, organization membership, sender history and recipient history. These
 facts retain access after group deletion without recreating a group or principal.
 A failed recipient batch rolls its facts and checkpoint back together. Actual
 bounded reader and HTTP parity remain required before activation.
+Allocation verification also streams retained message acceptance numbers, delivery
+event positions, message/reply free orders, conversation positions, origin entries
+and ACKs, and advisory entries. Each must be covered by its own person/origin/session
+counter. Missing or low counters are refused even when source and destination
+agree; the verifier never repairs them. Checking each retained value gives the
+same lower bound as its scoped maximum without retaining all scopes in memory.
