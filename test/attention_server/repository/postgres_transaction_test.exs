@@ -1661,6 +1661,155 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert %{status: 304, resp_body: ""} = Reads.get_postgres_item(conditional, ctx)
       pg = Router.init(relay: nil, repository: :postgres, auth: {:browser, Identities, nil})
       assert %{status: 404} = Router.call(conn, pg)
+
+      verify_native_ordinary_items(relay, dir, principal, key, record, ctx)
+    end
+
+    defp verify_native_ordinary_items(relay, dir, owner, key, record, ctx) do
+      alias AttentionServer.{BrowserAuth, ChangeLog, DeviceIdentity, DeviceProof, JSON, Relay, TLSFixtures}
+      alias AttentionServer.ClientAPI.{Reads, Resources, Router}
+      alias AttentionServer.Store.AuthSchema
+      alias Exqlite.Sqlite3
+
+      person = owner.person
+      native = "synthetic-item-native"
+      other_person = "synthetic-other-item-account"
+      other_device = "synthetic-other-item-native"
+      certs = TLSFixtures.create!()
+      on_exit(fn -> File.rm_rf!(certs) end)
+      der = TLSFixtures.certificate_der!(certs, "a1")
+      assert {:ok, certificate} = DeviceIdentity.from_certificate(der)
+
+      assert :ok = Relay.setup_person(relay, other_person)
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [other_person])
+      for {p, device} <- [{person, native}, {person, certificate}, {other_person, other_device}] do
+        assert :ok = Relay.setup_device(relay, p, device)
+        assert {:ok, _} =
+                 Transaction.query("INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'device', 1)", [device, p])
+      end
+      assert :ok = Relay.setup_sender(relay, certificate, "app:fixture")
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.sender_grants VALUES ($1, 'app:fixture')", [certificate])
+      subscribe = %{
+        "v" => 1, "type" => "subscribe_remote", "op_id" => "00000000-0000-4000-8000-000000000066",
+        "revision" => 1, "sender_ids" => ["app:fixture"]
+      }
+      assert {:ok, reply} = Relay.request_line(relay, native, JSON.encode!(subscribe) <> "\n")
+      assert {:ok, %{"type" => "ok"}} = JSON.decode_line(reply)
+      state = :sys.get_state(relay)
+      assert %{revision: 1, senders: senders} = state.store.engine.subscriptions[{person, native}]
+      assert MapSet.member?(senders, "app:fixture")
+      files = Resources.revision_file_refs(1, 2, record.files_by_revision[2], state.store.engine.uploads)
+      put_summary_fact("ordinary_revision_files", {person, "i1", 2}, files)
+      stop_supervised!(Relay)
+
+      path = Path.join(dir, "relay.sqlite3")
+      {:ok, db} = Sqlite3.open(path)
+      tokens =
+        for {p, device, pending?} <- [{person, native, true}, {person, record.origin, false}, {other_person, other_device, false}],
+            into: %{} do
+          token = BrowserAuth.new_secret()
+          hash = token |> DeviceProof.digest() |> Base.decode16!(case: :lower)
+          put_certificate_session(db, p, device, hash, pending?)
+          {device, token}
+        end
+      :ok = Sqlite3.close(db)
+      relay = start_supervised!({Relay, store_path: path, deployment_mode: :saas})
+      store = :sys.get_state(relay).store
+      resource = ChangeLog.item_resource(key)
+      assert {:ok, head} = ChangeLog.head(store, person)
+      assert {:ok, rev} = ChangeLog.rev(store, person, resource)
+      assert {:ok, _} =
+               Transaction.query("UPDATE harklight.stream_heads SET head = $2 WHERE person_id = $1 AND origin_key = ''", [person, head])
+      assert {:ok, _} =
+               Transaction.query("""
+               UPDATE harklight.stream_resource_revisions SET revision = $3
+               WHERE person_id = $1 AND origin_key = '' AND resource_kind = 'item' AND resource_id = $2
+               """, [person, resource, rev])
+
+      with_pg_auth_generation(AuthSchema.supported_generation(), fn ->
+        legacy_web = Router.init(relay: relay, auth: {:browser, nil, nil})
+        legacy_cert = Router.init(relay: relay, auth: :device)
+        make_bearer = fn path, device ->
+          Plug.Test.conn(:get, path)
+          |> Plug.Conn.put_req_header("authorization", "Bearer " <> Map.fetch!(tokens, device))
+        end
+        make_certificate = fn path ->
+          Plug.Test.conn(:get, path)
+          |> Plug.Test.put_peer_data(%{address: {127, 0, 0, 1}, port: 1, ssl_cert: der})
+        end
+
+        native_item = make_bearer.("/v2/items/i1", native)
+        native_rev = make_bearer.("/v2/items/i1/revisions/2", native)
+        rev_ctx = %{ctx | params: %{item_id: "i1", n: "2"}}
+        assert %{status: 503} = Reads.get_postgres_item(native_item, ctx)
+        assert_item_response_parity(Router.call(native_rev, legacy_web), Reads.get_postgres_revision(native_rev, rev_ctx))
+        put_summary_fact("device_subscription_heads", {person, native}, 1)
+        put_summary_fact("device_subscription_senders", {person, native, 1, "app:fixture"}, true)
+        put_summary_fact("device_subscription_heads", {person, certificate}, 0)
+
+        response = Reads.get_postgres_item(native_item, ctx)
+        assert_item_response_parity(Router.call(native_item, legacy_web), response)
+        assert {:ok, %{"item" => %{"as" => "message"}}} = JSON.decode_line(response.resp_body <> "\n")
+        own = make_bearer.("/v2/items/i1", record.origin)
+        response = Reads.get_postgres_item(own, ctx)
+        assert_item_response_parity(Router.call(own, legacy_web), response)
+        assert {:ok, %{"item" => own_item}} = JSON.decode_line(response.resp_body <> "\n")
+        refute Map.has_key?(own_item, "as")
+
+        certificate_item = make_certificate.("/v2/items/i1")
+        certificate_rev = make_certificate.("/v2/items/i1/revisions/2")
+        cert_mode = {:certificate, :saas}
+        response = Reads.get_postgres_item(certificate_item, ctx, cert_mode)
+        assert_item_response_parity(Router.call(certificate_item, legacy_cert), response)
+        assert {:ok, %{"item" => %{"as" => "knock"}}} = JSON.decode_line(response.resp_body <> "\n")
+        assert_item_response_parity(Router.call(certificate_rev, legacy_cert), Reads.get_postgres_revision(certificate_rev, rev_ctx, cert_mode))
+
+        other = make_bearer.("/v2/items/i1", other_device)
+        assert %{status: 404} = Router.call(other, legacy_web)
+        assert %{status: 404} = Reads.get_postgres_item(other, ctx)
+        other_rev = make_bearer.("/v2/items/i1/revisions/2", other_device)
+        assert %{status: 404} = Router.call(other_rev, legacy_web)
+        assert %{status: 404} = Reads.get_postgres_revision(other_rev, rev_ctx)
+
+        for device <- [native, certificate] do
+          assert :ok = Relay.owner_revoke_device(relay, person, owner.key, device)
+          assert {:ok, _} = Transaction.query("UPDATE harklight.principals SET revoked = true WHERE key = $1", [device])
+        end
+        assert %{status: 401} = Router.call(native_item, legacy_web)
+        assert %{status: 401} = Reads.get_postgres_item(native_item, ctx)
+        assert %{status: 401} = Router.call(certificate_rev, legacy_cert)
+        assert %{status: 401} = Reads.get_postgres_revision(certificate_rev, rev_ctx, cert_mode)
+      end)
+    end
+
+    defp assert_item_response_parity(legacy, postgres) do
+      assert legacy.status == 200
+      assert postgres.status == 200
+      assert legacy.resp_body == postgres.resp_body
+      assert Plug.Conn.get_resp_header(legacy, "etag") == Plug.Conn.get_resp_header(postgres, "etag")
+    end
+
+    defp with_pg_auth_generation(generation, test) do
+      address = Attributes.key(1)
+      selector = "SELECT body FROM harklight.compatibility_facts WHERE family = 'harklight_auth_schema' AND address = $1"
+      upsert = """
+      INSERT INTO harklight.compatibility_facts VALUES ('harklight_auth_schema', $1, $2)
+      ON CONFLICT (family, address) DO UPDATE SET body = excluded.body
+      """
+      assert {:ok, %{rows: original}} = Transaction.query(selector, [address])
+
+      try do
+        assert {:ok, _} = Transaction.query(upsert, [address, Attributes.encode([1, generation, 0])])
+        test.()
+      after
+        case original do
+          [] ->
+            Transaction.query("DELETE FROM harklight.compatibility_facts WHERE family = 'harklight_auth_schema' AND address = $1", [address])
+
+          [[body]] ->
+            Transaction.query(upsert, [address, body])
+        end
+      end
     end
 
     test "an attachment is served only after its complete chunk sequence and digest verify" do

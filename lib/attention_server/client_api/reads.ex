@@ -121,10 +121,10 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
-  def get_postgres_item(conn, %Context{params: %{item_id: item}}) do
+  def get_postgres_item(conn, %Context{params: %{item_id: item}}, auth \\ :web) do
     result =
-      postgres_browser_read(conn, fn principal ->
-        RecipientItems.item(:postgres, browser_render_principal(principal), item)
+      postgres_item_read(conn, auth, fn principal ->
+        RecipientItems.item(:postgres, postgres_render_principal(principal), item)
       end)
 
     respond_streamed(conn, result)
@@ -149,9 +149,9 @@ defmodule AttentionServer.ClientAPI.Reads do
   end
 
   @doc false
-  def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}}) do
+  def get_postgres_revision(conn, %Context{params: %{item_id: item, n: raw_revision}}, auth \\ :web) do
     result =
-      postgres_browser_read(conn, fn %{person: person} ->
+      postgres_item_read(conn, auth, fn %{person: person} ->
         with {:ok, revision} <- revision_number(raw_revision) do
           RecipientItems.revision(:postgres, person, item, revision)
         end
@@ -160,18 +160,27 @@ defmodule AttentionServer.ClientAPI.Reads do
     respond_streamed(conn, result)
   end
 
-  defp postgres_browser_read(conn, read) do
+  defp postgres_item_read(conn, auth, read) do
     Transaction.snapshot(fn ->
-      with {:ok, %{kind: :browser, person: person} = principal} <- Auth.web(conn, Identities, :postgres),
+      with {:ok, %{kind: kind, person: person} = principal} when kind in [:browser, :device] <-
+             postgres_item_authority(conn, auth),
            :ok <- Settings.check_active(person) do
         read.(principal)
       else
-        {:ok, _native} -> {:error, :not_found}
+        {:ok, _agent} -> {:error, :not_found}
         {:error, :unavailable} -> {:error, :retry_later}
         {:error, _} = error -> error
       end
     end)
   end
+
+  defp postgres_item_authority(conn, :web), do: Auth.web(conn, Identities, :postgres)
+
+  defp postgres_item_authority(conn, {:certificate, mode}) when mode in [:self_hosted, :saas],
+    do: Auth.device(conn, {:postgres, mode})
+
+  defp postgres_render_principal(%{kind: :browser} = principal), do: browser_render_principal(principal)
+  defp postgres_render_principal(%{kind: :device} = principal), do: principal
 
   @doc false
   def get_settings(conn, %Context{} = ctx),
