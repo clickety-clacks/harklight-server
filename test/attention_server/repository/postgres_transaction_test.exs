@@ -173,6 +173,60 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
       assert %{status: 404} = Router.call(browser_request(:put, "/v2/settings/alerts", cookie), postgres)
     end
 
+    defp browser_fixture(dir) do
+      alias AttentionServer.{DashboardBackend, DashboardBrowserSession, Relay, Store.AuthSchema}
+      alias AttentionServer.ClientAPI.Auth
+      alias Exqlite.Sqlite3
+
+      path = Path.join(dir, "relay.sqlite3")
+      opts = [
+        store_path: path,
+        deployment_mode: :saas,
+        dashboard_origin: "https://account.example.test"
+      ]
+
+      {:ok, relay} = Relay.start_link(opts)
+      {:ok, person} = Relay.hosted_account_create(relay, "browser-fixture")
+      :ok = GenServer.stop(relay)
+
+      {:ok, db} = Sqlite3.open(path)
+      assert {:ok, _} = AuthSchema.initialize(db)
+      :ok = Sqlite3.close(db)
+
+      relay = start_supervised!({Relay, opts})
+      browser = start_supervised!({DashboardBrowserSession, relay: relay})
+      backend = {DashboardBackend, %DashboardBackend{relay: relay, sessions: browser}}
+      assert {:ok, grant} = Relay.hosted_browser_grant(relay, person, "fixture-browser", "google")
+      assert {:ok, %{cookie: cookie}} = Relay.redeem_hosted_browser_grant(relay, grant, "fixture-browser")
+      conn = browser_request(:get, "/v2/me", cookie)
+
+      assert {:ok, %{person: ^person, key: key, owner_revision: revision, session_id: hash} = principal} =
+               Auth.web(conn, backend, relay)
+      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
+      assert {:ok, _} =
+               Transaction.query(
+                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'owner', $3)",
+                 [key, person, revision]
+               )
+      assert {:ok, _} =
+               Transaction.query(
+                 """
+                 INSERT INTO harklight.auth_sessions
+                   (token_hash, person_id, principal_key, kind, principal_revision)
+                 VALUES ($1, $2, $3, 'browser', $4)
+                 """,
+                 [hash, person, key, revision]
+               )
+
+      {relay, browser, backend, cookie, principal}
+    end
+
+    defp browser_request(method, path, cookie) do
+      method
+      |> Plug.Test.conn(path)
+      |> Plug.Test.put_req_cookie("__Host-harklight", cookie)
+    end
+
     test "committed pages preserve person and Agent position and retention contracts" do
       alias AttentionServer.Repository.Postgres.Streams
 
@@ -484,60 +538,6 @@ if System.get_env("HARKLIGHT_POSTGRES_TEST_URL") do
                    flunk("conflicting operation ran")
                  end)
                end)
-    end
-
-    defp browser_fixture(dir) do
-      alias AttentionServer.{DashboardBackend, DashboardBrowserSession, Relay, Store.AuthSchema}
-      alias AttentionServer.ClientAPI.Auth
-      alias Exqlite.Sqlite3
-
-      path = Path.join(dir, "relay.sqlite3")
-      opts = [
-        store_path: path,
-        deployment_mode: :saas,
-        dashboard_origin: "https://account.example.test"
-      ]
-
-      {:ok, relay} = Relay.start_link(opts)
-      {:ok, person} = Relay.hosted_account_create(relay, "browser-fixture")
-      :ok = GenServer.stop(relay)
-
-      {:ok, db} = Sqlite3.open(path)
-      assert {:ok, _} = AuthSchema.initialize(db)
-      :ok = Sqlite3.close(db)
-
-      relay = start_supervised!({Relay, opts})
-      browser = start_supervised!({DashboardBrowserSession, relay: relay})
-      backend = {DashboardBackend, %DashboardBackend{relay: relay, sessions: browser}}
-      assert {:ok, grant} = Relay.hosted_browser_grant(relay, person, "fixture-browser", "google")
-      assert {:ok, %{cookie: cookie}} = Relay.redeem_hosted_browser_grant(relay, grant, "fixture-browser")
-      conn = browser_request(:get, "/v2/me", cookie)
-
-      assert {:ok, %{person: ^person, key: key, owner_revision: revision, session_id: hash} = principal} =
-               Auth.web(conn, backend, relay)
-      assert {:ok, _} = Transaction.query("INSERT INTO harklight.people (id) VALUES ($1)", [person])
-      assert {:ok, _} =
-               Transaction.query(
-                 "INSERT INTO harklight.principals (key, person_id, kind, revision) VALUES ($1, $2, 'owner', $3)",
-                 [key, person, revision]
-               )
-      assert {:ok, _} =
-               Transaction.query(
-                 """
-                 INSERT INTO harklight.auth_sessions
-                   (token_hash, person_id, principal_key, kind, principal_revision)
-                 VALUES ($1, $2, $3, 'browser', $4)
-                 """,
-                 [hash, person, key, revision]
-               )
-
-      {relay, browser, backend, cookie, principal}
-    end
-
-    defp browser_request(method, path, cookie) do
-      method
-      |> Plug.Test.conn(path)
-      |> Plug.Test.put_req_cookie("__Host-harklight", cookie)
     end
 
     defp change(id) do
