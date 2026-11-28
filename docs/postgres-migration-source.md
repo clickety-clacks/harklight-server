@@ -416,3 +416,13 @@ staging. Their captured source paths must be those names beneath the directory
 containing the captured `server.env`. They do not choose the Server's runtime
 identity; a saved sign-in link remains private. Other undeclared identity kinds
 still refuse and must not be silently omitted from a backup or import.
+
+Bundle format 2 adds mandatory stopped-source material provenance. Format 1
+exports return `legacy_bundle_requires_reexport` (CLI exit 2), rather than a
+successful weaker validation or an ambiguous malformed-manifest error. Keep the
+original immutable stopped backup and create a **new** export directory with the
+current exporter; do not edit the old manifest, its version, or its checksums.
+Start a fresh unpublished destination and new receipt for that new bundle. An
+existing format-1 destination remains unpublished; do not reuse its receipt with
+the replacement bundle. This changes the migration bundle format, not FORMAT32
+or the client protocol. Unknown newer bundle versions also refuse explicitly.

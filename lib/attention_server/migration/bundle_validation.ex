@@ -5,7 +5,7 @@ defmodule AttentionServer.Migration.BundleValidation do
   # Integrity validation is separate from target-schema and relational validation.
   # A successful result here never authorizes database activation.
   def validate(root, %{
-        version: 1,
+        version: 2,
         source: source,
         provenance: receipt,
         data: data,
@@ -32,6 +32,7 @@ defmodule AttentionServer.Migration.BundleValidation do
     BadMapError -> {:error, :invalid_bundle_manifest}
   end
 
+  def validate(_, %{version: 1}), do: {:error, :legacy_bundle_requires_reexport}
   def validate(_, _), do: {:error, :invalid_bundle_manifest}
 
   defp record({address, value}) do

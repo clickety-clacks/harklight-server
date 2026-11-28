@@ -17,7 +17,7 @@ defmodule AttentionServer.Migration.Bundle do
          {:ok, material_provenance} <- MaterialProvenance.confirm(material_before, destination, material),
          {:ok, receipt} <- Source.confirm(path, captured.provenance, opts, observer),
          manifest = %{
-           version: 1,
+           version: 2,
            source: inventory,
            provenance: receipt,
            data: data,
@@ -58,8 +58,9 @@ defmodule AttentionServer.Migration.Bundle do
     )
 
     with {:ok, bytes} <- File.read(Path.join(root, "COMPLETE.json")),
-         {:ok, %{"version" => 1, "count" => 1, "bytes" => size, "sha256" => hash}} <-
-           AttentionServer.JSON.decode_line(bytes <> "\n"),
+         {:ok, %{"version" => version} = marker} <- AttentionServer.JSON.decode_line(bytes <> "\n"),
+         :ok <- supported_version(version),
+         %{"count" => 1, "bytes" => size, "sha256" => hash} <- marker,
          summary = %{count: 1, bytes: size, sha256: hash},
          {:ok, [manifest]} <-
            Frames.fold(Path.join(root, "manifest.frames"), summary, [], fn value, acc ->
@@ -72,6 +73,10 @@ defmodule AttentionServer.Migration.Bundle do
       _ -> {:error, :invalid_bundle_manifest}
     end
   end
+
+  defp supported_version(2), do: :ok
+  defp supported_version(1), do: {:error, :legacy_bundle_requires_reexport}
+  defp supported_version(_), do: {:error, :unsupported_bundle_version}
 
   defp export_data(copy, uploads, destination, inventory) do
     with :ok <- private_directory(Path.join(destination, "tables")),
@@ -259,7 +264,7 @@ defmodule AttentionServer.Migration.Bundle do
   defp seal(destination, summary) do
     bytes =
       AttentionServer.JSON.encode!(%{
-        "version" => 1,
+        "version" => 2,
         "count" => summary.count,
         "bytes" => summary.bytes,
         "sha256" => summary.sha256

@@ -80,6 +80,16 @@ defmodule AttentionServer.Migration.BundleTest do
              end)
 
     assert {:ok, ^manifest, ^summary} = Bundle.verify(destination)
+    assert manifest.version == 2 and marker["version"] == 2
+    assert {:error, :legacy_bundle_requires_reexport} = AttentionServer.Migration.BundleValidation.validate(destination,
+      manifest |> Map.put(:version, 1) |> Map.delete(:material_provenance))
+    marker_path = Path.join(destination, "COMPLETE.json")
+    File.write!(marker_path, JSON.encode!(%{marker | "version" => 1}))
+    assert {:error, :legacy_bundle_requires_reexport} = Bundle.verify(destination)
+    assert {:error, :legacy_bundle_requires_reexport} = CLI.run(["verify", destination])
+    File.write!(marker_path, JSON.encode!(marker))
+    assert {:ok, ^manifest, ^summary} = Bundle.verify(destination)
+
     assert {:ok, %{"contract_version" => 1, "command" => "verify", "result" => "verified_export"}} = CLI.run(["verify", destination])
     for {name, source} <- auxiliary do
       assert File.read!(Path.join(destination, "material/" <> name)) == File.read!(source)
