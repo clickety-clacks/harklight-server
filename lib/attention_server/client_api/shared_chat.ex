@@ -48,6 +48,7 @@ defmodule AttentionServer.ClientAPI.SharedChat do
          true <- SharedCapability.readable?(state, principal.person, capability) || {:error, :unsupported},
          {:ok, record, recipient} <- locate(engine, principal, direction, params.item_id),
          true <- SharedCapability.visible?(record, capability) || {:error, :not_found},
+         {:ok, actor} <- write_actor(principal, who),
          scope = wire_scope(principal, direction),
          {:ok, stored} <- lookup(state.store, scope, key) do
       case stored do
@@ -60,7 +61,7 @@ defmodule AttentionServer.ClientAPI.SharedChat do
         nil ->
           chat = %{
             person: principal.person, direction: direction, operation: operation,
-            actor: principal.key, receipt_scope: scope, key: key, digest: digest,
+            actor: actor, receipt_scope: scope, key: key, digest: digest,
             message_id: record.id, now: state.clock.()
           }
 
@@ -85,6 +86,13 @@ defmodule AttentionServer.ClientAPI.SharedChat do
   end
 
   defp locate(_engine, _principal, _direction, _item), do: {:error, :not_found}
+
+  defp write_actor(%{kind: :browser, person: person}, %{session_id: session})
+       when is_binary(session) and byte_size(session) > 0,
+       do: {:ok, Writes.browser_actor_key(person, session)}
+
+  defp write_actor(%{kind: :device, key: key}, _who), do: {:ok, key}
+  defp write_actor(_principal, _who), do: {:error, :unauthorized}
 
   defp wire_scope(principal, :person), do: principal.person
   defp wire_scope(principal, :sender), do: Idempotency.agent_scope(principal.person, principal.key)
